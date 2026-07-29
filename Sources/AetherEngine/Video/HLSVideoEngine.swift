@@ -589,7 +589,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         companionAudioReader: IOReader? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
-        forwardBufferSegments: Int? = nil
+        forwardBufferSegments: Int? = nil,
+        shortFirstSegmentSeconds: Double? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -628,6 +629,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        self.shortFirstSegmentSeconds = shortFirstSegmentSeconds
     }
 
     /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
@@ -653,6 +655,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// When true, `start()` skips the VOD duration guard / cue prewarm / precomputed plan and
     /// uses the forward-only live cut mode (producer cuts at each IDR past the duration target).
     let isLiveSession: Bool
+
+    /// 短首段起播优化的首段目标时长（秒）；nil = 关闭。来自 `LoadOptions.shortFirstSegmentSeconds`。
+    let shortFirstSegmentSeconds: Double?
 
     /// Controls whether the first live manifest may take the bounded shallow-window path.
     private let liveJoinProfile: LiveJoinProfile
@@ -831,7 +836,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 plan = Self.buildKeyframeSegmentPlan(
                     keyframes: keyframes,
                     videoTimeBase: videoTimeBase,
-                    sourceDurationSeconds: durationSeconds
+                    sourceDurationSeconds: durationSeconds,
+                    firstSegmentSeconds: shortFirstSegmentSeconds
                 )
                 let firstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = firstKeyframePts

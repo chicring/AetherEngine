@@ -104,12 +104,19 @@ extension HLSVideoEngine {
     static func buildKeyframeSegmentPlan(
         keyframes: [Int64],
         videoTimeBase: AVRational,
-        sourceDurationSeconds: Double
+        sourceDurationSeconds: Double,
+        firstSegmentSeconds: Double? = nil
     ) -> [Segment] {
         guard keyframes.count >= 2 else { return [] }
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         guard tb > 0 else { return [] }
         let target = Self.targetSegmentDuration
+        // 短首段起播优化：seg0 用 firstSegmentSeconds 阈值，后续段仍以 target 步进（阈值 = first + segIdx*target），
+        // 保证 seg0 早切、后段间隔不变。nil 或非法值时退回标准 (segIdx+1)*target。
+        let shortFirst: Double? = {
+            guard let f = firstSegmentSeconds, f >= Self.minSegmentDurationSeconds, f < target else { return nil }
+            return f
+        }()
 
         let sorted = keyframes.sorted()
         let startPts0 = sorted[0]
@@ -121,7 +128,8 @@ extension HLSVideoEngine {
         while i < sorted.count {
             let segStartPts = sorted[i]
             let segStartSeconds = Double(segStartPts - startPts0) * tb
-            let thresholdSeconds = Double(segIdx + 1) * target
+            let thresholdSeconds = shortFirst.map { $0 + Double(segIdx) * target }
+                ?? Double(segIdx + 1) * target
 
             var j = i + 1
             while j < sorted.count {

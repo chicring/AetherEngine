@@ -423,7 +423,8 @@ extension AetherEngine {
             // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
             probesize: loadedOptions.probesize,
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
-            forwardBufferSegments: loadedOptions.forwardBufferSegments
+            forwardBufferSegments: loadedOptions.forwardBufferSegments,
+            shortFirstSegmentSeconds: loadedOptions.shortFirstSegmentSeconds
         )
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().

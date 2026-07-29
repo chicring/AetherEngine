@@ -231,6 +231,11 @@ public struct LoadOptions: Sendable, Equatable {
     /// Caller-bounded demux probe budget in microseconds, mapped to `AVFormatContext.max_analyze_duration` for the main playback open. nil keeps the engine default (60 s). Pass a positive value to set an explicit cap; do NOT pass `0` expecting "no cap": FFmpeg maps `0` to a container-dependent heuristic (~5-7 s for MPEG-TS, longer elsewhere) that is SHORTER than the engine's 60 s default. Same scope and fail-open trade-off as `probesize`. Default nil (#68).
     public var maxAnalyzeDuration: Int64?
 
+    /// 短首段起播优化：首个分片的目标时长（秒）。nil = 关闭（首段用正常 targetDuration=4s）。
+    /// 设为较小值（如 1.5）让 seg0 在更早的关键帧切断，AVPlayer 更快拿到首段起播；后续
+    /// 分片仍用正常 targetDuration。只影响 keyframe-aligned 计划；必须 ≥ minSegmentDurationSeconds(1.0)。
+    public var shortFirstSegmentSeconds: Double?
+
     /// Ordered audio-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`). When non-empty and no explicit `audioSourceStreamIndex` is passed to `load`, the engine resolves the first-frame audio track from its single internal probe: the first track whose language matches an entry (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms), falling back to the container default when none match. This lets a host honor a saved language preference on the first frame from one open, instead of probing separately or reloading via `selectAudioTrack` after load (#72). An explicit `audioSourceStreamIndex` still wins. Default empty.
     public var preferredAudioLanguages: [String]
 
@@ -330,6 +335,7 @@ public struct LoadOptions: Sendable, Equatable {
         nativeSubtitlePreferredLanguages: [String] = [],
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
+        shortFirstSegmentSeconds: Double? = nil,
         preferredAudioLanguages: [String] = [],
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
@@ -360,6 +366,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
+        self.shortFirstSegmentSeconds = shortFirstSegmentSeconds
         self.preferredAudioLanguages = preferredAudioLanguages
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
