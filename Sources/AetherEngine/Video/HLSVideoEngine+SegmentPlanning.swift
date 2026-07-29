@@ -75,19 +75,34 @@ extension HLSVideoEngine {
     static func buildUniformSegmentPlan(
         videoTimeBase: AVRational,
         sourceDurationSeconds: Double,
-        startPts0: Int64 = 0
+        startPts0: Int64 = 0,
+        firstSegmentSeconds: Double? = nil
     ) -> [Segment] {
         guard sourceDurationSeconds > 0 else { return [] }
         let stride = Self.targetSegmentDuration
-        let count = max(1, Int(ceil(sourceDurationSeconds / stride)))
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         guard tb > 0 else { return [] }
+        // 短首段起播优化：seg0 用 firstSegmentSeconds，其后仍按 stride 均匀切；nil/非法退回标准均匀栅格。
+        let shortFirst: Double? = {
+            guard let f = firstSegmentSeconds, f >= Self.minSegmentDurationSeconds, f < stride else { return nil }
+            return f
+        }()
+
+        // 段起始时间序列。nil 时 = 0, stride, 2*stride...（与原实现等价）；短首段时 = 0, first, first+stride...
+        var starts: [Double] = []
+        if let first = shortFirst {
+            starts.append(0)
+            var t = first
+            while t < sourceDurationSeconds { starts.append(t); t += stride }
+        } else {
+            var t = 0.0
+            while t < sourceDurationSeconds { starts.append(t); t += stride }
+        }
 
         var plan: [Segment] = []
-        plan.reserveCapacity(count)
-        for i in 0..<count {
-            let startSeconds = Double(i) * stride
-            let endSeconds = min(sourceDurationSeconds, Double(i + 1) * stride)
+        plan.reserveCapacity(starts.count)
+        for (i, startSeconds) in starts.enumerated() {
+            let endSeconds = min(sourceDurationSeconds, i + 1 < starts.count ? starts[i + 1] : sourceDurationSeconds)
             let startPts = startPts0 + Int64(startSeconds / tb)
             let endPts = startPts0 + Int64(endSeconds / tb)
             plan.append(Segment(

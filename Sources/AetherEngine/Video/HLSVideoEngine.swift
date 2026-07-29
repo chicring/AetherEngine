@@ -862,7 +862,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds,
-                    startPts0: anchorPts
+                    startPts0: anchorPts,
+                    firstSegmentSeconds: shortFirstSegmentSeconds
                 )
                 self.firstKeyframePts = anchorPts
                 self.firstKeyframeSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
