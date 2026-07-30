@@ -47,6 +47,12 @@ enum SubtitleImageOCR {
 
     /// One synchronous Vision pass; callers serialize (single worker task / single fill task).
     nonisolated static func recognizeText(in image: CGImage, language: String?) -> String? {
+        // Vision rejects images ≤ 2 px in either dimension; frame-by-frame effects tracks emit
+        // streams of such fragments. Skip the flatten + perform and feed the breaker directly.
+        guard image.width > 2, image.height > 2 else {
+            registerFailure("image too small (\(image.width)x\(image.height))")
+            return nil
+        }
         guard let flat = flattenedOntoBlack(image) else { return nil }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
@@ -62,9 +68,10 @@ enum SubtitleImageOCR {
         do {
             try VNImageRequestHandler(cgImage: flat, options: [:]).perform([request])
         } catch {
-            logFailureOnce("Vision perform failed: \(error)")
+            registerFailure("Vision perform failed: \(error)")
             return nil
         }
+        noteSuccess()
         let observations = (request.results ?? []).compactMap { obs -> (String, CGFloat)? in
             guard let top = obs.topCandidates(1).first else { return nil }
             return (top.string, obs.boundingBox.midY)
@@ -80,7 +87,7 @@ enum SubtitleImageOCR {
         let language = recognitionLanguage(forTrackLanguage: trackLanguage)
         var out: [SubtitleCue] = []
         for cue in cues {
-            if Task.isCancelled { break }
+            if Task.isCancelled || breakerTripped { break }
             switch cue.body {
             case .image(let image):
                 if let text = recognizeText(in: image.cgImage, language: language) {
@@ -93,13 +100,51 @@ enum SubtitleImageOCR {
         if !out.isEmpty { store.appendCues(out) }
     }
 
+    // MARK: - Recognition circuit breaker
+
+    /// Consecutive-failure breaker: a frame-by-frame effects PGS track feeds ~24 unrecognizable
+    /// fragments per second, and without a trip every one still pays flatten + Vision (or the
+    /// tiny-image reject) forever — a full core of standing CPU for a rendition that will never
+    /// hold text. Any successful Vision pass (text found or not) resets the count; a trip stays
+    /// until the next `resetBreaker()` (worker re-arm on track select / new session).
+    static let breakerConsecutiveFailureLimit = 12
+
     private static let failureLock = NSLock()
     nonisolated(unsafe) private static var loggedFailure = false
-    private nonisolated static func logFailureOnce(_ reason: String) {
+    nonisolated(unsafe) private static var consecutiveFailures = 0
+    nonisolated(unsafe) private static var tripped = false
+
+    /// True once recognition has failed `breakerConsecutiveFailureLimit` times in a row.
+    /// The OCR worker polls this and disarms itself.
+    nonisolated static var breakerTripped: Bool {
+        failureLock.lock(); defer { failureLock.unlock() }
+        return tripped
+    }
+
+    /// New arm / new session: recognition gets a fresh chance (different track, different bitmaps).
+    nonisolated static func resetBreaker() {
+        failureLock.lock(); defer { failureLock.unlock() }
+        consecutiveFailures = 0
+        tripped = false
+        loggedFailure = false
+    }
+
+    private nonisolated static func noteSuccess() {
+        failureLock.lock(); defer { failureLock.unlock() }
+        consecutiveFailures = 0
+    }
+
+    private nonisolated static func registerFailure(_ reason: String) {
         failureLock.lock()
-        let first = !loggedFailure
+        consecutiveFailures += 1
+        let justTripped = !tripped && consecutiveFailures >= breakerConsecutiveFailureLimit
+        if justTripped { tripped = true }
+        let firstLog = !loggedFailure
         loggedFailure = true
         failureLock.unlock()
-        if first { EngineLog.emit("[SubtitleOCR] degraded: \(reason)", category: .engine) }
+        if firstLog { EngineLog.emit("[SubtitleOCR] degraded: \(reason)", category: .engine) }
+        if justTripped {
+            EngineLog.emit("[SubtitleOCR] circuit breaker tripped after \(breakerConsecutiveFailureLimit) consecutive failures", category: .engine)
+        }
     }
 }

@@ -14,9 +14,18 @@ extension AetherEngine {
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil
         EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex)", category: .engine)
+        SubtitleImageOCR.resetBreaker()
         subtitleOCRWorkerTask = Task.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                // Breaker tripped (unrecognizable bitmap stream, e.g. frame-by-frame effects PGS):
+                // disarm entirely. Returning here also stops the MainActor collect tick — the
+                // second decode pass is the expensive half, not just the Vision calls.
+                if SubtitleImageOCR.breakerTripped {
+                    EngineLog.emit("[SubtitleOCR] worker disarmed: recognition circuit breaker tripped", category: .engine)
+                    await MainActor.run { [weak self] in self?.cancelSubtitleOCRWorker() }
+                    return
+                }
                 let batch = await MainActor.run { [weak self] in
                     self?.subtitleOCRCollectTick(ordinal: ordinal, streamIndex: streamIndex) ?? []
                 }
