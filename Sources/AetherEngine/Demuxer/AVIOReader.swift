@@ -230,6 +230,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// forward-wait, abandon the connection and reconnect at the frontier; a fresh connection to the same
     /// origin typically delivers the range at full speed (first data ~200-400ms). Re-armed per window.
     private static let forwardWaitDripReconnectMs: Double = 5_000
+    /// #DRIP throughput floor (bytes/sec): only treat a long read as a drip if its average delivery is
+    /// below this. Device drip was ~10 KB/s (256 KB over 25s); any healthy read is MB/s. 50 KB/s cleanly
+    /// separates them and spares a slow-but-steady large read from a needless reconnect (CR).
+    private static let dripFloorBytesPerSec: Int64 = 50 * 1024
     // A reconnect that delivers at least this much counts as progress; resets streak.
     private static let minReconnectProgress: Int64 = 512 * 1024
     // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
@@ -954,6 +958,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var totalRead = 0
         // #DRIP: drip-triggered reconnects in THIS read, re-arming the drip timer once per window.
         var dripReconnects = 0
+        // #DRIP: bytes fetched at read start, to gate the breaker on actual throughput (not just elapsed).
+        let dripReadStartBytes = cumulativeBytesFetched
 
         // #93 restart latency: accumulate where THIS read spends its time; one summary line fires
         // on completion when the whole call exceeded the threshold (see SlowReadDiagnostics).
@@ -1190,9 +1196,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
                     diag.recordBackoff(ms: msSince(backoffStart))
                     timedReconnect(seek: false, at: frontier)
-                } else if msSince(readStart) >= Double(dripReconnects + 1) * Self.forwardWaitDripReconnectMs {
-                    // #DRIP: alive but dripping — signaled micro-deliveries that never fill the read, so the
-                    // silence-only path above never fires (115 range-throttle: one read
+                } else if msSince(readStart) >= Double(dripReconnects + 1) * Self.forwardWaitDripReconnectMs,
+                          cumulativeBytesFetched - dripReadStartBytes < Int64(msSince(readStart) / 1000.0) * Self.dripFloorBytesPerSec {
+                    // #DRIP: alive but dripping — signaled micro-deliveries whose AVERAGE throughput is below
+                    // the drip floor. connStallTimeout only fires on TOTAL silence, so a drip never trips it
+                    // (115 range-throttle: one read
                     // stallWaits=18(25681ms,18signaled) reconnects=0, starving the segment into a -15628
                     // loader poison). Abandon and reconnect at the frontier; startPersistentConnection cancels
                     // the old task first, so no second concurrent connection. Bounded by the give-up budget.
