@@ -612,7 +612,9 @@ extension AetherEngine {
         // text and CC entries so existing ordinals stay byte-stable. Unique NAMEs are computed
         // over text+bitmap together: a same-language pair must get the numbered suffix, or
         // AVFoundation collapses the legible options.
-        let bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
+        let bitmapEntries = loadedOptions.prepareBitmapSubtitleOCR
+            ? Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
+            : []
         let combinedInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable + bitmapEntries)
         let renditionInfos = Array(combinedInfos.prefix(nativeSubtitleTrackTable.count))
         let bitmapInfos = Array(combinedInfos.suffix(bitmapEntries.count))

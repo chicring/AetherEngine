@@ -210,6 +210,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
     public var prepareNativeSubtitles: Bool = false
 
+    /// Phase D bitmap OCR renditions: with `prepareNativeSubtitles`, bitmap tracks (PGS / DVB / DVD) additionally
+    /// get an OCR-fed WebVTT rendition so they too survive PiP / AirPlay. Selecting such a track arms the OCR
+    /// worker — a second MainActor decode pass over the packet store plus a Vision request per cue — and raises
+    /// the subtitle forward-prefetch lead from 60 s to 270 s. Hosts that render bitmaps overlay-only can opt out
+    /// and skip that standing cost; text-track renditions are unaffected. Default `true` (pre-existing behavior).
+    public var prepareBitmapSubtitleOCR: Bool = true
+
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
@@ -330,6 +337,7 @@ public struct LoadOptions: Sendable, Equatable {
         nativeRemoteHLSIngestFallback: Bool = true,
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
+        prepareBitmapSubtitleOCR: Bool = true,
         eagerNativeSubtitleReaders: Bool = false,
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
@@ -361,6 +369,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
+        self.prepareBitmapSubtitleOCR = prepareBitmapSubtitleOCR
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
