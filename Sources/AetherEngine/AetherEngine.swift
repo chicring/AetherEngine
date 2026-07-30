@@ -3167,12 +3167,17 @@ public final class AetherEngine: ObservableObject {
             nativeClockSeconds = clockTarget
             clock.currentTime = target
         }
+        // #254: the SW/audio hosts reposition their demuxer under a read deadline, off the main actor.
+        // A reposition that spends its budget leaves the read position undefined and nothing re-issues
+        // it, unlike the native recovery path whose ticket stays open for a late landing, so that case
+        // closes this ticket terminally as `.stalled` instead of claiming a landing it cannot back up.
+        var hostReposition: Demuxer.RepositionOutcome = .landed
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
         } else if let host = audioHost {
-            await host.seek(to: clockTarget)
+            hostReposition = await host.seek(to: clockTarget)
         } else if let host = softwareHost {
-            await host.seek(to: clockTarget)
+            hostReposition = await host.seek(to: clockTarget)
         } else {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek
             // never lands and the recovery chain must aim here, not at the frozen clock.
@@ -3502,7 +3507,20 @@ public final class AetherEngine: ObservableObject {
         setProgrammaticSeek(inFlight: false, target: nil)
         // `sourceTime` is the on-screen frame (#49/#123): the honest landing position, which keyframe
         // granularity or a still-draining chase can put a little off the target.
-        closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: clock.sourceTime))
+        closeSeekTicket(&programmaticSeekTicket,
+                        with: Self.seekTicketOutcome(hostReposition: hostReposition,
+                                                     renderedTime: clock.sourceTime))
+    }
+
+    /// #254: how a SW/audio-host reposition maps onto this seek's ticket. A reposition that spent its
+    /// read-deadline budget left the read position undefined, and nothing on that path re-issues it:
+    /// the native recovery loop can leave its ticket open because AVPlayer keeps aiming at the target
+    /// and a late `.landed` still arrives, while here no one does. So it closes terminally as
+    /// `.stalled` rather than claiming a landing it cannot back up.
+    nonisolated static func seekTicketOutcome(
+        hostReposition: Demuxer.RepositionOutcome, renderedTime: Double
+    ) -> SeekEvent.Outcome {
+        hostReposition == .stalled ? .stalled : .landed(renderedTime: renderedTime)
     }
 
     /// #112 rework: the playhead jumped (seek landing or wedge reconcile). Reset the PGS

@@ -2211,8 +2211,60 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    // MARK: - Response Body Bounds (#255)
+
+    /// Reservation ceiling for a response whose request set no bounded `Range`. `Data` grows on
+    /// demand, so the cap costs at most one reallocation on a legitimately larger body, while a
+    /// bogus or whole-source declared length stays harmless.
+    static let maxBodyReserve = 8 * 1024 * 1024
+
+    /// Bytes the request can legitimately deliver: the span of a bounded `Range: bytes=a-b`, 0 for a
+    /// HEAD (bodyless by definition), nil when the request is open-ended and the body is whatever the
+    /// origin chooses to stream.
+    ///
+    /// #255: the declared `Content-Length` is not that number and never was. A HEAD answers with the
+    /// whole source's length and no body at all, and an origin that ignores `Range` answers a bounded
+    /// chunk request with `200` plus the whole source's length, so sizing an allocation from it asked
+    /// malloc for the entire 12.4 GB movie at open time. `Data`'s storage force-unwraps the NULL that
+    /// a failing malloc returns, so it traps: a host app can neither catch it nor degrade.
+    static func expectedBodyBytes(for request: URLRequest) -> Int? {
+        if request.httpMethod?.uppercased() == "HEAD" { return 0 }
+        guard let value = request.value(forHTTPHeaderField: "Range") else { return nil }
+        return boundedRangeSpan(value)
+    }
+
+    /// Span of a single bounded byte range (`bytes=a-b`). Nil for the open-ended (`bytes=a-`), suffix
+    /// (`bytes=-n`), multi-range and malformed forms: none of those bound the body, so they fall back
+    /// to the flat ceiling rather than a wrong limit.
+    static func boundedRangeSpan(_ headerValue: String) -> Int? {
+        let spec = headerValue.trimmingCharacters(in: .whitespaces)
+        guard spec.lowercased().hasPrefix("bytes=") else { return nil }
+        let set = spec.dropFirst("bytes=".count)
+        guard !set.contains(",") else { return nil }
+        let parts = set.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let lower = Int64(parts[0]), let upper = Int64(parts[1]),
+              lower >= 0, upper >= lower else { return nil }
+        let span = upper - lower + 1
+        return span <= Int64(Int.max) ? Int(span) : nil
+    }
+
+    /// Bytes to reserve up front for a response body: the origin's declared length clamped to what
+    /// the request itself can deliver, or to `maxBodyReserve` when the request is open-ended.
+    static func bodyReservation(declaredLength: Int64, limit: Int?) -> Int {
+        guard declaredLength > 0 else { return 0 }
+        let ceiling = Int64(limit ?? maxBodyReserve)
+        guard ceiling > 0 else { return 0 }
+        return Int(min(declaredLength, ceiling))
+    }
+
+    /// #255 test hook: the largest up-front body reservation any chunk fetch has asked for since the
+    /// last reset. Written on the delegate queue, read once the fetch it belongs to has completed.
+    nonisolated(unsafe) static var peakBodyReserveForTesting = 0
+
     private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35) throws -> (Data, URLResponse) {
-        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders)
+        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders,
+                                          bodyLimit: Self.expectedBodyBytes(for: request))
         let task = Self.chunkSession.dataTask(with: request)
         task.delegate = delegate
 
@@ -2234,8 +2286,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             throw AVIOReaderError.requestTimeout
         }
 
-        if let err = delegate.error { throw err }
+        // A truncating cancel is this reader hanging up on purpose, so the cancellation error it
+        // produces is not a failed fetch: the prefix the request asked for is in hand (#255).
+        if let err = delegate.error, !delegate.truncated { throw err }
         guard let response = delegate.response else { throw AVIOReaderError.noResponse }
+        if delegate.truncated {
+            EngineLog.emit(
+                "[AVIOReader] response body ran past the requested range; kept \(delegate.body.count) bytes and hung up (origin ignored Range?)",
+                category: .demux, level: .verbose
+            )
+        }
         return (delegate.body, response)
     }
 }
@@ -2401,14 +2461,22 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
 /// via semaphore ensures no concurrent access to mutable fields.
 private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let extraHeaders: [String: String]
+    /// Most this fetch will ever buffer, nil when the request is open-ended (#255). Derived from
+    /// the request, never from the response: a declared length is the origin's claim about the
+    /// whole source, not about this body.
+    let bodyLimit: Int?
     var body = Data()
     var response: URLResponse?
     var error: Error?
+    /// Set when the origin sent past `bodyLimit` and the task was cancelled mid-body, so the
+    /// caller reads the kept prefix as a success instead of a cancellation failure.
+    var truncated = false
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
 
-    init(extraHeaders: [String: String]) {
+    init(extraHeaders: [String: String], bodyLimit: Int?) {
         self.extraHeaders = extraHeaders
+        self.bodyLimit = bodyLimit
     }
 
     func urlSession(
@@ -2430,8 +2498,11 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     ) {
         self.response = response
         if let http = response as? HTTPURLResponse {
-            let len = Int(http.expectedContentLength)
-            if len > 0 { body.reserveCapacity(len) }
+            let reserve = AVIOReader.bodyReservation(
+                declaredLength: http.expectedContentLength, limit: bodyLimit)
+            AVIOReader.peakBodyReserveForTesting = max(
+                AVIOReader.peakBodyReserveForTesting, reserve)
+            if reserve > 0 { body.reserveCapacity(reserve) }
             let status = http.statusCode
             if status == 200 || status == 206,
                let resolved = dataTask.currentRequest?.url {
@@ -2446,17 +2517,34 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
-        // Force-copy: body.append(data) may retain source dispatch_data via CoW,
-        // defeating the per-delivery release. Manual memcpy guarantees drop on return.
-        let count = data.count
-        let baseCount = body.count
-        body.count = baseCount + count
-        body.withUnsafeMutableBytes { dst in
-            data.withUnsafeBytes { src in
-                if let dstBase = dst.baseAddress, let srcBase = src.baseAddress {
-                    (dstBase + baseCount).copyMemory(from: srcBase, byteCount: count)
+        var count = data.count
+        var overshoot = false
+        if let bodyLimit {
+            // Past what the request asked for means the origin ignored the Range and is streaming
+            // the whole source at us. Keep the prefix the caller wanted and hang up, rather than
+            // buffer a 12 GB movie in order to reject it afterwards (#255).
+            let room = bodyLimit - body.count
+            if count > room {
+                count = max(0, room)
+                overshoot = true
+            }
+        }
+        if count > 0 {
+            // Force-copy: body.append(data) may retain source dispatch_data via CoW,
+            // defeating the per-delivery release. Manual memcpy guarantees drop on return.
+            let baseCount = body.count
+            body.count = baseCount + count
+            body.withUnsafeMutableBytes { dst in
+                data.withUnsafeBytes { src in
+                    if let dstBase = dst.baseAddress, let srcBase = src.baseAddress {
+                        (dstBase + baseCount).copyMemory(from: srcBase, byteCount: count)
+                    }
                 }
             }
+        }
+        if overshoot {
+            truncated = true
+            dataTask.cancel()
         }
     }
 

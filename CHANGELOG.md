@@ -12,6 +12,34 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.1.3] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.3))
+
+### Fixed
+
+- **Teletext rows no longer arrive with the column padding still on them.** A page libzvbi does not classify as a subtitle page is written out as the raw grid, every row at full column width with a hard space per grid cell, and the engine's two whitespace passes both walked past the inside of a line break: one trims the outer edges of the whole cue, the other folds what sits between two newlines and never looks at the characters touching a single one. A two-row caption therefore reached the host as `row one<pad>` / `<pad>row two`, which puts the second row visibly off centre on a renderer that centres each line and draws the cue's background box wider than its text. Both passes are now gated on that same raw-grid case, which is exactly the page that arrives without an alignment override, so a page the decoder curates itself is passed through whole: there the surviving padding is the relative indentation carrying the alignment it picked, and the blank lines are its vertical fine-positioning inside the block, both of which the blank-line fold had been discarding since #107. Reported by tresby, who had solved it row-wise in a proxy implementation and supplied the failing sequence.
+
+### Changed
+
+- **FFmpegBuild and LibDovi are pinned to the minor rather than floating from a lower bound**, so a released engine tag's dependency set is a property of the tag instead of the registry at resolve time. Both classes of drift this guards against were live: LibDovi 1.1.0 raised its declared tvOS floor in a minor, which SwiftPM floats onto and then fails on instead of backing off, so every 5.x tag stopped resolving; and FFmpegBuild 2.4.0 replaced 2.3.0 under a fixed 5.28.0 checkout. Forward-looking only, already published tags keep what they declared. Consumers resolve to the same versions as before (FFmpegBuild 2.4.0, LibDovi 2.0.0).
+
+## [6.1.2] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.2))
+
+### Fixed
+
+- **Opening a large progressive HTTP source no longer dies in the allocator before the first frame.** The chunk-fetch delegate reserved whatever the response declared, and one of the requests that reaches that line is the HEAD size probe, which declares the entire source and delivers no body at all: opening a 12.4 GB MKV asked malloc for 12.4 GB in order to buffer nothing, and on a 6 GB device the NULL that came back was force-unwrapped inside `Data`'s storage, so it trapped on the URLSession delegate queue rather than throwing (a host app could neither catch it nor degrade). The HEAD fallback is launched 0.75 s after the range probes and runs whenever they have not resolved a size yet, so this was reachable on any non-prefetch open (still extraction, one-shot seekable) against a slow origin, not only against origins that reject Range outright. The reservation now comes from the request instead of the response: the span of a bounded `Range`, nothing at all for a HEAD, a flat 8 MB ceiling for an open-ended request. The body is bounded by that same span, so an origin that ignores `Range` and answers a bounded chunk request with `200` plus the whole source's length is hung up on after the requested prefix instead of having its entire file buffered and then rejected. Reported by dlev02 from a symbolicated crash report.
+
+## [6.1.1] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.1))
+
+### Fixed
+
+- **A seek on the software path no longer blocks the main thread for the length of a network read.** `SoftwarePlaybackHost` is `@MainActor` and ran the demuxer reposition inline, so a seek issued while the demux loop sat in a slow remote read waited out that read on the main thread: two field App Hangs, "Fully Blocked", 4.4 s and 5.2 s, on a WAN source. The lock is held across the whole of `av_read_frame`, which is also why the existing deadline could not have prevented them, since it is armed on the far side of that lock. The reposition now runs off the main actor under an 8 s read deadline, and a burst of scrubs collapses onto its last target instead of paying one lock wait per seek. The same inline call sat in both hosts' `startPosition` resume, so this covers every resume into a remote source, not just scrubbing. A reposition that spends its budget reports `.stalled` on `seekEvents` rather than a landing it cannot back up. Reported by rrgomes from two production crash-reporter events.
+
 ## [6.1.0] - 2026-07-30
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.0))

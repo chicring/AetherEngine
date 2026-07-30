@@ -1175,6 +1175,47 @@ public final class Demuxer: @unchecked Sendable {
         return ret >= 0 && !capped
     }
 
+    /// How an off-actor reposition ended (#254). Named to mirror `SeekEvent.Outcome` so the engine's
+    /// mapping onto the public seek-event stream is one line.
+    enum RepositionOutcome: Sendable, Equatable {
+        /// `avformat_seek_file` completed inside the budget; the read position is at the target.
+        case landed
+        /// The reposition did not complete: the read deadline fired, `avformat_seek_file` failed, or
+        /// there was no open format context. The read position is undefined.
+        case stalled
+        /// A newer seek arrived before this one reached the demuxer, so it never ran.
+        case superseded
+    }
+
+    /// `seekBounded` off the caller's actor (#254).
+    ///
+    /// `readPacket` holds `accessLock` for the whole of `av_read_frame`, so the `accessLock.lock()`
+    /// inside every seek first waits out whatever read is in flight, up to `AVIOReader.connStallTimeout`
+    /// (20 s), BEFORE the deadline armed inside `seekBounded` starts counting. A `@MainActor` host that
+    /// calls the synchronous form therefore blocks the main thread for the length of one remote read;
+    /// the field saw 4.4 s and 5.2 s "Fully Blocked" App Hangs on a WAN source that way. The deadline
+    /// on its own does not fix that class, because it is armed on the far side of the lock.
+    ///
+    /// `queue` must be serial, so repositions stay in issue order, and must not be the queue the
+    /// caller's demux loop occupies (that block never returns, so the seek would never run).
+    /// `isSuperseded` is evaluated ON that queue, immediately before the FFmpeg call: a scrub burst
+    /// then collapses onto its last target instead of paying one lock wait per seek.
+    func seekBounded(to seconds: Double, anchorStreamIndex: Int32 = -1, timeout: TimeInterval,
+                     on queue: DispatchQueue,
+                     isSuperseded: (@Sendable () -> Bool)? = nil) async -> RepositionOutcome {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                guard isSuperseded?() != true else {
+                    continuation.resume(returning: .superseded)
+                    return
+                }
+                let completed = seekBounded(to: seconds, anchorStreamIndex: anchorStreamIndex,
+                                            timeout: timeout)
+                continuation.resume(returning: completed ? .landed : .stalled)
+            }
+        }
+    }
+
     /// #112 round 8/10: byte-position seek for an index-less container. On a remote MPEG-TS with no index, a
     /// timestamp `avformat_seek_file` binary-searches via read_timestamp: dozens of remote range reads, each
     /// able to ride a starved connection's full timeout while the video pipeline competes for the origin

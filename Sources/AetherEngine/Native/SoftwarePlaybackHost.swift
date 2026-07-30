@@ -87,6 +87,19 @@ final class SoftwarePlaybackHost {
 
     private let demuxQueue = DispatchQueue(label: "engine.sw.demux", qos: .userInitiated)
 
+    /// #254: every demuxer reposition runs here, never on the main actor. See
+    /// `Demuxer.seekBounded(to:anchorStreamIndex:timeout:on:isSuperseded:)` for why the main actor is
+    /// the wrong thread for it. Serial and separate from `demuxQueue`, whose block never returns.
+    private let seekQueue = DispatchQueue(label: "engine.sw.seek", qos: .userInitiated)
+
+    /// Read-deadline budget for a reposition (#254). Matches the side reader's positioning budget.
+    private static let seekBudgetSeconds: TimeInterval = 8.0
+
+    /// True while a reposition is awaiting `seekQueue`. Gates the 0.25 s time tick: the synchronizer
+    /// still carries the pre-seek anchor, so an ungated tick would walk the OLD position forward for
+    /// the length of the reposition and then snap to the target.
+    private var seekInFlight = false
+
     /// Guards isPlaying/stopRequested across demux thread reads and main-actor writes.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
@@ -500,7 +513,13 @@ final class SoftwarePlaybackHost {
         resetFeederState()
 
         if let start = startPosition, start > 0 {
-            dem.seek(to: start)
+            // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
+            // remote source that has to scan for its landing would otherwise block the main thread here.
+            _ = await dem.seekBounded(to: start, timeout: Self.seekBudgetSeconds, on: seekQueue)
+            // This is load()'s only suspension point, so it is also the only place a stop() can land
+            // mid-load. Arming the clock and publishing isReady on a session already torn down would
+            // hand the engine a host it has stopped.
+            guard !stopRequested else { return }
             // Mirror seek() skip-PTS + clock alignment so demux drops pre-keyframe frames and synchronizer starts at the resume offset.
             let startTime = CMTime(seconds: start, preferredTimescale: 90000)
             videoDecoder.skipUntilPTS = startTime
@@ -619,10 +638,17 @@ final class SoftwarePlaybackHost {
         }
     }
 
-    func seek(to seconds: Double) async {
-        guard let dem = demuxer else { return }
-        // Stop loop + bump generation to invalidate in-flight packets.
+    /// #254: the demuxer reposition is awaited off the main actor. It used to run inline here, and
+    /// because `Demuxer.readPacket` holds the access lock across the whole `av_read_frame`, a seek
+    /// issued while the demux loop sat in a slow remote read parked the main thread for the length of
+    /// that read (App Hangs of 4.4 s and 5.2 s in the field on a WAN source).
+    @discardableResult
+    func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
+        guard let dem = demuxer else { return .stalled }
+        // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
+        // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
+        let generation = seekGeneration
         let wasPlaying = isPlaying
         isPlaying = false
 
@@ -637,10 +663,28 @@ final class SoftwarePlaybackHost {
         // Live source is forward-only; DVR rewind reseeds decoders from the ring without touching the live demuxer's read position.
         if isLive, let ring = dvrRing {
             await seekLiveDVR(to: seconds, ring: ring, wasPlaying: wasPlaying)
-            return
+            return .landed
         }
 
-        dem.seek(to: seconds)
+        // Publish the target and hold it across the await, so the scrub clock snaps the way the native
+        // path's optimistic publish does instead of drifting on the stale synchronizer anchor.
+        currentTime = seconds
+        seekInFlight = true
+        let outcome = await dem.seekBounded(
+            to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+            isSuperseded: { [weak self] in self?.seekGeneration != generation })
+        // A newer seek owns the state from here: it published its own target and clears the hold itself.
+        // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
+        // isPlaying on a torn-down session would resurrect a loop that has already been told to quit.
+        guard seekGeneration == generation, !stopRequested else { return .superseded }
+        seekInFlight = false
+        if outcome == .stalled {
+            EngineLog.emit(
+                "[SWHost] reposition to \(String(format: "%.2f", seconds))s did not complete within "
+                + "\(String(format: "%.0f", Self.seekBudgetSeconds))s; read position is undefined",
+                category: .swPlayback
+            )
+        }
 
         let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
@@ -659,6 +703,7 @@ final class SoftwarePlaybackHost {
         }
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true
+        return outcome
     }
 
     /// Live DVR rewind: reseeds decoder from the ring (source PTS axis; maps via sessionStartPts) without touching the live demuxer. After return, the loop reads new packets forward and plays back to live.
@@ -750,6 +795,7 @@ final class SoftwarePlaybackHost {
     func stop() {
         stopRequested = true
         isPlaying = false
+        seekInFlight = false
         timeTimer?.cancel()
         timeTimer = nil
         renderer.subtitleCompositor.reset()
@@ -1672,6 +1718,9 @@ final class SoftwarePlaybackHost {
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self, let aOut = self.audioOutput else { return }
+                // #254: a reposition in flight holds `currentTime` at its target; the synchronizer is
+                // still on the pre-seek anchor and would drag the published position backwards.
+                guard !self.seekInFlight else { return }
                 let raw = aOut.currentTimeSeconds
                 if raw.isFinite, raw >= 0 {
                     // Raw clock = source/subtitle axis; published alongside the mapped position (#107).

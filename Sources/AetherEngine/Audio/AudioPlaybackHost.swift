@@ -31,6 +31,18 @@ final class AudioPlaybackHost {
     /// One demux queue per host so rapid load() calls don't fight over the same execution context.
     private let demuxQueue = DispatchQueue(label: "engine.audio.demux", qos: .userInitiated)
 
+    /// #254: every demuxer reposition runs here, never on the main actor. See
+    /// `Demuxer.seekBounded(to:anchorStreamIndex:timeout:on:isSuperseded:)` for why the main actor is
+    /// the wrong thread for it. Serial and separate from `demuxQueue`, whose block never returns.
+    private let seekQueue = DispatchQueue(label: "engine.audio.seek", qos: .userInitiated)
+
+    /// Read-deadline budget for a reposition (#254). Matches `SoftwarePlaybackHost`.
+    private static let seekBudgetSeconds: TimeInterval = 8.0
+
+    /// True while a reposition is awaiting `seekQueue`; gates the 250 ms tick so it cannot republish
+    /// the pre-seek synchronizer position over the target this seek already committed to.
+    private var seekInFlight = false
+
     /// Guards playing/stop flags: read on demux thread every iteration, written on main actor.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
@@ -129,7 +141,10 @@ final class AudioPlaybackHost {
         self.audioOutput = AudioOutput()
 
         if let start = startPosition, start > 0 {
-            dem.seek(to: start)
+            // #254: same off-main, deadline-bounded reposition the transport seek uses. Also load()'s
+            // only suspension point, so the only place a stop() can land mid-load.
+            _ = await dem.seekBounded(to: start, timeout: Self.seekBudgetSeconds, on: seekQueue)
+            guard !stopRequested else { return }
             initialClockTime = CMTime(seconds: start, preferredTimescale: 90000)
             currentTime = start
         } else {
@@ -176,26 +191,45 @@ final class AudioPlaybackHost {
         rate = newRate
     }
 
-    func seek(to seconds: Double) async {
-        guard let dem = demuxer else { return }
+    /// #254: the demuxer reposition is awaited off the main actor, for the reason
+    /// `Demuxer.seekBounded(to:anchorStreamIndex:timeout:on:isSuperseded:)` documents. Same defect as
+    /// `SoftwarePlaybackHost.seek`, same shape, only without the video half.
+    @discardableResult
+    func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
+        guard let dem = demuxer else { return .stalled }
+        // Drop the demux loop's enqueue high-water mark; after a backward seek the stale mark would park the
+        // back-pressure gate until the clock walked back up to the pre-seek position (minutes of silence).
+        // Hoisted above the reposition (#254): it is also the fence the reposition tests for supersession,
+        // and it invalidates in-flight packets from the moment the seek starts rather than after it.
+        bumpSeekGeneration()
+        let generation = seekGeneration
         let wasPlaying = isPlaying
         isPlaying = false
 
         audioDecoder?.flush()
         audioOutput?.flush()
 
-        dem.seek(to: seconds)
         currentTime = seconds
-
-        // Drop the demux loop's enqueue high-water mark; after a backward seek the stale mark would park the
-        // back-pressure gate until the clock walked back up to the pre-seek position (minutes of silence).
-        bumpSeekGeneration()
+        seekInFlight = true
+        let outcome = await dem.seekBounded(
+            to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+            isSuperseded: { [weak self] in self?.seekGeneration != generation })
+        guard seekGeneration == generation, !stopRequested else { return .superseded }
+        seekInFlight = false
+        if outcome == .stalled {
+            EngineLog.emit(
+                "[AudioHost] reposition to \(String(format: "%.2f", seconds))s did not complete within "
+                + "\(String(format: "%.0f", Self.seekBudgetSeconds))s; read position is undefined",
+                category: .swPlayback
+            )
+        }
+        currentTime = seconds
 
         let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
         guard demuxLoopStarted else {
             // Cold seek (no play() yet): stash target so the loop's first decoded packet anchors there, not at .zero.
             initialClockTime = targetTime
-            return
+            return outcome
         }
         if wasPlaying {
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
@@ -208,11 +242,13 @@ final class AudioPlaybackHost {
         }
         // Clock is now positioned; demux loop must not re-arm it at the stale initial anchor.
         clockArmed = true
+        return outcome
     }
 
     func stop() {
         stopRequested = true
         isPlaying = false
+        seekInFlight = false
         timeTimer?.cancel()
         timeTimer = nil
 
@@ -431,6 +467,9 @@ final class AudioPlaybackHost {
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self, let aOut = self.audioOutput else { return }
+                // #254: a reposition in flight holds `currentTime` at its target; the synchronizer is
+                // still on the pre-seek anchor and would drag the published position backwards.
+                guard !self.seekInFlight else { return }
                 let t = aOut.currentTimeSeconds
                 if t.isFinite, t >= 0 {
                     self.currentTime = t
