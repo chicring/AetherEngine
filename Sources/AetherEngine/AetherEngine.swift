@@ -1902,6 +1902,12 @@ public final class AetherEngine: ObservableObject {
     /// evicted cues are re-emitted after a producer restart (fresh EmbeddedSubtitleDecoder, empty dedupe set).
     let subtitleCueRetentionSeconds: Double = 300
 
+    /// Count backstop on the retained cue stores (see pruneOldSubtitleCues). The time window
+    /// above bounds normal tracks; a frame-by-frame effects PGS track (~24 cues/s) fits ~8600
+    /// decoded bitmaps inside it. Must exceed the 60 s drain lead at that flood rate (~1450)
+    /// so eviction only ever takes played-out history, never the forward window.
+    nonisolated static let maxRetainedSubtitleCueCount: Int = 2000
+
     /// #15: native WebVTT readers must stay ahead of AVPlayer's subtitle prefetch (~240s burst at PiP start),
     /// otherwise far segments are fetched empty and cached empty for the VOD rendition. Larger than the inline
     /// reader's 90s lead; only runs while a native rendition is selected (PiP), so the extra read is bounded.
