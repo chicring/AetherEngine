@@ -1009,8 +1009,13 @@ extension AetherEngine {
                 guard !Task.isCancelled, let self = self else { return }
                 guard self.isSubtitleActive else { return }
                 // Sidecar cues are in source PTS; host renders against engine.sourceTime (which folds playlistShiftSeconds).
-                self.subtitleCues = result.cues
+                // Header MUST publish before cues: a styled-ASS host activates its renderer off the
+                // header stream and drops cues that arrive while inactive (external tracks carry no
+                // TrackInfo.assHeader, so activation waits on THIS slot). Cues-first delivered the
+                // whole file into a not-yet-active coordinator and libass rendered an empty track
+                // (device: activate logged, subCues=1029 engine-side, nothing on screen).
                 self.sidecarASSHeader = result.assHeader
+                self.subtitleCues = result.cues
                 self.isLoadingSubtitles = false
                 // Native mov_text moov is declared at load; runtime sidecars drive only the host overlay (#55).
                 // Phase D: an external bitmap sidecar fills its OCR rendition store from THIS
