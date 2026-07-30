@@ -222,6 +222,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private static let seekKeepForwardLimit = 8 * 1024 * 1024
     // CDN stall threshold: no bytes for this long triggers reconnect.
     private static let connStallTimeout: TimeInterval = 20
+
+    /// #DRIP: a live-but-dripping origin (signaled micro-deliveries that never fill the read) never trips
+    /// `connStallTimeout`, which needs TOTAL silence. Device-confirmed on 115: one read spent
+    /// stallWaits=18(25681ms,18signaled) reconnects=0 — 25s of trickle that starved the segment into an
+    /// AVPlayer loader poison (CoreMedia -15628). If a single read has run this long still stuck in the
+    /// forward-wait, abandon the connection and reconnect at the frontier; a fresh connection to the same
+    /// origin typically delivers the range at full speed (first data ~200-400ms). Re-armed per window.
+    private static let forwardWaitDripReconnectMs: Double = 5_000
     // A reconnect that delivers at least this much counts as progress; resets streak.
     private static let minReconnectProgress: Int64 = 512 * 1024
     // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
@@ -944,6 +952,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func readPersistent(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         let requestSize = Int(size)
         var totalRead = 0
+        // #DRIP: drip-triggered reconnects in THIS read, re-arming the drip timer once per window.
+        var dripReconnects = 0
 
         // #93 restart latency: accumulate where THIS read spends its time; one summary line fires
         // on completion when the whole call exceeded the threshold (see SlowReadDiagnostics).
@@ -1176,6 +1186,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     EngineLog.emit("[AVIOReader] \(label) stall at offset \(frontier), reconnecting", category: .demux)
                     lastUnplannedReconnectAt = Date()
                     emitNetworkPhase(.reconnecting)   // unplanned reconnect now in flight (#85)
+                    let backoffStart = DispatchTime.now()
+                    backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
+                    diag.recordBackoff(ms: msSince(backoffStart))
+                    timedReconnect(seek: false, at: frontier)
+                } else if msSince(readStart) >= Double(dripReconnects + 1) * Self.forwardWaitDripReconnectMs {
+                    // #DRIP: alive but dripping — signaled micro-deliveries that never fill the read, so the
+                    // silence-only path above never fires (115 range-throttle: one read
+                    // stallWaits=18(25681ms,18signaled) reconnects=0, starving the segment into a -15628
+                    // loader poison). Abandon and reconnect at the frontier; startPersistentConnection cancels
+                    // the old task first, so no second concurrent connection. Bounded by the give-up budget.
+                    dripReconnects += 1
+                    if recordReconnectAndShouldGiveUp() {
+                        EngineLog.emit("[AVIOReader] \(label) drip gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
+                        emitNetworkPhase(.flowing)
+                        return totalRead > 0 ? Int32(totalRead) : (isLive ? AVERROR_EIO_VALUE : -1)
+                    }
+                    EngineLog.emit("[AVIOReader] \(label) drip at offset \(frontier) after \(Int(msSince(readStart)))ms (drip-reconnect \(dripReconnects)), reconnecting", category: .demux)
+                    lastUnplannedReconnectAt = Date()
+                    emitNetworkPhase(.reconnecting)
                     let backoffStart = DispatchTime.now()
                     backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
                     diag.recordBackoff(ms: msSince(backoffStart))
