@@ -290,6 +290,13 @@ extension AetherEngine {
             guard let decoder = subtitleDrainDecoders[channel] else { continue }
             let entries = store.entries(streamIndex: streamIndex,
                                         from: window.from, through: window.through)
+            // Bound the MainActor decode per tick: a fresh selection's backfill window on a
+            // frame-by-frame effects PGS track holds ~1800 packets (backscan 15 s + lead 60 s at
+            // ~24/s), and decoding them in one pass froze the UI for seconds at start. The cursor
+            // only advances to the last decoded packet, so following ticks pick up the remainder
+            // (192 packets/s decode far outruns the ~24/s arrival; normal tracks fit in one tick).
+            let batch = entries.prefix(Self.subtitleDrainMaxPacketsPerTick)
+            let truncated = batch.count < entries.count
             // The cursor only advances to an actually-decoded packet's PTS: a window that is
             // empty because the producer has not reached it yet must be rescanned next tick.
             var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
@@ -299,7 +306,7 @@ extension AetherEngine {
             // over the full cue array (O(events × cues) per tick; device: UI frozen, CPU pegged).
             var working = retainedSubtitleCues(for: channel)
             var mutated = false
-            for entry in entries {
+            for entry in batch {
                 // A cue-less event still matters: a PGS clear composition carries only
                 // pgsTrimAt and is what removes the line during silence.
                 if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder),
@@ -322,7 +329,10 @@ extension AetherEngine {
             // decoding above. If the pass remains active with a candidate after the whole window,
             // finalize it. Raw packet presence cannot answer this: the landing line's own zero-object
             // CLEAR is stored ahead and trims the candidate, but carries no cues that can end the pass.
-            if SubtitleOverlayDrainer.shouldFinalizeReconstruction(
+            // A truncated tick has NOT seen the whole window: finalizing then would emit a candidate
+            // still seconds behind the playhead; the pass continues next tick (or ends naturally in
+            // admitDuringReconstruction once the decode reaches the playhead).
+            if !truncated, SubtitleOverlayDrainer.shouldFinalizeReconstruction(
                 reconstructing: pgsStaleArrivalGates[channel]?.reconstructing ?? false,
                 hasCandidate: pgsStaleArrivalGates[channel]?.hasReconstructionCandidate ?? false) {
                 // #143 follow-up: the candidate is the genuinely active line at the seek target, so

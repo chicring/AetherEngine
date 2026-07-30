@@ -739,6 +739,11 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let subtitleDrainBackscanSeconds: Double = 15
     nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
     nonisolated static let subtitleDrainTickNanoseconds: UInt64 = 500_000_000
+    /// Per-tick decode cap for the overlay drainer: smooths a flood backfill (frame-by-frame
+    /// effects PGS, ~1800 packets in a fresh selection's window) over a few ticks instead of one
+    /// long MainActor pass. 96 × 2 ticks/s decodes far faster than any real track emits (~24/s
+    /// worst observed), so the lead edge always catches up within seconds.
+    nonisolated static let subtitleDrainMaxPacketsPerTick: Int = 96
     /// Phase D: the OCR worker decodes bitmap compositions to playhead + this lead so AVKit's
     /// ~240 s forward .vtt prefetch burst at selection is served populated, never cached empty.
     nonisolated static let subtitleOCRLeadSeconds: Double = 240
