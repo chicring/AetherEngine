@@ -813,8 +813,11 @@ extension AetherEngine {
                     ) {
                         // A late landing settled the clock onto the target; if the deadline loop held the
                         // clock at the target and returned without finalizing (slow-source spinner path),
-                        // leave `.seeking` now that the frame is presented.
-                        self.finalizeLateRecoverySeekLanding()
+                        // leave `.seeking` now that the frame is presented. Also where a seek that already
+                        // gave up (`.stalled`) finally reports `.landed` (AE#38 follow-up).
+                        self.finalizeLateRecoverySeekLanding(
+                            rendered: PresentationAxis.display(sourcePTS: value + shift,
+                                                               origin: self.sourcePresentationOrigin))
                     } else {
                         let prev = self.lastRenderedForPendingSeek
                         if value > prev, value - prev < 1.0 {
@@ -840,6 +843,9 @@ extension AetherEngine {
                         self.lastRenderedForPendingSeek = value
                     }
                 }
+                // AE#38 follow-up: a native scrub's in-flight window ends when the PICTURE reaches the
+                // scrub target, not when the coalesced restart run drains.
+                self.checkPendingScrubLanding(rendered: value)
                 // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
                 self.renderedPositionMirror.set(value)
                 self.clock.sourceTime = value + shift

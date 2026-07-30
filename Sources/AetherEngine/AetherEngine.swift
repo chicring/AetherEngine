@@ -68,16 +68,34 @@ public final class AetherEngine: ObservableObject {
         didSet { recomputePlaybackPhase() }
     }
 
-    /// True from seek entry until physical landing, covering both programmatic and native AVKit scrubs.
-    /// Unlike `state == .seeking` (optimistically flipped to `.playing`), this spans the real
-    /// loopback-HLS landing, which resolves seconds after the call (AetherEngine#38). Paired with `seekTarget`.
+    /// True from seek entry until physical landing, covering programmatic seeks, native AVKit scrubs and
+    /// seeks the session could not take yet (#127/#178 stash). Unlike `state == .seeking` (optimistically
+    /// flipped to `.playing`), this spans the real loopback-HLS landing, which resolves seconds after the
+    /// call (AetherEngine#38). Paired with `seekTarget`.
+    ///
+    /// A LEVEL signal: it says a seek is in flight, never why it stopped being one. Observe `seekEvents`
+    /// where the falling edge itself carries weight (landed vs gave up vs superseded, and which target).
     @Published public internal(set) var isSeeking: Bool = false {
         didSet { recomputePlaybackPhase() }
     }
 
     /// Source-PTS seek destination, or nil when idle. Cleared on landing. For native scrubs, set to the
-    /// out-of-range segment time AVPlayer requested (AetherEngine#38).
+    /// out-of-range segment time AVPlayer requested (AetherEngine#38). Follows the most authoritative
+    /// in-flight source (programmatic > scrub > deferred), so it never publishes a settled seek's target
+    /// while a different one is in flight.
     @Published public internal(set) var seekTarget: Double? = nil
+
+    /// Seek-lifecycle events: one value per transition, carrying the outcome and the target it belongs to
+    /// (AetherEngine#38 follow-up). See `SeekEvent` for the contract, including the late `.landed` that
+    /// can follow a `.stalled` and that `isSeeking` structurally cannot express.
+    public var seekEvents: AnyPublisher<SeekEvent, Never> { seekEventSubject.eraseToAnyPublisher() }
+
+    private let seekEventSubject = PassthroughSubject<SeekEvent, Never>()
+
+    /// Monotonic id source for `SeekEvent`. Deliberately NOT `seekGeneration`: that counter is the
+    /// supersede fence every in-flight finalize checks itself against, so a rejected or stashed seek must
+    /// not be able to move it (it would make a live seek believe it lost and return without finalizing).
+    private var seekEventCounter: UInt64 = 0
 
     /// Single source of truth for what playback is doing right now (#85), derived from
     /// `state` / `isBuffering` / `isSeeking` / the reader network phase. Recomputed on every input change;
@@ -110,30 +128,131 @@ public final class AetherEngine: ObservableObject {
     /// preventing a superseded seek from clobbering a newer one.
     private var seekGeneration: UInt64 = 0
 
-    /// Two independent seek-in-flight flags that isSeeking OR-s over. Programmatic and native scrub seeks
-    /// are NOT mutually exclusive: a far programmatic seek triggers the same producer-restart as a scrub.
-    /// Tracked separately so neither can drop isSeeking before the other settles. Routed through
-    /// `setProgrammaticSeek`/`setNativeScrubSeek`.
+    /// #250: read-only view of the seek fence for the subtitle-resolution statement. Read-only on
+    /// purpose: only `seek(to:)` may move the counter, and a diagnostic must not be able to.
+    var currentSeekGeneration: UInt64 { seekGeneration }
+
+    /// Three independent seek-in-flight flags that isSeeking OR-s over. Programmatic and native scrub
+    /// seeks are NOT mutually exclusive: a far programmatic seek triggers the same producer-restart as a
+    /// scrub. `deferred` is a seek stashed before the session could take it (#127/#178). Tracked
+    /// separately so none can drop isSeeking before the others settle. Routed through
+    /// `setProgrammaticSeek`/`setNativeScrubSeek`/`setDeferredSeek`.
     private var programmaticSeekInFlight = false
     private var nativeScrubSeekInFlight = false
+    private var deferredSeekInFlight = false
 
-    /// Recomputes isSeeking/seekTarget from both in-flight flags. Idempotent to avoid redundant Combine emissions.
-    private func recomputeSeekSignal(target: Double?) {
-        let seeking = programmaticSeekInFlight || nativeScrubSeekInFlight
+    /// Per-source targets behind the published `seekTarget`. Kept apart because one fold over "the last
+    /// non-nil target written" published a finished programmatic seek's destination while a scrub was in
+    /// flight toward a different one, and a consumer broadcasting `seekTarget` broadcast the wrong place.
+    private var programmaticSeekTarget: Double?
+    private var nativeScrubSeekTarget: Double?
+    private var deferredSeekTarget: Double?
+
+    /// Event-side bookkeeping for one seek: the id its `.began` carried and the target it aims at. An
+    /// open ticket IS the "not yet reported" state, so closing it is what prevents a double report.
+    /// Deliberately outlives `programmaticSeekInFlight` on the give-up path: a seek reported `.stalled`
+    /// stays alive inside AVPlayer as recovery intent, and the late landing that finally settles it has to
+    /// arrive under the SAME id (AE#38 follow-up).
+    struct SeekTicket {
+        let id: UInt64
+        let target: Double
+        let origin: SeekEvent.Origin
+    }
+
+    var programmaticSeekTicket: SeekTicket?
+    var nativeScrubSeekTicket: SeekTicket?
+    private var deferredSeekTicket: SeekTicket?
+
+    /// Armed scrub landing watch and its give-up timer; see `setNativeScrubSeek`.
+    var pendingScrubLanding: PendingScrubLanding?
+    var scrubLandingWatchdog: Task<Void, Never>?
+
+    /// Was the in-flight restart run caused by a programmatic seek rather than a user scrub? Captured at
+    /// the rising edge, because by the drain the programmatic seek may already have finalized.
+    var scrubRestartOwnedByProgrammaticSeek = false
+
+    private func nextSeekEventID() -> UInt64 {
+        seekEventCounter &+= 1
+        return seekEventCounter
+    }
+
+    /// Publishes one `SeekEvent` and logs it. The log line is the device-side record: a host that has not
+    /// wired the stream still gets the same statement in `EngineLog`.
+    func emitSeekEvent(id: UInt64, origin: SeekEvent.Origin, outcome: SeekEvent.Outcome, target: Double) {
+        let event = SeekEvent(id: id, origin: origin, outcome: outcome, target: target)
+        EngineLog.emit("[AetherEngine] \(event)", category: .engine)
+        seekEventSubject.send(event)
+    }
+
+    /// Opens a ticket and publishes its `.began`.
+    private func beginSeekTicket(origin: SeekEvent.Origin, target: Double) -> SeekTicket {
+        let ticket = SeekTicket(id: nextSeekEventID(), target: target, origin: origin)
+        emitSeekEvent(id: ticket.id, origin: origin, outcome: .began, target: target)
+        return ticket
+    }
+
+    /// Terminates a ticket: emits the outcome under the id its `.began` carried, then closes it. A closed
+    /// ticket is what keeps the late-landing hook from double-reporting a seek the finalize already
+    /// settled, so every terminal path must run through here.
+    func closeSeekTicket(_ ticket: inout SeekTicket?, with outcome: SeekEvent.Outcome) {
+        guard let open = ticket else { return }
+        emitSeekEvent(id: open.id, origin: open.origin, outcome: outcome, target: open.target)
+        ticket = nil
+    }
+
+    /// The give-up contract: the seek drops out of `isSeeking`, but it is still alive inside AVPlayer as
+    /// recovery intent, so its ticket stays OPEN and the late `.landed` arrives under the same id when the
+    /// source finally serves the target (AE#38 follow-up, the case a level signal cannot express).
+    func reportSeekStalled() {
+        guard let open = programmaticSeekTicket else { return }
+        emitSeekEvent(id: open.id, origin: open.origin, outcome: .stalled, target: open.target)
+    }
+
+    /// Recomputes isSeeking/seekTarget from the in-flight flags. Idempotent to avoid redundant Combine emissions.
+    private func recomputeSeekSignal() {
+        let seeking = programmaticSeekInFlight || nativeScrubSeekInFlight || deferredSeekInFlight
         // #240: a seek owns the link until it lands. Set unconditionally (not inside the
         // change guard) so the gate cannot drift from the flags it mirrors.
         sideReaderLinkGate.setSeeking(seeking)
         if isSeeking != seeking { isSeeking = seeking }
-        if seeking {
-            if let target { seekTarget = target }
-        } else {
-            seekTarget = nil
-        }
+        let target = programmaticSeekTarget ?? nativeScrubSeekTarget ?? deferredSeekTarget
+        if seekTarget != target { seekTarget = target }
     }
 
     private func setProgrammaticSeek(inFlight: Bool, target: Double?) {
         programmaticSeekInFlight = inFlight
-        recomputeSeekSignal(target: target)
+        programmaticSeekTarget = inFlight ? target : nil
+        recomputeSeekSignal()
+    }
+
+    /// #127/#178: a seek stashed before the session can take it. The engine publishes the target on
+    /// `clock.currentTime` up front so scrub UI follows, which is exactly the position a consumer must NOT
+    /// treat as reached, so the stash window carries the seek signal like any other in-flight seek.
+    private func setDeferredSeek(inFlight: Bool, target: Double?) {
+        deferredSeekInFlight = inFlight
+        deferredSeekTarget = inFlight ? target : nil
+        recomputeSeekSignal()
+    }
+
+    /// Opens (or replaces) the deferred stash entry. A second stashed seek supersedes the first, matching
+    /// `pendingPreReadySeekSeconds`' own latest-wins rule.
+    func beginDeferredSeek(target: Double) {
+        closeSeekTicket(&deferredSeekTicket, with: .superseded)
+        deferredSeekTicket = beginSeekTicket(origin: .deferred, target: target)
+        setDeferredSeek(inFlight: true, target: target)
+    }
+
+    /// Ends the deferred stash window. `.superseded` when the replay hands it to a real seek, `.rejected`
+    /// when the load died under it. No-op without an open stash.
+    func endDeferredSeek(_ outcome: SeekEvent.Outcome) {
+        guard deferredSeekInFlight || deferredSeekTicket != nil else { return }
+        closeSeekTicket(&deferredSeekTicket, with: outcome)
+        setDeferredSeek(inFlight: false, target: nil)
+    }
+
+    /// Rejection path: the seek never reached a host, so it gets a standalone event and no `.began`.
+    func emitSeekRejected(_ reason: SeekEvent.Rejection, target: Double) {
+        emitSeekEvent(id: nextSeekEventID(), origin: .programmatic, outcome: .rejected(reason), target: target)
     }
 
     /// Complete the seek state after a late async recovery landing settled the clock through the
@@ -142,9 +261,14 @@ public final class AetherEngine: ObservableObject {
     /// extension budget (spinner-at-target rather than the old revert + flap). When the re-anchored
     /// producer finally serves the target, the sink settles the clock onto it; clear the
     /// programmatic-seek gate and reconcile the transport here so `state`/`isSeeking` leave `.seeking`
-    /// instead of parking a spinner over a now-live frame. No-op unless a programmatic seek is still in
-    /// flight (the normal in-budget landing finalizes inline and clears this before the sink fires).
-    func finalizeLateRecoverySeekLanding() {
+    /// instead of parking a spinner over a now-live frame.
+    ///
+    /// The event half runs even when the gate is already closed, which is the whole point: a seek that
+    /// exhausted its budget was reported `.stalled` and dropped out of `isSeeking`, but it stayed alive
+    /// as recovery intent, and this is where its real landing finally becomes observable. A level signal
+    /// has no edge left to spend there, so the ticket carries it (AE#38 follow-up).
+    func finalizeLateRecoverySeekLanding(rendered: Double) {
+        closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: rendered))
         guard programmaticSeekInFlight else { return }
         setProgrammaticSeek(inFlight: false, target: nil)
         if let nativeHost {
@@ -152,11 +276,116 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// Wired to `HLSVideoEngine.onSeekStateChanged`; see `requestRestart`.
+    /// Wired to `HLSVideoEngine.onSeekStateChanged`; see `requestRestart`. `target` is on the display
+    /// axis; nil on the falling edge.
+    ///
+    /// The falling edge from the coalescer means "the producer is now producing at the new index", NOT
+    /// "AVPlayer rendered it": the picture arrives a fetch and a decode later, measured at 1.4 s on a WAN
+    /// source by the host this signal exists for. Clearing there published a landing that had not
+    /// happened. Instead the scrub stays in flight and a landing watch on `$renderedTime` closes it when
+    /// the picture actually reaches the target, bounded by `nativeScrubLandingBudgetSeconds` so a source
+    /// that never serves it degrades to `.stalled` rather than latching the signal (AE#38 follow-up).
     func setNativeScrubSeek(inFlight: Bool, target: Double?) {
-        nativeScrubSeekInFlight = inFlight
-        recomputeSeekSignal(target: target)
+        if inFlight {
+            // A restart that a programmatic seek caused is that seek's business: it owns the landing, its
+            // own target is where the picture will end up, and the restart segment can sit a segment below
+            // it (probe: restart 84.0, landing 90.0). Watching for a landing at the RESTART target there
+            // would report a miss on a seek that landed fine, so this restart keeps the old drain-edge
+            // semantics and the programmatic ticket carries the outcome.
+            scrubRestartOwnedByProgrammaticSeek = programmaticSeekInFlight
+            guard let target else {
+                // No resolvable segment time (index outside the plan): keep the flag honest but publish no
+                // target, and leave the landing watch unarmed.
+                nativeScrubSeekInFlight = true
+                nativeScrubSeekTarget = nil
+                recomputeSeekSignal()
+                return
+            }
+            if let open = nativeScrubSeekTicket, open.target != target {
+                closeSeekTicket(&nativeScrubSeekTicket, with: .superseded)
+            }
+            // No ticket for a programmatic seek's own restart: that seek's events are the authority, and a
+            // second pair reporting a landing at the RESTART target (a segment below where the picture
+            // ends up) would contradict them. The level flag is still set, exactly as before.
+            if nativeScrubSeekTicket == nil, !scrubRestartOwnedByProgrammaticSeek {
+                nativeScrubSeekTicket = beginSeekTicket(origin: .nativeScrub, target: target)
+            }
+            nativeScrubSeekInFlight = true
+            nativeScrubSeekTarget = target
+            // A fresh restart run supersedes any armed watch; its watchdog must not outlive it and trip
+            // the next one's window.
+            pendingScrubLanding = nil
+            scrubLandingWatchdog?.cancel()
+            scrubLandingWatchdog = nil
+            recomputeSeekSignal()
+            return
+        }
+        // Coalesced restart run drained. Hand the falling edge to the landing watch when this restart was
+        // a user scrub with a target and a native host to watch; otherwise settle now, exactly as before.
+        guard !scrubRestartOwnedByProgrammaticSeek,
+              let watchTarget = nativeScrubSeekTarget,
+              let host = nativeHost else {
+            finishNativeScrubSeek(.landed(renderedTime: clock.sourceTime))
+            return
+        }
+        pendingScrubLanding = PendingScrubLanding(
+            displayTarget: watchTarget,
+            playlistTarget: PresentationAxis.source(displayTime: watchTarget,
+                                                    origin: sourcePresentationOrigin) - playlistShiftSeconds,
+            frozenRendered: host.renderedTime
+        )
+        // The watch runs on `$renderedTime`, which goes silent while AVPlayer waits to play, so the
+        // give-up cannot be tick-driven.
+        scrubLandingWatchdog?.cancel()
+        let budget = Self.nativeScrubLandingBudgetSeconds
+        scrubLandingWatchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.pendingScrubLanding != nil else { return }
+            EngineLog.emit(
+                "[AetherEngine] scrub landing watch expired after \(String(format: "%.0f", budget))s; "
+                + "reporting stalled",
+                category: .engine
+            )
+            self.finishNativeScrubSeek(.stalled)
+        }
+        checkPendingScrubLanding(rendered: host.renderedTime)
     }
+
+    /// Closes the scrub's in-flight window and its ticket, and disarms the landing watch.
+    func finishNativeScrubSeek(_ outcome: SeekEvent.Outcome) {
+        pendingScrubLanding = nil
+        scrubLandingWatchdog?.cancel()
+        scrubLandingWatchdog = nil
+        closeSeekTicket(&nativeScrubSeekTicket, with: outcome)
+        nativeScrubSeekInFlight = false
+        nativeScrubSeekTarget = nil
+        recomputeSeekSignal()
+    }
+
+    /// `$renderedTime` hook for the scrub landing watch. No-op unless a watch is armed.
+    func checkPendingScrubLanding(rendered: Double) {
+        guard let watch = pendingScrubLanding else { return }
+        guard Self.nativeScrubLanded(rendered: rendered,
+                                     target: watch.playlistTarget,
+                                     frozen: watch.frozenRendered) else { return }
+        finishNativeScrubSeek(
+            .landed(renderedTime: PresentationAxis.display(sourcePTS: rendered + playlistShiftSeconds,
+                                                           origin: sourcePresentationOrigin))
+        )
+    }
+
+    /// Armed when a coalesced scrub restart drains; retired when the picture reaches the target or the
+    /// watchdog expires. `playlistTarget` is the AVPlayer-axis twin of `displayTarget`, because
+    /// `renderedTime` is on the playlist axis.
+    struct PendingScrubLanding {
+        let displayTarget: Double
+        let playlistTarget: Double
+        let frozenRendered: Double
+    }
+
+    /// Budget for the scrub landing watch. Same order as the programmatic seek's reconcile budget: past
+    /// it, "not landed" is the honest report.
+    static let nativeScrubLandingBudgetSeconds: Double = 8.0
 
     /// High-frequency playback clock (currentTime, sourceTime, live-edge). Separate ObservableObject:
     /// its ~10 Hz ticks must not fire objectWillChange on the engine or every SwiftUI view re-renders per
@@ -436,6 +665,8 @@ public final class AetherEngine: ObservableObject {
             return
         case .discard:
             pendingPreReadySeekSeconds = nil
+            // The load died under the stash; the seek never reaches a host (#38 follow-up).
+            endDeferredSeek(.rejected(.noActiveSession))
         case .replay:
             pendingPreReadySeekSeconds = nil
             EngineLog.emit("[AetherEngine] replaying seek stashed during load to \(String(format: "%.2f", pending))s (#178)", category: .engine)
@@ -476,6 +707,10 @@ public final class AetherEngine: ObservableObject {
     var softwareSubtitlePacketStore: SubtitlePacketStore?
     var subtitleDrainDecoders: [SubtitleChannel: EmbeddedSubtitleDecoder] = [:]
     var subtitleDrainCursors: [SubtitleChannel: SubtitleDrainCursor] = [:]
+    /// #250: the frontier source of the last statement emitted per channel, so a change of source
+    /// (the prefetcher dying, EOF landing) gets its own line instead of waiting for the 30 s
+    /// cadence. nil before the first statement of a session.
+    var subtitleResolutionLastFrontier: [SubtitleChannel: SubtitleResolutionStatement.Frontier] = [:]
     /// #151: subtitle-only forward side reader filling the session packet store up to
     /// playhead + subtitleDrainLeadSeconds independent of the producer's forward park, so the
     /// drainer's lead window holds cues for host-applied ADVANCE sync offsets (text and bitmap).
@@ -2808,6 +3043,7 @@ public final class AetherEngine: ObservableObject {
         switch state {
         case .idle, .ended, .error:
             EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: no active session (state=\(state))", category: .engine)
+            emitSeekRejected(.noActiveSession, target: seconds)
             return
         case .loading:
             // #178: don't drop a seek raced against load(). No hosts exist yet (forwarding would
@@ -2818,6 +3054,7 @@ public final class AetherEngine: ObservableObject {
             pendingPreReadySeekSeconds = seconds
             clock.currentTime = duration > 0 ? max(0, min(seconds, duration)) : max(0, seconds)
             EngineLog.emit("[AetherEngine] seek(to:\(String(format: "%.2f", seconds))) stashed during load; will replay when the session settles (#178)", category: .engine)
+            beginDeferredSeek(target: clock.currentTime)
             return
         default:
             break
@@ -2827,6 +3064,7 @@ public final class AetherEngine: ObservableObject {
         if isLive {
             guard let w = liveWindow, w.windowSeconds != nil else {
                 EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: live, DVR disabled", category: .engine)
+                emitSeekRejected(.liveWithoutDVR, target: seconds)
                 return
             }
         }
@@ -2841,6 +3079,7 @@ public final class AetherEngine: ObservableObject {
             pendingPreReadySeekSeconds = seconds
             clock.currentTime = max(0, min(seconds, duration))
             EngineLog.emit("[AetherEngine] seek(to:\(String(format: "%.2f", seconds))) deferred until item ready (#127)", category: .engine)
+            beginDeferredSeek(target: clock.currentTime)
             return
         }
         // VOD: clamp to [0, duration] in source PTS. Live/DVR: clamp to the
@@ -2851,6 +3090,15 @@ public final class AetherEngine: ObservableObject {
         // Generation guard at each finalize point prevents a superseded seek from clearing it.
         seekGeneration &+= 1
         let seekGen = seekGeneration
+        // A stash resolving into this seek hands its window over without a gap in `isSeeking`: the
+        // deferred flag clears in the same recompute that sets the programmatic one.
+        closeSeekTicket(&deferredSeekTicket, with: .superseded)
+        deferredSeekInFlight = false
+        deferredSeekTarget = nil
+        // Whatever was in flight lost; its ticket closes here rather than at the generation guards, which
+        // are spread over every exit of the deadline loop.
+        closeSeekTicket(&programmaticSeekTicket, with: .superseded)
+        programmaticSeekTicket = beginSeekTicket(origin: .programmatic, target: target)
         setProgrammaticSeek(inFlight: true, target: target)
         // Capture loadGeneration so the live finalize can detect a concurrent stop()/load()/zap
         // (which bumps loadGeneration in stopInternal but leaves seekGeneration untouched), matching
@@ -2868,6 +3116,7 @@ public final class AetherEngine: ObservableObject {
                 clock.sourceTime = target
                 state = .playing
                 setProgrammaticSeek(inFlight: false, target: nil)
+                closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: target))
                 return
             }
             let behind = (liveWindow?.edgeTime ?? target) - target   // >= 0; 0 == "to the edge"
@@ -2889,6 +3138,7 @@ public final class AetherEngine: ObservableObject {
                 state = .playing
             }
             setProgrammaticSeek(inFlight: false, target: nil)
+            closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: target))
             return
         }
         // #178: this seek supersedes any recovery re-anchor still holding the restart coalescer's
@@ -2981,6 +3231,7 @@ public final class AetherEngine: ObservableObject {
                 // give-up contract instead: clock held at the target, gate cleared, honest phase reported.
                 guard !Task.isCancelled else {
                     setProgrammaticSeek(inFlight: false, target: nil)
+                    reportSeekStalled()
                     reconcileNativeSeekTransport(host: host, isStarved: true)
                     EngineLog.emit(
                         "[AetherEngine] seek deadline recovery cancelled; holding clock at target "
@@ -3005,6 +3256,10 @@ public final class AetherEngine: ObservableObject {
                     nativeClockSeconds = avpReal
                     clock.sourceTime = avpReal + playlistShiftSeconds
                     setProgrammaticSeek(inFlight: false, target: nil)
+                    closeSeekTicket(&programmaticSeekTicket,
+                                    with: .landed(renderedTime: PresentationAxis.display(
+                                        sourcePTS: avpReal + playlistShiftSeconds,
+                                        origin: sourcePresentationOrigin)))
                     reconcileNativeSeekTransport(host: host, isStarved: false)
                     EngineLog.emit(
                         "[AetherEngine] seek landed while deadline ownership transferred; "
@@ -3193,6 +3448,7 @@ public final class AetherEngine: ObservableObject {
                 // landing still settles through the sink, where finalizeLateRecoverySeekLanding is then a
                 // harmless no-op.
                 setProgrammaticSeek(inFlight: false, target: nil)
+                reportSeekStalled()
                 reconcileNativeSeekTransport(host: host, isStarved: true)
                 EngineLog.emit(
                     "[AetherEngine] seek still buffering after re-anchor + full budget "
@@ -3238,6 +3494,9 @@ public final class AetherEngine: ObservableObject {
             state = parked
         }
         setProgrammaticSeek(inFlight: false, target: nil)
+        // `sourceTime` is the on-screen frame (#49/#123): the honest landing position, which keyframe
+        // granularity or a still-draining chase can put a little off the target.
+        closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: clock.sourceTime))
     }
 
     /// #112 rework: the playhead jumped (seek landing or wedge reconcile). Reset the PGS
@@ -4154,11 +4413,25 @@ public final class AetherEngine: ObservableObject {
         isBuffering = false
         readerStall = .flowing
         // Hard-clear in-flight seek state: late callbacks are dropped by generation guards, but isSeeking
-        // must not strand (#38).
+        // must not strand (#38). Open tickets are rejected rather than left dangling, so a host tracking
+        // "did my target land" never waits on a seek whose session is gone. A ticket kept open by the
+        // give-up path (recovery intent) dies here too: the session it aimed at no longer exists.
+        closeSeekTicket(&programmaticSeekTicket, with: .rejected(.noActiveSession))
+        closeSeekTicket(&nativeScrubSeekTicket, with: .rejected(.noActiveSession))
+        closeSeekTicket(&deferredSeekTicket, with: .rejected(.noActiveSession))
+        pendingScrubLanding = nil
+        scrubLandingWatchdog?.cancel()
+        scrubLandingWatchdog = nil
         programmaticSeekInFlight = false
         nativeScrubSeekInFlight = false
-        isSeeking = false
-        seekTarget = nil
+        deferredSeekInFlight = false
+        programmaticSeekTarget = nil
+        nativeScrubSeekTarget = nil
+        deferredSeekTarget = nil
+        // Through the recompute rather than assigning the two properties: it also releases the #240 side
+        // reader link gate, which a stop landing mid-seek otherwise leaves owned by the video path for the
+        // whole next session (the gate is per engine, not per session).
+        recomputeSeekSignal()
 
         liveWindowTimerTask?.cancel()
         liveWindowTimerTask = nil

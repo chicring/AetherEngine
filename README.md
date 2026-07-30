@@ -112,8 +112,14 @@ player.$state          // .idle, .loading, .playing, .paused, .seeking, .ended, 
                        // .ended = played to completion (any backend); .idle = pre-load / stopped
 player.$duration
 player.$videoFormat    // .sdr, .hdr10, .hdr10Plus, .dolbyVision, .hlg
-player.$isSeeking      // true until a seek physically lands (programmatic + native scrubs)
+player.$isSeeking      // true until a seek physically lands (programmatic + native scrubs, and
+                       // seeks stashed before the session can take them)
 player.$seekTarget     // in-flight seek destination (source-PTS), nil otherwise
+player.seekEvents      // AnyPublisher<SeekEvent, Never>: .began / .landed(renderedTime:) /
+                       // .stalled / .superseded / .rejected, each with the target it belongs to.
+                       // Use this where the FALLING edge of $isSeeking matters: the level cannot
+                       // say whether a seek landed, gave up, or was superseded, and a seek that
+                       // gave up can still land minutes later on a stalled source.
 player.$playbackPhase  // unified: .idle/.loading/.playing/.paused/.seeking/.rebuffering/
                        // .stalled(reconnecting:)/.ended/.error. One source of truth for a status
                        // spinner; derived from state + isBuffering + isSeeking + source reconnect.
@@ -193,7 +199,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.0.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.1.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -333,10 +339,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.0.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.1.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.0.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.1.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

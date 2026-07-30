@@ -12,7 +12,44 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.1.0] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.0))
+
+### Added
+
+- **A seek now says what happened to it, not just that it stopped happening.** `isSeeking` / `seekTarget` are a level, and a level's falling edge cannot distinguish a landing from a give-up from a supersede, nor keep the target it belonged to (both properties clear in the same recompute, and any consumer that hops a queue sees them coalesced). `player.seekEvents` publishes `.began`, `.landed(renderedTime:)`, `.stalled`, `.superseded` and `.rejected`, each carrying its target and an id that pairs a seek with its outcome. The one asymmetry is the point of the stream: a seek that spent its recovery budget reports `.stalled` and drops out of `isSeeking`, but it stays alive inside AVPlayer, so its `.landed` can still arrive minutes later on a source that finally serves the target. Reported by rrgomes from production use of the signal in a synchronized-playback host, which had rebuilt all of this out of a landing grace, a retained last target and a 180 s unreached-target map.
+
+### Fixed
+
+- **A native scrub no longer reports a landing before the picture arrives.** The scrub's in-flight window ended when the coalesced producer restart drained, which means "the producer is producing at the new index", not "AVPlayer rendered it"; the picture follows a fetch and a decode later, measured at 1.4 s on a WAN source. The window now ends when the rendered frame reaches the restarted region, bounded at 8 s so a source that never serves it degrades to `.stalled` instead of latching the signal.
+- **A seek issued before the session can take it is visible instead of silently optimistic.** Seeks stashed during load or against a pre-ready item (#127/#178) publish their target on `currentTime` so scrub UI follows, but left `isSeeking` false, which is the worst combination for a consumer broadcasting that position: a place nothing has reached, with no in-flight flag to suppress it. The stash window now carries the seek signal and hands over to its replay without a gap.
+- **`seekTarget` no longer publishes a settled seek's destination.** It folded over the last non-nil target ever written, so a finished programmatic seek's target stayed published while a scrub was in flight toward a different one. Each source now owns its own target, and the published value follows the most authoritative one in flight.
+- **A stop landing mid-seek no longer leaves the subtitle side-reader link owned by the video path** for the whole next session (the #240 gate is per engine, not per session).
+
+## [6.0.2] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.2))
+
+### Added
+
+- **The subtitle path now states how far it has decoded display state, on the absolute source axis and fenced by generation.** After a far seek lands, nothing in the log could tell "the pipeline has determined the display state here" from "it has produced nothing yet"; on a PGS track with no acquisition point those are indistinguishable from outside, and that distinction is the whole adjudication for a conformance harness. One line per active drain target, at post-seek reconstruction, on the 30 s cadence, at prefetcher EOF, and whenever the frontier's source changes: `[AetherEngine] #250 subtitle-resolution loadGen= seekGen= stream= coveredFrom= resolvedThrough= via= decodedThrough= reason=`. `resolvedThrough` is the decode window clamped to a harvest frontier, never the window's own lead edge (which would claim determination over unread bytes) and never the drain cursor alone (which stands still through every dialogue pause on a sparse track), with `via=prefetch|eof|pump` stating which frontier bounds the claim and therefore what the number is worth. Requested by cmcpherson274. No published property, no behaviour change.
+
+## [6.0.1] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.1))
+
+### Fixed
+
+- **Every 5.x tag stopped resolving, and 6.0.0 pinned the cause.** LibDovi published the visionOS slices and the tvOS floor correction together as 1.1.0. A raised platform floor is a breaking change, so it belonged in a major: SwiftPM resolved that new minor into every consumer pinning `from: "1.0.x"`, then failed the build on the floor mismatch instead of backing off to a version that fits. Any AetherEngine 5.x tag, all of which declare tvOS 16 and `LibDovi from: "1.0.2"`, became unbuildable on a fresh resolve within hours of that release. Reported by cmcpherson274 while retesting #240 on 5.28.0. The same content is now published as LibDovi 2.0.0 and the 1.1.0 tag is withdrawn, so the 5.x line resolves back to 1.0.2 and builds again; this engine pins `from: "2.0.0"`. 6.0.0 itself points at the withdrawn tag and no longer resolves, so it is superseded by this release rather than merely followed by it.
+
+### Changed
+
+- **The subtitle side readers no longer take the link without leaving a trace.** `prefetchYielded` counts every priority yield, a seek in flight as much as a producer that is fetching, while the `yielded the link for` line is emitted once per continuous-yield-cap grant, so a session can legitimately show seconds of yield with no such line anywhere. Reading the two as one number is a mistake this codebase invited and then made in an issue reply. The memprobe now carries `prefetchValve=N` next to `prefetchYielded=Ns` so the escape hatch has a figure of its own, and the native subtitle readers log their grants in the same shape the #151 prefetcher does instead of taking them silently.
+
 ## [6.0.0] - 2026-07-29
+
+**Superseded by 6.0.1: this tag pins the withdrawn LibDovi 1.1.0 and no longer resolves.**
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.0))
 

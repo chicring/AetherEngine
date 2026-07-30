@@ -11,6 +11,10 @@ struct SubtitleDrainCursor: Sendable {
     /// Playhead at the previous tick; a jump beyond the threshold means the user
     /// seeked (or the producer re-anchored) and the decoder must be rebuilt.
     var lastPlayhead: Double
+    /// #250: where the current contiguous decoded run started, i.e. the window start of the last
+    /// `.resetAndDecode`. Steady ticks decode forward from the cursor, so the tick's own window
+    /// start says nothing about how far back determination reaches. nil until the first reset.
+    var coverageStart: Double? = nil
 }
 
 enum SubtitleDrainPlan: Equatable, Sendable {

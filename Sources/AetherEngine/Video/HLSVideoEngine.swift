@@ -350,7 +350,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// Fires when AVKit scrub drives a producer restart (AetherEngine#38). `(true, playlistTime)`
     /// at restart-run start; `(false, nil)` when settled. `playlistTime` folds with
-    /// `playlistShiftSeconds` onto the source-PTS `seekTarget`.
+    /// `playlistShiftSeconds` onto the source-PTS `seekTarget`, and is a LOWER BOUND on where the
+    /// picture will land (the restart aims at the segment containing the requested time).
+    ///
+    /// The falling edge is "the producer is now producing at the new index", NOT "AVPlayer rendered it".
+    /// The engine no longer treats it as a landing; see `AetherEngine.setNativeScrubSeek`.
     var onSeekStateChanged: (@Sendable (Bool, Double?) -> Void)?
 
     /// Source stall/reconnect transitions from the main demuxer's `AVIOReader` (#85). Forwarded to
@@ -1993,7 +1997,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             onSeekStateChanged?(true, nextSeekTime)
             target = nextTarget
         }
-        onSeekStateChanged?(false, nil) // run settled; clear in-flight seek signal
+        onSeekStateChanged?(false, nil) // run settled; hand the falling edge to the landing watch (#38)
     }
 
     /// `segmentPlan[idx].startSeconds` on the AVPlayer/playlist axis, or nil

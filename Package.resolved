@@ -1,5 +1,5 @@
 {
-  "originHash" : "1470ec40253b287a71e504b131b82d129373ea695b6e1fb49589af1431fc9376",
+  "originHash" : "004248d40b9e5d1a73fbd12c0db3fca32baf8470285de2f0c13bf9d3e729993f",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -16,7 +16,7 @@
       "location" : "https://github.com/superuser404notfound/LibDovi",
       "state" : {
         "revision" : "89be93431c2a5f2e54fb77e93059071b8d2ddb3a",
-        "version" : "1.1.0"
+        "version" : "2.0.0"
       }
     },
     {

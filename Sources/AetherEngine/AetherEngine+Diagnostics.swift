@@ -189,6 +189,12 @@ extension AetherEngine {
                     + "seams=\(self.liveShiftSeams.count)"
 
                 EngineLog.emit(line, category: .engine)
+
+                // #250: the steady-state cadence for the subtitle-resolution statement. It rides
+                // the memprobe rather than the 2 Hz drain tick because it states a span, and a
+                // span restated four times a second per channel buries the transitions that carry
+                // the information. Silent when no subtitle drain target is active.
+                self.emitSubtitleResolutionStatements(reason: .tick)
             }
         }
     }

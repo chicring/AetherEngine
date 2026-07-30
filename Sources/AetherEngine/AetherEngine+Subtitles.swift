@@ -223,6 +223,7 @@ extension AetherEngine {
         subtitleDrainerTask = nil
         subtitleDrainDecoders.removeAll()
         subtitleDrainCursors.removeAll()
+        subtitleResolutionLastFrontier.removeAll()   // #250
         cancelSubtitleForwardPrefetcher()   // #151
     }
 
@@ -231,6 +232,7 @@ extension AetherEngine {
         subtitleDrainTargets[channel] = nil
         subtitleDrainDecoders[channel] = nil
         subtitleDrainCursors[channel] = nil
+        subtitleResolutionLastFrontier[channel] = nil   // #250
         refreshSubtitleStoreProtection()   // #166
         if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
     }
@@ -259,13 +261,19 @@ extension AetherEngine {
                 prefetchNeedsReanchor = true
             }
             let window: (from: Double, through: Double)
+            // #250: a reset starts a fresh contiguous decoded run; a steady tick extends the one
+            // already running.
+            var coverageStart = subtitleDrainCursors[channel]?.coverageStart
             switch plan {
             case .idle:
                 subtitleDrainCursors[channel]?.lastPlayhead = playhead
+                emitSubtitleResolutionStatementIfFrontierChanged(channel: channel,
+                                                                 streamIndex: streamIndex)
                 continue
             case .decode(let from, let through):
                 window = (from, through)
             case .resetAndDecode(let from, let through):
+                coverageStart = from
                 subtitleDrainDecoders[channel] = nil
                 // Fresh selection or seek: the backscan decodes compositions BEHIND the
                 // playhead. Run them through the gate's reconstruction admission so the
@@ -301,7 +309,8 @@ extension AetherEngine {
             }
             subtitleDrainCursors[channel] = SubtitleDrainCursor(
                 lastDecodedPts: lastDecoded ?? window.from,
-                lastPlayhead: playhead)
+                lastPlayhead: playhead,
+                coverageStart: coverageStart ?? window.from)
             // #143/#204: a renderable composition at/after the playhead ends reconstruction while
             // decoding above. If the pass remains active with a candidate after the whole window,
             // finalize it. Raw packet presence cannot answer this: the landing line's own zero-object
@@ -313,6 +322,14 @@ extension AetherEngine {
                     .finalizeReconstruction(playhead: playhead) {
                     insertFinalizedReconstructionCue(cue, channel: channel)
                 }
+            }
+            // #250: the post-seek window has decoded, so state how far determination reaches.
+            if case .resetAndDecode = plan {
+                emitSubtitleResolutionStatement(channel: channel, streamIndex: streamIndex,
+                                                reason: .reconstruction)
+            } else {
+                emitSubtitleResolutionStatementIfFrontierChanged(channel: channel,
+                                                                 streamIndex: streamIndex)
             }
         }
         // #151: a jump (seek / producer re-anchor) moves the drain window out from under the
@@ -367,7 +384,9 @@ extension AetherEngine {
         if let reanchor = subtitleForwardPrefetchReanchor,
            subtitleForwardPrefetchTask != nil,
            subtitleForwardPrefetchActiveLead == lead {
-            reanchor.request(anchor)
+            // #250: the seek this move serves rides along, so the read position it banks after the
+            // reposition is fenced to that seek rather than to the one the session started under.
+            reanchor.request(anchor, seekGeneration: currentSeekGeneration)
             return
         }
         cancelSubtitleForwardPrefetcher()
@@ -562,13 +581,15 @@ extension AetherEngine {
             anchorStreamIndex: seekAnchor,
             fallbackDuration: engineDisplayDuration,
             seekTimeout: Self.sideReaderSeekBudgetSeconds)
-        let adopted = await MainActor.run { [weak self] () -> Bool in
+        // #250: the fence this session's read positions belong to, captured in the same hop that
+        // adopts the anchor box. An in-place move re-stamps the seek half from the request itself.
+        let adopted = await MainActor.run { [weak self] () -> SubtitleResolutionStatement.Fence? in
             guard !Task.isCancelled, let self, self.subtitleForwardPrefetchDemuxer === demuxer
-            else { return false }
+            else { return nil }
             self.subtitleForwardPrefetchReanchor = reanchor
-            return true
+            return self.subtitleResolutionFence
         }
-        guard adopted else {
+        guard let fence = adopted else {
             return SubtitleForwardPrefetcher.Outcome(exit: .cancelled, harvested: 0)
         }
 
@@ -585,6 +606,7 @@ extension AetherEngine {
             parkPollNanoseconds: Self.subtitleForwardPrefetchParkPollNanoseconds,
             link: link,
             reanchor: reanchor,
+            fence: fence,
             playhead: { [weak self] in
                 await MainActor.run(body: { [weak self] in self?.sourceTime })
             })
@@ -592,6 +614,15 @@ extension AetherEngine {
             "[AetherEngine] #151 forward prefetch exited (reason=\(outcome.exit) "
             + "cancelled=\(Task.isCancelled)) harvested=\(outcome.harvested)",
             category: .engine)
+        // #250: EOF is the one exit that strengthens the claim rather than weakening it. Everything
+        // ahead of the playhead is read, so the window is determined in full and a harness can
+        // treat an empty position as "no cue here" instead of "not yet".
+        if outcome.exit == .endOfFile {
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.emitSubtitleResolutionStatements(reason: .eof)
+            }
+        }
         return outcome
     }
 
@@ -1311,6 +1342,13 @@ extension AetherEngine {
                 }
                 if yielded >= link.maxYieldSeconds {
                     valveGrantedUntil = DispatchTime.now() + link.valveGrantSeconds
+                    // Same line the #151 prefetcher emits, because a grant that is not logged
+                    // reads from the outside like a reader taking the link without permission.
+                    EngineLog.emit(
+                        "[AetherEngine] native subtitle readers yielded the link for "
+                        + "\(Int(yielded))s; taking \(Int(link.valveGrantSeconds))s of it back "
+                        + "(the video path is not releasing it)",
+                        category: .engine)
                 }
             }
             guard let pkt = try? demuxer.readPacket() else { break }

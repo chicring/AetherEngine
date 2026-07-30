@@ -18,6 +18,10 @@ enum SubtitlePrefetchTelemetry {
 
     struct Snapshot: Sendable {
         var generation = 0
+        /// #250: the engine generations this session's read position belongs to. Stamped at
+        /// session start and re-stamped by every in-place re-anchor, so a consumer can tell a
+        /// position banked before the seek it cares about from one banked after it.
+        var fence = SubtitleResolutionStatement.Fence()
         var running = false
         var parked = false
         /// Subtitle-axis seconds of the most recently routed packet, NaN before the first one.
@@ -29,10 +33,20 @@ enum SubtitlePrefetchTelemetry {
         var timeBaseFallbacks = 0
         /// #240: the reader is holding the link for the video path right now.
         var linkYield = false
-        /// #240: cumulative seconds spent yielding the link. On a link with room this stays near
-        /// zero; a number that tracks playback time says the source is barely faster than the
-        /// content and the lookahead is being paid for out of the video path's budget.
+        /// #240: cumulative seconds spent yielding the link, counting EVERY priority yield: a seek
+        /// in flight, a producer that is fetching, both. It is not the valve's counter, and the
+        /// two surfaces are meant to disagree. `#151 forward prefetch yielded the link for` is
+        /// logged once per valve grant, so a session can hold seconds of ordinary yield here with
+        /// no such line anywhere in the log. On a link with room this stays low but not at zero,
+        /// because a seek yields unconditionally; a number that tracks playback time says the
+        /// source is barely faster than the content and the lookahead is being paid for out of
+        /// the video path's budget.
         var linkYieldSeconds = 0.0
+        /// #240: times the continuous-yield cap fired and the reader took the link back anyway.
+        /// The escape hatch is the risky half of a strict priority, so it gets a number rather
+        /// than only a log line: non-zero says the video path claimed the link for a full
+        /// `maxYieldSeconds` without parking, which is a finding whether or not cues went missing.
+        var linkValveGrants = 0
         /// Why the loop stopped, nil while it runs. Reported instead of a bare `dead`, which
         /// could not tell the defect apart from the expected end of a session: the reader works
         /// `leadSeconds` ahead, so it reaches EOF a full lead before the playhead does and every
@@ -44,12 +58,59 @@ enum SubtitlePrefetchTelemetry {
     private static let state = OSAllocatedUnfairLock(initialState: Snapshot())
 
     /// Marks a new prefetch session live and returns its generation for the later `ended` call.
-    static func sessionStarted() -> Int {
+    /// The whole snapshot is replaced, so a fresh session never inherits the previous one's read
+    /// position: until its first packet the frontier is NaN, which #250 reports as unresolved
+    /// rather than as a stale position under a fresh fence.
+    static func sessionStarted(fence: SubtitleResolutionStatement.Fence) -> Int {
         state.withLock { s in
             let next = s.generation &+ 1
-            s = Snapshot(generation: next, running: true)
+            s = Snapshot(generation: next, fence: fence, running: true)
             return next
         }
+    }
+
+    /// #250: an in-place re-anchor (#240) moved the reader, so the banked position belongs to a
+    /// new seek generation and the old one is void. Called AFTER the reposition, from the loop:
+    /// stamping at request time would validate the pre-seek position for the window between the
+    /// request and the seek that serves it, which is exactly the superseded-seek case the fence
+    /// exists for. Until the stamp lands the fence stays behind the engine's and the frontier
+    /// reads as unusable, which is the conservative answer.
+    static func recordReanchor(seekGeneration: UInt64) {
+        state.withLock { $0 = reanchored($0, seekGeneration: seekGeneration) }
+    }
+
+    /// The re-anchor's effect on the gauge, as a value: the new seek fence, and no read position
+    /// until the moved reader banks one.
+    static func reanchored(_ s: Snapshot, seekGeneration: UInt64) -> Snapshot {
+        var next = s
+        next.fence.seekGeneration = seekGeneration
+        next.lastPacketSeconds = .nan
+        return next
+    }
+
+    /// #250: the read position on the source axis, or nil when it cannot be trusted for `fence`.
+    /// A running session fenced to the caller's generations is the only case that qualifies; a
+    /// dead, superseded or not-yet-positioned session has no frontier to state.
+    static func resolutionFrontier(
+        _ s: Snapshot, matching fence: SubtitleResolutionStatement.Fence
+    ) -> Double? {
+        guard s.running, s.fence == fence, s.lastPacketSeconds.isFinite else { return nil }
+        return s.lastPacketSeconds
+    }
+
+    /// #250: the fenced session read to end of stream, so everything ahead is determined.
+    static func reachedEndOfFile(
+        _ s: Snapshot, matching fence: SubtitleResolutionStatement.Fence
+    ) -> Bool {
+        s.fence == fence && s.exit == .endOfFile
+    }
+
+    static func resolutionFrontier(matching fence: SubtitleResolutionStatement.Fence) -> Double? {
+        resolutionFrontier(snapshot, matching: fence)
+    }
+
+    static func reachedEndOfFile(matching fence: SubtitleResolutionStatement.Fence) -> Bool {
+        reachedEndOfFile(snapshot, matching: fence)
     }
 
     static func sessionEnded(generation: Int, exit: SubtitleForwardPrefetcher.Exit) {
@@ -70,6 +131,11 @@ enum SubtitlePrefetchTelemetry {
 
     static func recordPark(_ parked: Bool) {
         state.withLock { $0.parked = parked }
+    }
+
+    /// #240: the continuous-yield cap fired and the reader is taking its grant window.
+    static func recordLinkValveGrant() {
+        state.withLock { $0.linkValveGrants &+= 1 }
     }
 
     /// #240: enter or leave a link yield. `seconds` is charged on the way out, so the cumulative
@@ -115,5 +181,6 @@ enum SubtitlePrefetchTelemetry {
             + "prefetchHarvested=\(s.harvested) "
             + "prefetchTbFallback=\(s.timeBaseFallbacks) "
             + "prefetchYielded=\(String(format: "%.0f", s.linkYieldSeconds))s "
+            + "prefetchValve=\(s.linkValveGrants) "
     }
 }
