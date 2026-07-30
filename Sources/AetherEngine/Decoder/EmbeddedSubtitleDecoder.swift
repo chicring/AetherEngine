@@ -189,6 +189,14 @@ final class EmbeddedSubtitleDecoder {
         // only bounds a ghost line if transmission stops without either; teletext re-transmits
         // held pages every few seconds, so a real caption never hits it.
         if isTeletext, endOffset > 120 { endOffset = 120 }
+        // PGS compositions carry the same open-ended placeholder (end_display_time = u32 max,
+        // closed by the successor's pgsTrimAt). Uncapped, the +4294967.295 s endTime defeats the
+        // retained store's endTime prune for any cue no successor ever trims; a frame-by-frame
+        // effects track (~24 compositions/s) then accumulates decoded bitmaps without bound
+        // (device: RSS 372→576 MB in 15 s, jetsam). Real windows are trimmed within a frame;
+        // the cap only bounds orphans, mirroring the teletext cap above.
+        let isPGS = ctx.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE
+        if isPGS, endOffset > 120 { endOffset = 120 }
         let startTime = pktPTS + startOffset
         let endTime = pktPTS + endOffset
 
@@ -250,7 +258,6 @@ final class EmbeddedSubtitleDecoder {
             bodies.append(.text(merged))
         }
 
-        let isPGS = ctx.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE
         let isClearEvent = bodies.isEmpty
 
         // A teletext page erase carries no rects but must still trim the open page cue (#107).
