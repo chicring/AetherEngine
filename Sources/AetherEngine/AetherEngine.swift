@@ -1100,12 +1100,33 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// Live program-boundary shift seam history in output-timeline order. The producer rebases immediately on
-    /// reading a boundary; AVPlayer renders it ~buffer+holdback later. Each entry holds the new shift and the
-    /// raw-clock position from which it applies. currentTime sink resolves the active shift by looking up the
-    /// newest seam at or before the raw clock (a history, not a queue: backward DVR seeks must fold pre-seam
-    /// content with pre-seam shift). Seeded with a baseline entry at -infinity. Cleared on load/stop.
-    var liveShiftSeams: [(activateAt: Double, shift: Double)] = []
+    /// Shift seam history on the item axis. The producer rebases immediately (live program boundary) or starts a
+    /// fresh epoch (VOD restart); AVPlayer renders that content ~buffer+holdback later. The currentTime sink
+    /// resolves the active shift by looking up the newest seam at or before the raw clock (a history, not a
+    /// queue: backward DVR seeks must fold pre-seam content with pre-seam shift). Cleared on load/stop.
+    ///
+    /// Write only through `setPresentationAxis`, which keeps the off-main mirror in step.
+    private(set) var presentationAxis = PresentationAxisMap()
+
+    /// Off-main mirror of `presentationAxis`. Read by hosts converting between axes on their own thread
+    /// (subtitle rasterisation, #260); the map itself is main-actor state.
+    let presentationAxisMirror = AtomicPresentationAxisMap()
+
+    /// Conversion between the source-PTS axis (subtitle cues, chapters, `sourceTime`) and the item axis
+    /// (`AVPlayerItem.currentTime()`, its timebase, `NativeVideoFrameTime.item`) for the native path.
+    /// Readable off the main actor. Empty on the SW and audio paths, which have no producer shift (#260).
+    public nonisolated var presentationAxisMap: PresentationAxisMap {
+        presentationAxisMirror.get()
+    }
+
+    /// Host observer for per-frame presentation times (#260). Held here so it survives across loads and is
+    /// re-installed on each new native session; see `setNativeVideoFrameTimeObserver`.
+    var nativeVideoFrameTimeObserver: NativeVideoFrameTimeObserver?
+
+    func setPresentationAxis(_ map: PresentationAxisMap) {
+        presentationAxis = map
+        presentationAxisMirror.set(map)
+    }
 
     /// 1 Hz live-window updater, independent of the periodic time observer (which only fires while playing).
     /// Without this, liveEdgeTime/behindLiveSeconds/isAtLiveEdge/seekableLiveRange all freeze on pause:
@@ -1186,6 +1207,20 @@ public final class AetherEngine: ObservableObject {
         var needsOCR: Bool = false
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
+
+    /// #266: one pass over one container, filling every native store whose external track points at
+    /// it. Tracks that share a URL and headers collapse into a single job, so a container holding
+    /// several subtitle streams is fetched once rather than once per registered track.
+    struct ExternalSubtitleFillJob: Sendable {
+        struct Target: Sendable {
+            /// Absolute AVStream index in this container, nil for its first subtitle stream.
+            let streamIndex: Int32?
+            let store: NativeSubtitleCueStore
+        }
+        let url: URL
+        let headers: [String: String]
+        let targets: [Target]
+    }
 
     /// Native WebVTT rendition store for the in-band CEA-608 track (#98). The CC tap feeds it (via
     /// `updateClosedCaptionCues`) so 608 captions ride a native AVKit-selectable rendition and
@@ -3701,7 +3736,30 @@ public final class AetherEngine: ObservableObject {
     /// Active AVPlayer on the native path, nil on SW path or when idle. Published so hosts driving an
     /// AVPlayerViewController can rebind `.player` on every audio-track reload (one-shot assignment goes stale).
     @Published public internal(set) var currentAVPlayer: AVPlayer? {
-        didSet { observeExternalPlayback() }
+        didSet {
+            observeExternalPlayback()
+            observeCurrentItem()
+        }
+    }
+
+    /// Item currently loaded into `currentAVPlayer` (#260). Published separately because items are swapped in
+    /// place (`replaceCurrentItem`, on every audio-track reload and episode autoplay) without the player itself
+    /// changing, so a host holding the item or its timebase gets no signal from `currentAVPlayer` alone.
+    @Published public internal(set) var currentAVPlayerItem: AVPlayerItem?
+    private var currentItemObservation: NSKeyValueObservation?
+
+    private func observeCurrentItem() {
+        currentItemObservation?.invalidate()
+        currentItemObservation = nil
+        guard let player = currentAVPlayer else {
+            currentAVPlayerItem = nil
+            return
+        }
+        currentAVPlayerItem = player.currentItem
+        currentItemObservation = player.observe(\.currentItem, options: [.new]) { [weak self] _, change in
+            guard let item = change.newValue else { return }
+            Task { @MainActor in self?.currentAVPlayerItem = item }
+        }
     }
 
     /// AirPlay (#86, DrHurt): true while the native AVPlayer reports external playback. loadNative reads it to
@@ -4435,7 +4493,7 @@ public final class AetherEngine: ObservableObject {
         activeAudioDecoder = nil
         lastDetectedVideoCodec = AV_CODEC_ID_NONE
         playlistShiftSeconds = 0
-        liveShiftSeams.removeAll()
+        setPresentationAxis(PresentationAxisMap())
         nativeClockSeconds = 0
         clock.sourceTime = 0
         clock.bufferedPosition = 0

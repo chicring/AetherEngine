@@ -12,6 +12,50 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.3.0] - 2026-07-31
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.3.0))
+
+### Added
+
+- **`ExternalSubtitleTrack.sourceStreamIndex`, so an external subtitle URL can be a container rather than a sidecar.** An external track's URL may hold several subtitle streams (an MKV with English, English SDH and Spanish), and a host would register one track per stream against that same URL. The sidecar decoder stopped at the container's first subtitle stream and the descriptor carried no index, so every such track decoded that same stream and the host got three selectable tracks rendering identical cues. The new field names the stream to decode as an absolute `AVStream` index inside the container, matching the convention that embedded track ids are stream indices; nil keeps decoding the first subtitle stream. An index that is out of range or names a non-subtitle stream fails the decode rather than falling back to the first subtitle stream, because a silent fallback is indistinguishable from the behaviour the index exists to escape. Reported by edde746. (#266)
+
+### Changed
+
+- **External tracks sharing a container are now filled from a single pass over it.** Each load-declared external track used to be decoded by its own whole-file read, so three tracks pointing at one MKV meant three full downloads at load, and `AVDISCARD_ALL` cannot shorten them (a Matroska demuxer reads every discarded byte anyway). Tracks sharing a URL and headers are now decoded together in one pass, one stream decoder per requested stream. Since a pass covering several streams fails as a whole, a failure retries the targets individually, so one host-side index mistake cannot blank the container's other tracks; a store that still could not be filled stays unfinished rather than serving a complete but blank rendition.
+
+## [6.2.1] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.2.1))
+
+### Fixed
+
+- **An ASS track that declares its play resolution with CRLF line endings is no longer read as declaring none.** The header arrives as codec extradata byte for byte as the muxer stored it, and muxed ASS is conventionally CRLF, so the line is `PlayResX: 718\r`. The trim used `CharacterSet.whitespaces`, which is space and tab but not CR, so the CR survived and `Double("718\r")` returned nil. Both lookups failed, the header was reported as declaring nothing, and every `\pos` on the track normalized against libavcodec's 384x288 default instead of the declared space. On a 718x480 script `{\an1\pos(298,432)}` reached the host at (0.776, 1.500) rather than (0.415, 0.900), which is off-picture and indistinguishable from a cue that never arrived. Header lines now split on any newline (CRLF, LF or lone CR) and trim newline-inclusive. Tracks that declare no play resolution are unaffected, since 384x288 is then the correct basis. Reported by rrgomes, traced to the line. (#261)
+
+### Changed
+
+- `SubtitleTextPlacement.position` no longer documents a [0, 1] range. A script may anchor outside the frame on purpose, so that is a range the engine cannot guarantee, and clamping or dropping such an anchor engine-side would hide the next wrong normalization basis the way #261 hid. Hosts that cannot draw off-picture should decide for themselves what to do with such a cue. No behaviour change.
+
+## [6.2.0] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.2.0))
+
+### Added
+
+- **The native path now states the relation between its two time axes, instead of leaving a host to infer it.** Cue times, chapter marks and `sourceTime` are source PTS; `AVPlayerItem.currentTime()` and its timebase are the axis the producer muxes into the segments. They differ by the producer shift, and nothing published closed that gap for a host compositing its own overlay: adding `playlistShiftSeconds` is correct only until the next producer epoch, the clock ticks at ~10 Hz and a clock reading is not a frame boundary, and the per-segment pair is a genuine pair but six seconds apart. `player.presentationAxisMap` converts either way at any position and is readable off the main actor, and `setNativeVideoFrameTimeObserver` reports both axes for every muxed frame, with its segment index, keyframe flag and producer epoch. Frames arrive in decode order, so `source` is not monotonic under B-frames. Both surfaces answer nothing rather than zero when no axis has been established, since at the call site a defaulted shift is indistinguishable from a measured one, which is what #259 cost. `player.currentAVPlayerItem` publishes alongside, because items are swapped in place and a host holding a timebase otherwise gets no signal. Requested by edde746 for frame-accurate libass rendering, with the axis measurement that showed the gap.
+
+### Fixed
+
+- **A VOD producer restart no longer folds the whole timeline with its new shift.** Each producer computes its own shift when its video gate opens, and a restart lands wherever the source seek lands, so a restart can change it. The shift history was rebuilt from scratch on every VOD restart with one entry covering everything, so content muxed by the previous producer, which AVPlayer can still hold in its buffer and put on screen, was folded with the incoming shift: the published playhead then leads or trails the picture by the difference for as long as that buffer lasts. The history now records the item-axis position each producer starts writing at and keeps the entries below it, and a backward restart drops only the entries it actually rewrites. Live already worked this way for program boundaries; that path is unchanged. Note that the shift-fold hypotheses in #65 were refuted by measurement at the time: that burst ran with an invariant shift, so this mechanism was inactive there and is not a retroactive explanation for it.
+
+## [6.1.4] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.4))
+
+### Fixed
+
+- **In-picture A/53 closed captions are timed against the source again, not against the playlist.** The extraction rides the segment producer's per-packet finalize step, which runs after the pump has rebased the packet onto the output timeline, so the timestamps handed to the caption tap carried the playlist shift while everything downstream reads them as source PTS: the decoded cues feed `subtitleCues`, and a host renders those against `currentTime`, which folds that same shift back in. Every A/53 caption was displaced by it, and because the shift is recomputed on each producer restart, the displacement changed after every seek. On a clip with B-frames it is two frames at head of stream; a restart landing off its planned keyframe has been measured in seconds; and a broadcast MPEG-TS source whose first DTS sits far from zero, which is the case this path exists for, carries it from the first packet. Only the producer path was affected: a demuxable `eia_608` / `c608` caption track is tapped before the rebase, and the software path reads its triplets out of decoded-frame side data, where no shift exists at all. Reported by edde746 from a read of the value flow plus a measurement of the shift magnitude, without a caption-bearing source on hand.
+
 ## [6.1.3] - 2026-07-30
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.3))

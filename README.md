@@ -167,6 +167,9 @@ let track = player.addExternalSubtitleTrack(
 player.selectSubtitleTrack(index: track.id)
 // Declared at load instead, external tracks also join the native WebVTT renditions (PiP):
 // LoadOptions(prepareNativeSubtitles: true, externalSubtitles: [ExternalSubtitleTrack(url: srtURL, language: "en")])
+// When the URL is a container holding several subtitle streams, register one track per stream
+// with its absolute AVStream index; tracks sharing a URL are decoded in one pass (#266).
+ExternalSubtitleTrack(url: mkvURL, name: "Spanish", language: "es", sourceStreamIndex: 3)
 
 // Native WebVTT subtitle renditions (subtitles in PiP / AirPlay / external display; opt-in
 // via LoadOptions.prepareNativeSubtitles, details in docs/formats.md)
@@ -192,14 +195,28 @@ player.$mediaChapters                          // [ChapterInfo]; startSeconds ar
 
 // Info panel / Now Playing (iOS / tvOS)
 player.setExternalMetadata([ AVMetadataItem(/* title, artwork, etc. */) ])
+
+// Frame-accurate host rendering on the native path (#260). Cue times, chapters and sourceTime live on
+// the SOURCE axis; AVPlayerItem.currentTime() and its timebase read the ITEM axis. They differ by the
+// producer shift, which steps at every producer epoch (a seek restart, a live program boundary).
+player.presentationAxisMap                        // conversion both ways, readable off the main actor
+player.presentationAxisMap.itemSeconds(forSourceSeconds: cue.startTime)   // stamp an overlay sample
+player.presentationAxisMap.sourceSeconds(forItemSeconds: item.currentTime().seconds)
+player.$currentAVPlayerItem                       // items swap in place; this is the signal for it
+
+// Per muxed video frame, on both axes at once. Called on the producer's pump thread in DECODE order,
+// so `source` is not monotonic under B-frames; sort before using it as a frame-boundary list.
+player.setNativeVideoFrameTimeObserver { frame in
+    frame.source; frame.item; frame.segmentIndex; frame.isKeyframe; frame.epoch
+}
 ```
 
-Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
+Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
 
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.1.3")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.3.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -339,10 +356,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.1.3")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.3.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.1.3")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.3.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

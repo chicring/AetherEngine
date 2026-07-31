@@ -180,13 +180,15 @@ extension AetherEngine {
                     + "subActive=\(self.isSubtitleActive) "
                     + "avBufAhead=\(String(format: "%.1f", bufferAheadSec))s "
                     + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s "
-                    // #65 shift-coherence: frameAhead/prodShift/hostShift all 0 while avBufAhead holds
-                    // multiple seconds is the bidirectional-seek-burst signature (presented frame ahead of
-                    // the folded clock). seams=1 is the degenerate VOD seam history (no positional fold).
+                    // Shift coherence: prodShift is the producer edge, hostShift the shift the clock folds
+                    // with, and frameAhead their difference. Since #260 a VOD restart records a seam instead
+                    // of collapsing the history, so a non-zero frameAhead now means the producer has moved to
+                    // a new epoch while AVPlayer still presents the previous one, which is a real state and
+                    // not a defect on its own; seams counts the epochs still on record.
                     + "frameAhead=\(String(format: "%.2f", self.frameAhead))s "
                     + "prodShift=\(String(format: "%.2f", self.activeProducerShiftSeconds))s "
                     + "hostShift=\(String(format: "%.2f", self.playlistShiftSeconds))s "
-                    + "seams=\(self.liveShiftSeams.count)"
+                    + "seams=\(self.presentationAxis.seams.count)"
 
                 EngineLog.emit(line, category: .engine)
 

@@ -143,6 +143,10 @@ Sources/AetherEngine/
 ├── AetherEngine+AudioTap.swift              Opt-in decoded PCM audio tap (#95): installAudioTap() vends the AsyncStream, dispatches native-loopback vs remote-HLS vs SW-mirror
 ├── AetherEngine+BackgroundAudioTestHooks.swift DEBUG-only hooks letting aetherctl bgaudio toggle the SW background-audio keepalive without a UIApplication lifecycle (never shipped)
 ├── PlaybackClock.swift                      engine.clock: the ~10 Hz ticking values (currentTime, sourceTime, bufferedPosition, progress, live-edge fields) as a separate ObservableObject
+├── PresentationAxis.swift                   Display-axis fold for disc titles (source PTS <-> 0-based published axis, AE#105)
+├── PresentationAxisMap.swift                Source axis <-> item axis (#260): the seam history of producer shifts as a piecewise-constant map, plus its off-main mirror. Written by the shift-changed / rebased handlers, read by the clock fold, the live thumbnail path and hosts
+├── NativeVideoFrameTime.swift               Per-muxed-frame presentation times on both axes (#260): the value type + observer typealias; emitted from HLSSegmentProducer.finalizeAndWriteVideo
+├── AetherEngine+FrameTimes.swift            Public installer for the per-frame time observer, re-armed on each native session
 ├── PlayerState.swift                        PlaybackState, PlaybackPhase, VideoFormat, PlaybackBackend, LoadOptions, SourceProbe, TrackInfo, FontAttachment, MediaMetadata, SubtitleCue, SubtitleImage
 ├── LiveReloadPolicy.swift                   Pure decision functions for live reloads: rejoin at the live edge (no stale resume position), skip the pre-readiness zero seek
 ├── TransportControllable.swift              Common transport surface of the four playback hosts (single active-host dispatch)
@@ -177,7 +181,7 @@ Sources/AetherEngine/
 │   ├── VideoRoutingPolicy.swift             Pure codec-and-field-order dispatch rule: AV1 gated on HW, VP9/VP8/MPEG4/MPEG2/VC1 always SW, interlaced H.264 SW so bwdif can deinterlace (#107, verified against decoded frames on VOD, #232), plus a second-stage gate routing H.264 High 4:2:2/4:4:4/10 + HEVC Rext to SW where VideoToolbox has no HW decoder (#2)
 │   ├── HardwareVideoDecoder.swift           SW path: VideoToolbox HW HEVC / AV1 decoder for sources routed away from AVPlayer
 │   ├── SoftwareVideoDecoder.swift           SW path: libavcodec/dav1d → CVPixelBuffer (NV12 / P010), HDR10+ side data
-│   ├── SubtitleDecoder.swift                Sidecar URL one-shot decode (text only)
+│   ├── SubtitleDecoder.swift                Sidecar URL one-shot decode (text only); decodes several streams of one container in a single pass (#266)
 │   └── VideoDecoderTypes.swift              DecodedFrameHandler typealias + VideoDecoderError
 ├── Demuxer/
 │   ├── AVIOProvider.swift                   Internal seam over a custom-AVIO byte source; AVIOReader and CustomIOReaderBridge both plug into the Demuxer through it, incl. the bounded-seek read deadline and the resolved byte size backing the byte-estimate seek fallback (#112)
@@ -249,7 +253,7 @@ Sources/AetherEngine/
 │   └── SampleBufferRenderer.swift           SW path: AVSampleBufferDisplayLayer + B-frame reorder, HDR10+ attachments; `flush(removingDisplayedImage:)` holds the last frame through a seek (`DisplayFlushOp`, #90)
 ├── Subtitles/
 │   ├── ASSScriptBuilder.swift               Reassembles raw ASS event cues + TrackInfo.assHeader into a complete script for whole-file renderers
-│   ├── ExternalSubtitleTrack.swift          Host-facing descriptor for external subtitle files registered as first-class tracks (synthetic TrackInfo ids, #88)
+│   ├── ExternalSubtitleTrack.swift          Host-facing descriptor for external subtitle files registered as first-class tracks (synthetic TrackInfo ids, #88; sourceStreamIndex addresses one stream of a container URL, #266)
 │   ├── Issue100PGSStaleArrival.swift        Holdback (`PGSStaleArrivalGate`) for PGS cues arriving behind the playhead: catch-up bursts resolve via their successor's trim instead of flashing open-ended placeholder windows through the overlay (#100)
 │   ├── MovTextSampleBuilder.swift           Stateless tx3g (mov_text) sample builder for the native legible-subtitle injection path (LoadOptions.prepareNativeSubtitles, #55)
 │   ├── NativeSubtitleCueStore.swift         Owns the decoded-cue array behind a native WebVTT subtitle rendition + the overlay tap feed; deduped, filled by the pump tap (embedded) or one whole-file decode (load-declared external, #88) (#55, Sodalite#32)

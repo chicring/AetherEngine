@@ -685,8 +685,11 @@ public struct SubtitleTextRun: Sendable, Equatable {
 public struct SubtitleTextPlacement: Sendable, Equatable {
     /// ASS numpad alignment from `\an`: 1 bottom-left through 9 top-right, 5 centred.
     public let alignment: Int?
-    /// Anchor from `\pos`, normalized to [0, 1] against the source video frame the same way
-    /// `SubtitleImage.position` is, with y measured from the top.
+    /// Anchor from `\pos`, normalized against the script's declared play resolution the same way
+    /// `SubtitleImage.position` is, with y measured from the top. Usually in [0, 1], but not
+    /// guaranteed: a script may anchor outside the frame on purpose, so a host that cannot draw
+    /// off-picture should decide for itself what to do with such a cue rather than assume the
+    /// range (#261).
     public let position: CGPoint?
 
     public init(alignment: Int?, position: CGPoint?) {

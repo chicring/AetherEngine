@@ -16,6 +16,7 @@
 #   restart-witness-av.mp4        - H.264 B-frames + AAC, 12 s (3 segments)
 #   restart-witness-leadaudio.mp4 - same, video delayed 0.3 s so audio leads
 #   restart-witness-subs.mkv      - same as MKV with an embedded SRT track (pump tap)
+#   a53-captions.mp4              - H.264 with in-picture A/53 CEA-608 SEI (#131, #259)
 #   hev1-inband-xps.mp4           - HEVC with in-band VPS/SPS/PPS and an empty hvcC
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
@@ -140,6 +141,97 @@ ffmpeg -hide_banner -loglevel error -y \
     -metadata:s:s:0 language=eng \
     "$FIXTURES_DIR/restart-witness-subs.mkv"
 rm -f "$SRT_TMP"
+
+# A/53 in-picture captions (#131, #259): US broadcast sources carry CEA-608 inside the
+# video as user_data_registered_itu_t_t35 SEI, and no encoder emits those from a synthetic
+# source, so they are injected here. Every access unit gets a cc_data SEI: the null pad pair
+# real encoders send continuously, except every 48th AU (2 s at 24 fps), which carries a
+# COMPLETE pop-on sequence (RCL, ENM, PAC, characters, EOC) in one SEI, so the caption is
+# atomic inside a single access unit and survives B-frame reordering. B-frames stay on
+# (-bf 3): they give the producer a non-zero playlist shift, which is what the axis witness
+# in Issue259A53CaptionAxisTests measures.
+echo "→ a53-captions.mp4 (H.264 with in-picture A/53 CEA-608 SEI, 12s)"
+A53_RAW="$(mktemp -t a53-raw).264"
+A53_CC="$(mktemp -t a53-cc).264"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=duration=12:size=320x180:rate=24" \
+    -c:v libx264 -preset veryfast -bf 3 -g 48 -pix_fmt yuv420p -b:v 200k \
+    -bsf:v "h264_metadata=aud=insert" -f h264 "$A53_RAW"
+python3 - "$A53_RAW" "$A53_CC" <<'PY'
+import sys
+
+def odd_parity(v):
+    v &= 0x7F
+    return v if bin(v).count('1') % 2 == 1 else (v | 0x80)
+
+# A complete pop-on caption: RCL, ENM, PAC row 1 col 0, character pairs, EOC.
+def caption_pairs(text):
+    pairs = [(0x14, 0x20), (0x14, 0x2E), (0x11, 0x40)]
+    b = text.encode('ascii')
+    for i in range(0, len(b), 2):
+        pairs.append((b[i], b[i + 1] if i + 1 < len(b) else 0x00))
+    pairs.append((0x14, 0x2F))
+    return [(odd_parity(a), odd_parity(c)) for a, c in pairs]
+
+# cc_data SEI: country 0xB5, provider 0x0031, "GA94", user_data_type_code 0x03, then
+# process_cc_data_flag | cc_count, em_data, cc_count * (0xFC marker + 608 pair), marker.
+def sei_nal(pairs):
+    payload = bytearray([0xB5, 0x00, 0x31, 0x47, 0x41, 0x39, 0x34, 0x03])
+    payload += bytes([0x40 | len(pairs), 0xFF])
+    for d0, d1 in pairs:
+        payload += bytes([0xFC, d0, d1])
+    payload += b'\xFF'
+    rbsp = bytearray([4])                      # payload_type: user_data_registered_itu_t_t35
+    n = len(payload)
+    while n >= 255:
+        rbsp.append(0xFF)
+        n -= 255
+    rbsp.append(n)
+    rbsp += payload
+    rbsp.append(0x80)                          # rbsp_trailing_bits
+    escaped = bytearray()
+    zeros = 0
+    for byte in rbsp:                          # emulation prevention
+        if zeros >= 2 and byte <= 0x03:
+            escaped.append(0x03)
+            zeros = 0
+        escaped.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    return b'\x00\x00\x00\x01\x06' + bytes(escaped)
+
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, 'rb').read()
+out = bytearray()
+prev = 0
+au = 0
+captions = 0
+i = 0
+while i + 3 <= len(data):
+    if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
+        payload = i + 3
+        if data[payload] & 0x1F == 9:          # access unit delimiter: AU boundary
+            end = payload + 2                  # AUD is header + primary_pic_type
+            out += data[prev:end]
+            if au % 48 == 0:
+                captions += 1
+                out += sei_nal(caption_pairs('CUE %d' % captions))
+            else:
+                out += sei_nal([(0x80, 0x80)])
+            prev = end
+            au += 1
+        i += 3
+    else:
+        i += 1
+out += data[prev:]
+open(dst, 'wb').write(bytes(out))
+print('    %d access units, %d captions' % (au, captions))
+PY
+ffmpeg -hide_banner -loglevel error -y \
+    -f h264 -r 24 -i "$A53_CC" \
+    -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=12" \
+    -map 0:v -map 1:a -c:v copy -c:a aac -b:a 48k -ac 1 -shortest \
+    "$FIXTURES_DIR/a53-captions.mp4"
+rm -f "$A53_RAW" "$A53_CC"
 
 # HEVC whose parameter sets live IN-BAND only: hev1 sample entry, hvcC header with
 # numOfArrays = 0. That is what `MP4Box ...:xps_inband` and the common Dolby-Vision MP4

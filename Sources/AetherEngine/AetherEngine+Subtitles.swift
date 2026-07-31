@@ -144,7 +144,8 @@ extension AetherEngine {
             clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
             activeSecondaryEmbeddedSubtitleStreamIndex = -1
             activeSecondaryExternalSubtitleTrackID = index
-            startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders)
+            startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
+                                        sourceStreamIndex: external.sourceStreamIndex)
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }
@@ -906,7 +907,8 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] external subtitle backfilled from finished store: id=\(id) cues=\(subtitleCues.count)", category: .engine)
             return
         }
-        startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id)
+        startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id,
+                           sourceStreamIndex: track.sourceStreamIndex)
     }
 
     /// Store lookup for the external backfill: test-hook override first, else the live session's stores.
@@ -925,29 +927,51 @@ extension AetherEngine {
     func startExternalNativeStoreFill(session: HLSVideoEngine) {
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
-        var jobs: [(url: URL, headers: [String: String], store: NativeSubtitleCueStore)] = []
-        for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
-            // Phase D: OCR entries defer to the selection-time sidecar decode (OCR of a whole
-            // .sup at load would violate the selection gating).
-            guard !entry.needsOCR,
-                  let extID = entry.externalID,
-                  let track = externalSubtitleRegistry[extID],
-                  ordinal < session.nativeSubtitleCueStoresForSession.count else { continue }
-            jobs.append((track.url,
-                         track.httpHeaders ?? loadedOptions.httpHeaders,
-                         session.nativeSubtitleCueStoresForSession[ordinal]))
-        }
+        let jobs = Self.externalSubtitleFillJobs(
+            table: nativeSubtitleTrackTable,
+            registry: externalSubtitleRegistry,
+            stores: session.nativeSubtitleCueStoresForSession,
+            defaultHeaders: loadedOptions.httpHeaders)
         guard !jobs.isEmpty else { return }
         externalNativeStoreFillTask = Task.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
-                if let result = try? await SubtitleDecoder.decodeFile(url: job.url, httpHeaders: job.headers) {
-                    job.store.appendCues(result.cues)
-                    job.store.markFinished()
-                } else {
-                    EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent)", category: .engine)
-                }
+                await AetherEngine.runExternalSubtitleFill(job: job)
             }
+        }
+    }
+
+    /// #266: fill one container's stores from a single decode pass. A pass covering several streams
+    /// fails as a whole (an out-of-range index throws), so on failure the targets are retried
+    /// individually: one host-side index mistake must not blank the container's other tracks. A
+    /// store that could not be filled stays UNfinished, or the rendition would serve a complete but
+    /// blank .vtt.
+    nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob) async {
+        if let results = try? await SubtitleDecoder.decodeFile(
+            url: job.url, httpHeaders: job.headers,
+            sourceStreamIndices: job.targets.map(\.streamIndex)
+        ) {
+            for (target, result) in zip(job.targets, results) {
+                target.store.appendCues(result.cues)
+                target.store.markFinished()
+            }
+            return
+        }
+        guard job.targets.count > 1 else {
+            EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent)", category: .engine)
+            return
+        }
+        EngineLog.emit("[AetherEngine] external native store fill: shared pass over \(job.url.lastPathComponent) failed, retrying \(job.targets.count) targets individually", category: .engine)
+        for target in job.targets {
+            if Task.isCancelled { return }
+            guard let result = try? await SubtitleDecoder.decodeFile(
+                url: job.url, httpHeaders: job.headers, sourceStreamIndex: target.streamIndex
+            ) else {
+                EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
+                continue
+            }
+            target.store.appendCues(result.cues)
+            target.store.markFinished()
         }
     }
 
@@ -970,7 +994,8 @@ extension AetherEngine {
     /// track id (if any) to publish as active. Also clears the pump-tap overlay stream so a prior
     /// tap-fed selection stops forwarding into the sidecar's cues (latent pre-#88 bug: the tap
     /// forward-guard matched the stale index and kept appending).
-    func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?) {
+    func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?,
+                            sourceStreamIndex: Int32? = nil) {
         cancelSidecarTask()
         // Sidecar replaces any active embedded stream.
         clearSubtitleDrainTarget(channel: .primary)   // #112 rework
@@ -992,7 +1017,8 @@ extension AetherEngine {
             do {
                 result = try await SubtitleDecoder.decodeFile(
                     url: url, httpHeaders: effectiveHeaders,
-                    preserveASSMarkup: preserveASS
+                    preserveASSMarkup: preserveASS,
+                    sourceStreamIndex: sourceStreamIndex
                 )
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
@@ -1036,7 +1062,8 @@ extension AetherEngine {
     }
 
     /// Shared secondary sidecar-decode start (#88): the pre-#88 selectSecondarySidecarSubtitle body.
-    func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?) {
+    func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?,
+                                     sourceStreamIndex: Int32? = nil) {
         loadedSecondarySidecarURL = url
         isSecondarySubtitleActive = true
         secondarySubtitleCues = []
@@ -1048,7 +1075,8 @@ extension AetherEngine {
             let result: SidecarDecodeResult
             do {
                 // Secondary is plain text only (never drives libass, mirroring embedded secondary #47).
-                result = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders)
+                result = try await SubtitleDecoder.decodeFile(
+                    url: url, httpHeaders: effectiveHeaders, sourceStreamIndex: sourceStreamIndex)
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -1609,6 +1637,38 @@ extension AetherEngine {
     /// sourceStreamIndex, external ids match externalID.
     nonisolated static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry]) -> Int? {
         table.firstIndex { $0.sourceStreamIndex == id || $0.externalID == id }
+    }
+
+    /// #266: group the load-declared external tracks into one fill job per container, so a URL
+    /// backing several tracks (an MKV with three subtitle streams) is read once instead of once per
+    /// track. Headers are part of the grouping key: differing auth means differing requests.
+    /// Duplicate registrations of one stream stay separate targets, both stores get the cues.
+    /// Ordering is by first appearance in the table, so the jobs are deterministic.
+    nonisolated static func externalSubtitleFillJobs(
+        table: [NativeSubtitleTrackEntry],
+        registry: [Int: ExternalSubtitleTrack],
+        stores: [NativeSubtitleCueStore],
+        defaultHeaders: [String: String]
+    ) -> [ExternalSubtitleFillJob] {
+        struct Key: Hashable {
+            let url: URL
+            let headers: [String: String]
+        }
+        var order: [Key] = []
+        var targetsByKey: [Key: [ExternalSubtitleFillJob.Target]] = [:]
+        for (ordinal, entry) in table.enumerated() {
+            // Phase D: OCR entries defer to the selection-time sidecar decode (OCR of a whole
+            // .sup at load would violate the selection gating).
+            guard !entry.needsOCR, let extID = entry.externalID,
+                  let track = registry[extID], ordinal < stores.count else { continue }
+            let key = Key(url: track.url, headers: track.httpHeaders ?? defaultHeaders)
+            if targetsByKey[key] == nil { order.append(key) }
+            targetsByKey[key, default: []].append(
+                .init(streamIndex: track.sourceStreamIndex, store: stores[ordinal]))
+        }
+        return order.map {
+            ExternalSubtitleFillJob(url: $0.url, headers: $0.headers, targets: targetsByKey[$0] ?? [])
+        }
     }
 
     /// Phase D: bitmap tracks eligible for an OCR-fed rendition. VOD only; embedded entries carry

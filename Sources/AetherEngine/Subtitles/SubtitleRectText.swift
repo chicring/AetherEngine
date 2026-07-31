@@ -73,12 +73,18 @@ enum SubtitleRectText {
     static let defaultASSPlayRes = CGSize(width: 384, height: 288)
 
     /// Play resolution declared by an ASS `[Script Info]` header, or nil when it declares none.
+    ///
+    /// The header arrives as codec extradata byte for byte as the muxer stored it, and muxed ASS
+    /// is conventionally CRLF, so the line endings are not ours to assume (#261). Splitting on
+    /// `isNewline` covers CRLF, LF and lone CR, and the trims are newline-inclusive so a stray CR
+    /// cannot reach `Double(_:)`, which returns nil for `"718\r"` and silently costs the whole
+    /// declaration.
     static func playRes(fromASSHeader header: String) -> CGSize? {
         func value(_ key: String) -> Double? {
-            for line in header.split(separator: "\n", omittingEmptySubsequences: false) {
-                let l = line.trimmingCharacters(in: .whitespaces)
+            for line in header.split(whereSeparator: \.isNewline) {
+                let l = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard l.lowercased().hasPrefix(key.lowercased() + ":") else { continue }
-                return Double(l.dropFirst(key.count + 1).trimmingCharacters(in: .whitespaces))
+                return Double(l.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines))
             }
             return nil
         }

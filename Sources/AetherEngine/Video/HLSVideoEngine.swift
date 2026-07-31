@@ -141,6 +141,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Set before start() when the source has no demuxable CC stream.
     var a53CaptionObserverForSession: (@Sendable ([CCDataParser.CCTriplet], Int64, Int64, AVRational) -> Void)?
 
+    /// #260: per-frame presentation times on both axes. Lock-guarded because the pump reads it once per muxed
+    /// frame while the host can install or clear it from any thread at any time (a subtitle track switched
+    /// mid-title must not have to wait for the next producer).
+    private let frameTimeObserverLock = NSLock()
+    private var _nativeVideoFrameTimeObserver: NativeVideoFrameTimeObserver?
+
+    func setNativeVideoFrameTimeObserver(_ observer: NativeVideoFrameTimeObserver?) {
+        frameTimeObserverLock.lock()
+        _nativeVideoFrameTimeObserver = observer
+        frameTimeObserverLock.unlock()
+    }
+
+    private func nativeVideoFrameTimeObserverSnapshot() -> NativeVideoFrameTimeObserver? {
+        frameTimeObserverLock.lock(); defer { frameTimeObserverLock.unlock() }
+        return _nativeVideoFrameTimeObserver
+    }
+
+    /// Monotonic producer generation handed to each producer (#260). Own lock: `makeProducer` runs both
+    /// under `restartLock` (live reopen) and outside it (initial bring-up).
+    private let producerEpochLock = NSLock()
+    private var producerEpochCounter: UInt64 = 0
+
+    private func nextProducerEpoch() -> UInt64 {
+        producerEpochLock.lock(); defer { producerEpochLock.unlock() }
+        producerEpochCounter &+= 1
+        return producerEpochCounter
+    }
+
     /// Sodalite#32: ordinal-aligned source stream indices for the native subtitle cue stores (nil entry =
     /// no demuxable stream, e.g. a sidecar). Drives the producer's subtitle tap: the pump keeps these
     /// streams and hands their packets to the session tap, which decodes into the ordinal's store. Set
@@ -341,7 +369,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// Fires on each gate open (initial + restart) so AetherEngine keeps its shift in step
     /// for subtitle cue lookup.
-    var onPlaylistShiftChanged: (@Sendable (Double) -> Void)?
+    /// `(shiftSeconds, seamItemSeconds)`: the new shift, and the item-axis position from which it applies
+    /// (this producer's planned first tfdt). Content below that position was muxed under the previous shift
+    /// and can still be in AVPlayer's buffer, so the host records a seam rather than replacing the scalar (#260).
+    var onPlaylistShiftChanged: (@Sendable (Double, Double) -> Void)?
 
     /// #240: link arbitration shared with the engine's subtitle side readers. Set by `AetherEngine`
     /// before `start()`; nil when the session is driven without one (`aetherctl`, tests), which
@@ -1831,7 +1862,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             prefetchDiskBudgetBytes: retentionBudgetBytes,
             // AE#222: nil until a pump proved this source cuts its first segment before any audio packet
             // arrives; from then on every producer of the session muxes moov from this frame.
-            audioMoovPrimeFrame: sessionAudioMoovPrimeFrame
+            audioMoovPrimeFrame: sessionAudioMoovPrimeFrame,
+            epoch: nextProducerEpoch()
         )
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
         // below. The side readers read one gate for the whole session, so a restart must not leave
@@ -1840,8 +1872,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
         }
-        prod.onVideoShiftKnown = { [weak self] shiftPts in
-            self?.handleVideoShiftKnown(shiftPts)
+        prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts in
+            self?.handleVideoShiftKnown(shiftPts, firstItemTfdtPts: firstItemTfdtPts)
         }
         prod.onLiveTimelineRebase = { [weak self] shiftPts, seamOutputSeconds in
             self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds)
@@ -1862,6 +1894,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.hasStartedRenderingProvider = hasStartedRenderingProvider
         prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
         prod.a53CaptionObserver = a53CaptionObserverForSession   // #131
+        // #260: resolved per frame, so installing an observer mid-session reaches this producer too.
+        prod.nativeVideoFrameTimeObserverProvider = { [weak self] in
+            self?.nativeVideoFrameTimeObserverSnapshot()
+        }
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.
         subtitleTapLock.lock()
@@ -1887,8 +1923,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var lastReopenSegmentCount = -1
     static let maxBarrenReopenCycles = 3
 
-    private func handleVideoShiftKnown(_ shiftPts: Int64) {
+    private func handleVideoShiftKnown(_ shiftPts: Int64, firstItemTfdtPts: Int64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
+        let seamItemSeconds = Double(firstItemTfdtPts) * sourceVideoTbSeconds
         setPlaylistShiftSeconds(seconds)
         // Refresh every native subtitle store's shift so cuesInWindow stays on the correct AVPlayer
         // axis after a restart (matroska seek can land past the planned keyframe, #55). Snapshot under
@@ -1898,7 +1935,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let stores = nativeSubtitleCueStoresForSession
         restartLock.unlock()
         stores.forEach { $0.setShiftSeconds(seconds) }
-        onPlaylistShiftChanged?(seconds)
+        onPlaylistShiftChanged?(seconds, seamItemSeconds)
     }
 
     /// Live program-boundary rebase. Unlike `handleVideoShiftKnown`, does NOT fire `onPlaylistShiftChanged`:

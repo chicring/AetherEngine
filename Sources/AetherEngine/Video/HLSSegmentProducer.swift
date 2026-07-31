@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import Libavformat
 import Libavcodec
@@ -545,8 +546,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Fires once per producer when HDR10+ T.35 SEI prefix (B5 00 3C 00 01 04) first appears in a video packet.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
 
+    /// #260: resolves the host's per-frame time observer at emission rather than holding it, so a host that
+    /// installs one mid-session reaches the running producer without a data race on a stored closure. Set
+    /// before `start()`; nil leaves the emission out entirely.
+    var nativeVideoFrameTimeObserverProvider: (@Sendable () -> NativeVideoFrameTimeObserver?)?
+
+    /// Monotonic producer generation, reported with every frame time so a consumer can drop entries from an
+    /// epoch whose segments a restart has since rewritten (#260).
+    let epoch: UInt64
+
     /// Fires at video gate-open with videoShiftPts (source video TB); re-fires on restart (matroska seek imprecision can shift).
-    var onVideoShiftKnown: (@Sendable (Int64) -> Void)?
+    /// `firstItemTfdtPts` is this producer's planned first tfdt, i.e. the item-axis position (same TB) from which
+    /// its shift applies. Everything below it on the item axis was muxed by an earlier producer under an earlier
+    /// shift and may still be in AVPlayer's buffer, so a consumer needs the pair, not the shift alone (#260).
+    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64) -> Void)?
 
     /// Fires at live program boundary with updated videoShiftPts and seamOutputSeconds (AVPlayer clock position of the seam).
     /// Distinct from onVideoShiftKnown: the new shift is at the producer edge, AVPlayer renders it buffer+holdback later.
@@ -711,8 +724,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packedSideAudioFallbackDurationPts: Int64 = 0,
         bufferAheadSegments: Int = 10,
         prefetchDiskBudgetBytes: Int = 0,
-        audioMoovPrimeFrame: [UInt8]? = nil
+        audioMoovPrimeFrame: [UInt8]? = nil,
+        epoch: UInt64 = 0
     ) throws {
+        self.epoch = epoch
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.bufferAheadSegments = bufferAheadSegments
         self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
@@ -855,6 +870,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func segmentIndex(forSourcePts pts: Int64) -> Int {
         let absolute = videoShiftPts == Int64.min ? pts : pts &+ videoShiftPts
         return baseIndex + Self.segmentOffset(forAbsolutePts: absolute, boundaries: segmentBoundaries)
+    }
+
+    /// Source-axis value of a timestamp the pump has already rebased onto the output axis
+    /// (`pts -= videoShiftPts`). Anything the producer hands to a consumer that works in source
+    /// PTS has to come back through here (#259). NOPTS and an unresolved shift pass through.
+    static func foldingShiftBack(_ value: Int64, shift: Int64) -> Int64 {
+        guard value != Int64.min, shift != Int64.min else { return value }
+        return value &+ shift
     }
 
     /// 0-based segment offset for `absolute` within the sorted-ascending `boundaries`: segment i spans
@@ -2273,7 +2296,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + "videoPID=\(videoStreamIndex) reconstructed=\(pendingJoinVideoConfig != nil)",
                             category: .session
                         )
-                        onVideoShiftKnown?(videoShiftPts)
+                        onVideoShiftKnown?(videoShiftPts, desiredFirstVideoTfdtPts)
                         // #133 follow-up: the gating IDR's in-band SPS/PPS back this epoch's muxer avcC. Establish
                         // the baseline so a later same-PID parameter-set change (encoder restart / regional splice)
                         // is detected against it. joinConfig is non-nil only in the liveH264AnnexBJoin scope.
@@ -2843,22 +2866,61 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         // #131: A53 caption extraction rides the same per-packet spot as the HDR10+ scan: decode
         // order, repaired DTS, timestamps still in the source time base (the rescale below).
+        // #259: the source time BASE, but no longer the source AXIS. The pump rebased this packet
+        // onto the output axis long before it got here, so the shift is folded back: the tap's cues
+        // are rendered against the source-PTS clock (as the c608 tap's and the SW path's are), and
+        // the shift is recomputed per producer session, so leaving it in would displace every
+        // caption by a different amount after each seek.
         if let kind = a53CodecKind, let observe = a53CaptionObserver,
            let data = packet.pointee.data, packet.pointee.pts != Int64.min {
             let size = Int(packet.pointee.size)
             if A53SEIParser.mayContainA53(data, size) {
                 let extracted = A53SEIParser.triplets(in: data, size: size, codec: kind, framing: a53NALFraming)
                 if !extracted.isEmpty {
-                    observe(extracted, packet.pointee.pts, packet.pointee.dts, sourceVideoTimeBase)
+                    observe(extracted,
+                            Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts),
+                            Self.foldingShiftBack(packet.pointee.dts, shift: videoShiftPts),
+                            sourceVideoTimeBase)
                 }
             }
         }
 
+        // #260: capture the source axis BEFORE the rescale (after it the packet carries muxer TB) and the
+        // keyframe flag while the packet is still ours. The item axis comes back out of writePacket: the write
+        // blanks the packet, so it cannot be read off it afterwards, and the sanitizer can move it.
+        let frameObserver = nativeVideoFrameTimeObserverProvider?()
+        let frameSourcePts = frameObserver == nil
+            ? Int64.min
+            : Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts)
+        let frameIsKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+        let frameSegmentIndex = currentMuxerSegmentIndex
+
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
-        _ = muxer.writePacket(packet)
+        let written = muxer.writePacket(packet).written
+
+        if let frameObserver,
+           let source = Self.cmTime(ticks: frameSourcePts, timeBase: sourceVideoTimeBase),
+           let item = Self.cmTime(ticks: written.pts, timeBase: muxer.muxerVideoTimeBase) {
+            frameObserver(
+                NativeVideoFrameTime(
+                    source: source,
+                    item: item,
+                    segmentIndex: frameSegmentIndex,
+                    isKeyframe: frameIsKeyframe,
+                    epoch: epoch
+                )
+            )
+        }
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
         trackedPacketFree(&pkt)
+    }
+
+    /// Ticks in `timeBase` as a `CMTime`. nil for NOPTS or a degenerate time base, so a consumer never
+    /// receives a timestamp the engine could not actually resolve (#260).
+    static func cmTime(ticks: Int64, timeBase: AVRational) -> CMTime? {
+        guard ticks != Int64.min, timeBase.num > 0, timeBase.den > 0 else { return nil }
+        return CMTime(value: CMTimeValue(ticks &* Int64(timeBase.num)), timescale: CMTimeScale(timeBase.den))
     }
 
     /// Strip 7/9-byte ADTS header in-place (advances data pointer, shrinks size; buf untouched for unref safety).
