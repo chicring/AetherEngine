@@ -439,11 +439,17 @@ extension AetherEngine {
                 guard let self = self else { return }
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
-                // AE#105: a disc title's raw source PTS starts at clip 0's STC base (= this constant VOD shift)
-                // while its duration is the 0-based MPLS/IFO playlist length. Anchor the display origin to that
-                // base so the published playhead is 0-based like the total. Normal/live sources keep origin 0
-                // (their public axis already equals source PTS), so this whole change is a no-op off disc.
-                self.sourcePresentationOrigin = (!self.discTitles.isEmpty && !self.isLive) ? seconds : 0
+                // AE#105 / AE#270: `duration` is 0-based for every source, so the published playhead has to
+                // be too. The origin is the source PTS of the item's first frame: a disc re-reads it from
+                // every publish (constant STC base), any other VOD source latches the first one (its later
+                // shifts carry producer drift), live keeps 0. See `PresentationOriginPolicy`.
+                self.sourcePresentationOrigin = PresentationOriginPolicy.origin(
+                    latched: self.latchedPresentationOrigin,
+                    publishedShift: seconds,
+                    isLive: self.isLive,
+                    isDisc: !self.discTitles.isEmpty
+                )
+                self.latchedPresentationOrigin = self.sourcePresentationOrigin
                 // #260: a live retune/reopen replaces the whole timeline (nothing older comes back on screen), so
                 // the history re-anchors. A VOD producer only writes from `seamItemSeconds` forward; whatever sits
                 // below that on the item axis was muxed by the previous producer, can still be in AVPlayer's
@@ -740,6 +746,15 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+        // AE#270: anchor the display axis on the container's own start time, which is what `duration` is
+        // measured from. Taking it from the session rather than latching the first published shift keeps a
+        // 0-based source byte-identical to the pre-#270 behaviour: the shift also carries the producer's
+        // initial drift (-0.08 s on a B-frame MP4 whose first PTS is 0), the container start does not.
+        // Live and disc keep their own rule (`PresentationOriginPolicy`).
+        if !isLive, discTitles.isEmpty {
+            latchedPresentationOrigin = session.sourceStartSeconds
+            sourcePresentationOrigin = session.sourceStartSeconds
+        }
         nativeSubtitleRenditionsServed = served.subtitleRenditionsServed
         extractorYieldState.activate(session: session)
 

@@ -52,9 +52,9 @@ enum RemoteHLSIngestFallback {
         return variantHasVideoAttributes.contains(true)
     }
 
-    /// The watchdog runs only for live bypass sessions with the fallback enabled: VOD remote HLS is the
-    /// AE#154 reroute target (ingesting it back would ping-pong), and hosts can opt out via
-    /// `LoadOptions.nativeRemoteHLSIngestFallback`.
+    /// The watchdog runs only for live bypass sessions with the fallback enabled. Finite
+    /// HEVC-in-MPEG-TS VOD uses the content-gated, seekable #268 ingest before a native mount, and hosts
+    /// can opt out of this live recovery via `LoadOptions.nativeRemoteHLSIngestFallback`.
     static func shouldArm(isLive: Bool, fallbackEnabled: Bool) -> Bool {
         isLive && fallbackEnabled
     }

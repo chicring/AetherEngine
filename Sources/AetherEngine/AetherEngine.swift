@@ -325,7 +325,9 @@ public final class AetherEngine: ObservableObject {
         guard !scrubRestartOwnedByProgrammaticSeek,
               let watchTarget = nativeScrubSeekTarget,
               let host = nativeHost else {
-            finishNativeScrubSeek(.landed(renderedTime: clock.sourceTime))
+            // AE#270: the event's `target` is on the display axis, so its landing has to be too.
+            finishNativeScrubSeek(.landed(renderedTime: PresentationAxis.display(
+                sourcePTS: clock.sourceTime, origin: sourcePresentationOrigin)))
             return
         }
         pendingScrubLanding = PendingScrubLanding(
@@ -707,6 +709,12 @@ public final class AetherEngine: ObservableObject {
     var softwareSubtitlePacketStore: SubtitlePacketStore?
     var subtitleDrainDecoders: [SubtitleChannel: EmbeddedSubtitleDecoder] = [:]
     var subtitleDrainCursors: [SubtitleChannel: SubtitleDrainCursor] = [:]
+    /// #271: monotonic timestamp of the previous drain tick, so a tick that ran long is not read as
+    /// a seek by the next one (`SubtitleOverlayDrainer.drainPlan`). Per tick, not per channel: both
+    /// channels are planned in the same pass off the same playhead. nil before the first tick.
+    var subtitleDrainLastTickUptime: Double?
+    /// #271: the OCR worker's own tick timestamp; same rule, separate cadence.
+    var subtitleOCRLastTickUptime: Double?
     /// #250: the frontier source of the last statement emitted per channel, so a change of source
     /// (the prefetcher dying, EOF landing) gets its own line instead of waiting for the 30 s
     /// cadence. nil before the first statement of a session.
@@ -739,11 +747,13 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let subtitleDrainBackscanSeconds: Double = 15
     nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
     nonisolated static let subtitleDrainTickNanoseconds: UInt64 = 500_000_000
-    /// Per-tick decode cap for the overlay drainer: smooths a flood backfill (frame-by-frame
-    /// effects PGS, ~1800 packets in a fresh selection's window) over a few ticks instead of one
-    /// long MainActor pass. 96 × 2 ticks/s decodes far faster than any real track emits (~24/s
-    /// worst observed), so the lead edge always catches up within seconds.
-    nonisolated static let subtitleDrainMaxPacketsPerTick: Int = 96
+    /// #271: per-tick decode cap for the overlay drainer, extended to the next PTS boundary
+    /// (`SubtitleOverlayDrainer.batchEnd`). The drain window is bounded in seconds of content, so on
+    /// a dense typeset track one window is thousands of packets and the loop holds the main actor
+    /// for all of them. Generous on purpose: the backscan sits at the head of the window, so the
+    /// cues around the playhead still land in the first batch and the rest of the 60 s lead fills
+    /// over the following ticks.
+    nonisolated static let subtitleDrainMaxPacketsPerTick: Int = 256
     /// Phase D: the OCR worker decodes bitmap compositions to playhead + this lead so AVKit's
     /// ~240 s forward .vtt prefetch burst at selection is served populated, never cached empty.
     nonisolated static let subtitleOCRLeadSeconds: Double = 240
@@ -1060,6 +1070,11 @@ public final class AetherEngine: ObservableObject {
     /// the producer already anchors `startPosition` on (`segmentIndexForPlaylistTime`), while `sourceTime`
     /// stays true source PTS for subtitle-cue alignment. Reset to 0 on load/stop; set in onPlaylistShiftChanged.
     var sourcePresentationOrigin: Double = 0
+
+    /// AE#270: the origin this session settled on, nil before the first publish. A non-disc VOD source
+    /// keeps its first one: later publishes fold producer drift into the shift, and re-reading them would
+    /// move the display axis under a picture that has not moved.
+    var latchedPresentationOrigin: Double?
 
     /// Diagnostics only. Reads HLSVideoEngine's videoShiftPts synchronously, bypassing the async
     /// onPlaylistShiftChanged relay. A persistent gap vs `playlistShiftSeconds` means the clock is folding
@@ -2140,6 +2155,51 @@ public final class AetherEngine: ObservableObject {
     /// (AetherEngine#28). nil on the `nativeRemoteHLS` bypass (no
     /// probe runs there) and when the probe failed but playback
     /// proceeds anyway (URL sources can be reopened internally).
+    enum HLSVODIngestReroute {
+        /// No content evidence for unsupported carriage; the caller keeps its existing route.
+        case notTaken
+        /// The load was restarted on the ingest; the caller must return this result.
+        case taken(SourceProbe?)
+    }
+
+    /// AE#268: content-gated reroute of a finite HLS VOD onto the seekable TS -> fMP4 ingest.
+    ///
+    /// AVFoundation builds no video track for HEVC in MPEG-TS (the HLS Authoring Spec sanctions HEVC
+    /// only in fMP4), so the AE#154 bypass would hand this source to AVPlayer for an audio-only,
+    /// black session. The #168 watchdog cannot catch it either: it is live-only and needs master
+    /// variant evidence, which a direct media playlist has none of. The decision therefore comes from
+    /// the playlist and the first segment's PMT, never from the `.m3u8` suffix or an AVPlayer error,
+    /// and only positive evidence reroutes: unknown, fMP4, live, encrypted, demuxed-audio and
+    /// H.264 shapes stay on the native path.
+    private func rerouteOntoHEVCMPEGTSIngest(
+        playlistURL: URL,
+        options: LoadOptions,
+        startPosition: Double?,
+        audioSourceStreamIndex: Int32?,
+        discTitleID: Int?,
+        generation: UInt64,
+        evidence: String
+    ) async throws -> HLSVODIngestReroute {
+        guard let reader = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: playlistURL,
+            httpHeaders: options.httpHeaders
+        ) else { return .notTaken }
+        try checkLoadCurrent(generation)
+        EngineLog.emit(
+            "[AetherEngine] AE#268: \(evidence); routing through the seekable TS -> fMP4 ingest",
+            category: .engine
+        )
+        var remuxOptions = options
+        remuxOptions.nativeRemoteHLS = false
+        return .taken(try await load(
+            source: .custom(reader, formatHint: "mpegts"),
+            startPosition: startPosition,
+            options: remuxOptions,
+            audioSourceStreamIndex: audioSourceStreamIndex,
+            discTitleID: discTitleID
+        ))
+    }
+
     @discardableResult
     /// - Parameter discTitleID: For a disc image (Blu-ray / DVD ISO), the title to open (id from
     ///   `discTitles`). nil opens the main title. Threaded into the probe so the chosen title is honored
@@ -2408,6 +2468,17 @@ public final class AetherEngine: ObservableObject {
         // (audio-tap reader selection, seek paths) sees a genuine remote-HLS session.
         if RemoteHLSMediaSelection.shouldReroute(failure: probeFailure, isCustomSource: isCustomSource),
            case .url(let hlsURL) = source {
+            if case .taken(let probe) = try await rerouteOntoHEVCMPEGTSIngest(
+                playlistURL: hlsURL,
+                options: loadedOptions,
+                startPosition: startPosition,
+                audioSourceStreamIndex: audioSourceStreamIndex,
+                discTitleID: discTitleID,
+                generation: gen,
+                evidence: "finite HEVC-in-MPEG-TS HLS"
+            ) {
+                return probe
+            }
             EngineLog.emit("[AetherEngine] AE#154: HLS playlist on the VOD loopback path; rerouting to the native remote-HLS bypass", category: .engine)
             loadedOptions.nativeRemoteHLS = true
             do {
@@ -2935,6 +3006,17 @@ public final class AetherEngine: ObservableObject {
             if RemoteHLSMediaSelection.shouldReroute(failure: error, isCustomSource: isCustomSource),
                case .url(let hlsURL) = source,
                loadGeneration == gen {
+                if case .taken(let probe) = try await rerouteOntoHEVCMPEGTSIngest(
+                    playlistURL: hlsURL,
+                    options: loadedOptions,
+                    startPosition: startPosition,
+                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    discTitleID: discTitleID,
+                    generation: gen,
+                    evidence: "second open confirmed finite HEVC-in-MPEG-TS HLS"
+                ) {
+                    return probe
+                }
                 EngineLog.emit(
                     "[AetherEngine] AE#246: the loopback session's own open classified the source as HLS; "
                     + "taking the AE#154 reroute onto the native remote-HLS bypass",
@@ -3546,10 +3628,14 @@ public final class AetherEngine: ObservableObject {
         }
         setProgrammaticSeek(inFlight: false, target: nil)
         // `sourceTime` is the on-screen frame (#49/#123): the honest landing position, which keyframe
-        // granularity or a still-draining chase can put a little off the target.
+        // granularity or a still-draining chase can put a little off the target. Folded onto the display
+        // axis because that is the axis the ticket's `target` is on (AE#270; identity off disc and off a
+        // PTS-origin source).
         closeSeekTicket(&programmaticSeekTicket,
-                        with: Self.seekTicketOutcome(hostReposition: hostReposition,
-                                                     renderedTime: clock.sourceTime))
+                        with: Self.seekTicketOutcome(
+                            hostReposition: hostReposition,
+                            renderedTime: PresentationAxis.display(sourcePTS: clock.sourceTime,
+                                                                   origin: sourcePresentationOrigin)))
     }
 
     /// #254: how a SW/audio-host reposition maps onto this seek's ticket. A reposition that spent its
@@ -3686,7 +3772,6 @@ public final class AetherEngine: ObservableObject {
         clock.currentTime = 0
         clock.bufferedPosition = 0
         clock.progress = 0
-        sourcePresentationOrigin = 0  // AE#105: clear disc display-origin so the next source starts on a clean axis.
         // Clear session state; without this, metadata/track lists/format/pendingExternalMetadata from the
         // previous session survive until the next load and bleed into unrelated sessions.
         duration = 0
@@ -4493,6 +4578,11 @@ public final class AetherEngine: ObservableObject {
         activeAudioDecoder = nil
         lastDetectedVideoCodec = AV_CODEC_ID_NONE
         playlistShiftSeconds = 0
+        // AE#105 / AE#270: the display origin belongs to the session that published it. Clearing it here
+        // rather than only in stop() keeps a load that reuses the engine (the common path: load() runs
+        // stopInternal itself) from folding the previous source's PTS origin into the new one's clock.
+        sourcePresentationOrigin = 0
+        latchedPresentationOrigin = nil
         setPresentationAxis(PresentationAxisMap())
         nativeClockSeconds = 0
         clock.sourceTime = 0

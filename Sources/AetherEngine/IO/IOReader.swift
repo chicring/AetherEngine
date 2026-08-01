@@ -17,6 +17,19 @@ public protocol IOReader: AnyObject, Sendable {
     func makeIndependentReader() -> IOReader?
 }
 
+/// Internal seam for finite segmented sources whose natural seek axis is time,
+/// not a synthetic concatenated byte offset.
+protocol TimeSeekableIOReader: IOReader {
+    /// Total media duration in seconds, from the source's own manifest.
+    var mediaDuration: Double { get }
+
+    /// Reposition to `seconds` of ELAPSED MEDIA TIME (0 = first byte the reader would deliver from a
+    /// fresh open), never an absolute container PTS: the caller strips the source's PTS origin first
+    /// (`Demuxer.repositionTimeSeekable`). Landing at or before the requested time is the contract;
+    /// the demuxer's packet gate drops what precedes the exact target.
+    func seek(to seconds: Double) -> Bool
+}
+
 public extension IOReader {
     func cancel() {}
     func makeIndependentReader() -> IOReader? { nil }

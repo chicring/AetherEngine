@@ -266,6 +266,43 @@ data[start:start + size] = replacement
 open(path, 'wb').write(bytes(data))
 PY
 
+# AetherEngine#268: finite HEVC-in-MPEG-TS HLS VOD, the carriage AVFoundation refuses to build a
+# video track for. Two shapes, because the seek axis only shows up in the second one:
+#   hls-hevc-vod/       PTS origin at ffmpeg's default 1.4 s
+#   hls-hevc-vod-offset/ PTS origin at ~1001 s, what broadcast-derived VOD carries
+# plus an H.264 control that has to STAY on the native AVPlayer route. Serve the parent directory
+# over HTTP (any static, range-capable origin) and drive it with
+# `aetherctl play --seek-every 6 --seek-pattern 500,120 http://127.0.0.1:PORT/hls-hevc-vod/media.m3u8`.
+echo "→ user/hls-hevc-vod* (HEVC-in-MPEG-TS HLS VOD, #268 route)"
+hls_vod_fixture() {  # <dir> <encoder> <extra-out-args...>
+    local dir="$FIXTURES_DIR/user/$1"; shift
+    local codec="$1"; shift
+    rm -rf "$dir" && mkdir -p "$dir"
+    ffmpeg -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=size=960x540:rate=25" \
+        -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 120 \
+        -c:v "$codec" -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 96k "$@" \
+        -f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type vod \
+        -hls_segment_filename "$dir/seg%03d.ts" "$dir/media.m3u8"
+}
+hls_vod_fixture hls-hevc-vod libx265 -x265-params "keyint=50:min-keyint=50:scenecut=0:log-level=none"
+hls_vod_fixture hls-h264-vod libx264 -g 50 -keyint_min 50 -sc_threshold 0
+
+# Broadcast-style PTS origin: mux once with the offset, then segment with -copyts so the segments
+# keep it. A reader that mistakes an absolute source PTS for playlist time seeks to the wrong end of
+# this one.
+OFFSET_TS="$FIXTURES_DIR/user/hevc-offset.ts"
+rm -rf "$FIXTURES_DIR/user/hls-hevc-vod-offset" && mkdir -p "$FIXTURES_DIR/user/hls-hevc-vod-offset"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=960x540:rate=25" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 120 \
+    -c:v libx265 -preset ultrafast -x265-params "keyint=50:min-keyint=50:scenecut=0:log-level=none" \
+    -pix_fmt yuv420p -c:a aac -b:a 96k -output_ts_offset 1000 -f mpegts "$OFFSET_TS"
+ffmpeg -hide_banner -loglevel error -y -copyts -i "$OFFSET_TS" -c copy \
+    -f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type vod \
+    -hls_segment_filename "$FIXTURES_DIR/user/hls-hevc-vod-offset/seg%03d.ts" \
+    "$FIXTURES_DIR/user/hls-hevc-vod-offset/media.m3u8"
+
 echo ""
 echo "Done. Try:"
 echo "  swift run aetherctl probe $FIXTURES_DIR/sdr-h264.mp4"

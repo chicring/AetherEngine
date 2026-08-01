@@ -31,6 +31,16 @@ The view is polymorphic: under the hood the engine swaps the hosted CALayer (`AV
 
 You provide the transport bar. You provide the dropdowns. You provide the pretty.
 
+## Used by
+
+<!-- used-by:start -->
+- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
+- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
+- [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
+<!-- used-by:end -->
+
+Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
+
 ## What it handles
 
 A scannable summary; the depth for each row lives in **[docs/formats.md](docs/formats.md)**.
@@ -216,7 +226,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.3.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.4.1")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -295,16 +305,6 @@ For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g
 
 A non-live remote `m3u8` handed to the default (loopback) path reroutes onto this bypass automatically: the bundled FFmpeg is built without network support, so the playlist can never be demuxed locally, and remote HLS is AVPlayer's native domain anyway (#154). On the bypass the engine surfaces the stream's external WebVTT subtitle renditions (the legible `AVMediaSelectionGroup`) as `subtitleTracks`; `selectSubtitleTrack(index:)` and `clearSubtitle()` drive AVPlayer's media selection, and AVPlayer renders the cues itself.
 
-## Used by
-
-<!-- used-by:start -->
-- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
-- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
-- [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
-<!-- used-by:end -->
-
-Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed.
-
 ## Host setup on tvOS
 
 For HDR / Dolby Vision sources to play reliably on tvOS 26.5+, the engine must drive `AVDisplayManager.preferredDisplayCriteria` itself (synchronously, before the AVPlayerItem assignment). Apple Tech Talk 503 has prescribed this ordering since 2017, and tvOS 26.5 now enforces it synchronously at HLS variant validation: the validator rejects variants whose `VIDEO-RANGE` the panel can't currently host with `AVFoundationErrorDomain -11868`, before fetching the `EXT-X-MAP` init segment, producing `item.status = .failed` with zero `errorLog().events`. SDR variants are unaffected.
@@ -356,10 +356,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.3.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.4.1")
 ```
 
-Pin to `.upToNextMinor(from: "6.3.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.4.1")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

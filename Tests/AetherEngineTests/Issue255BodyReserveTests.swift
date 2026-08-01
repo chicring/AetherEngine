@@ -133,10 +133,26 @@ final class ScriptedOriginServer: @unchecked Sendable {
             lock.unlock()
             Thread.detachNewThread { [self] in
                 while serveOneRequest(fd) {}
-                shutdown(fd, SHUT_RDWR)
-                close(fd)
+                closeConnection(fd)
             }
         }
+    }
+
+    /// Closes a connection exactly once. `stop()` closes every descriptor still registered, so a socket
+    /// whose serving thread is done has to leave the registry before it closes: otherwise the kernel
+    /// hands that number to the next opener (in practice a guarded descriptor), `stop()` closes it a
+    /// second time, and the EXC_GUARD kills the whole test process instead of failing one test. The run
+    /// then ends with no failing test and a bare exit 1.
+    private func closeConnection(_ fd: Int32) {
+        lock.lock()
+        guard let index = _connFDs.firstIndex(of: fd) else {
+            lock.unlock()
+            return  // stop() owns this descriptor now
+        }
+        _connFDs.remove(at: index)
+        lock.unlock()
+        shutdown(fd, SHUT_RDWR)
+        close(fd)
     }
 
     /// Returns false when the connection is done (client gone, malformed request, or a scripted close).

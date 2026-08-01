@@ -345,6 +345,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `playlistShiftSeconds` (updated dynamically per gate open).
     public private(set) var firstKeyframeSeconds: Double = 0
 
+    /// AE#270: source PTS the container's timeline starts at, clamped at 0. The published playhead folds
+    /// it out so it stays on the same 0-based axis as `duration`.
+    public private(set) var sourceStartSeconds: Double = 0
+
     /// Result of the stream-copy / FLAC-bridge / video-only cascade. Possible values:
     /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → FLAC bridge"`.
     /// nil when no audio pipeline is live.
@@ -828,6 +832,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if videoTimeBase.num > 0, videoTimeBase.den > 0 {
             sourceVideoTbSeconds = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         }
+        // AE#270: the source PTS the container's own timeline starts at. `duration` is measured from here,
+        // so this is the PTS that maps to display-0 for the host (0 for an MP4, 1.4 s for anything ffmpeg
+        // wrote as MPEG-TS, hours for VOD carved out of a broadcast stream). A negative start time is an
+        // encoder-side reorder artifact rather than an origin, so it clamps to 0.
+        let formatStart = dem.formatStartTime
+        sourceStartSeconds = formatStart == Int64.min ? 0 : max(0, Double(formatStart) / Double(AV_TIME_BASE))
         let durationSeconds = dem.duration
         var plan: [Segment]
         if isLiveSession {
@@ -849,13 +859,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // 2. Prewarm MKV Cues so libavformat's keyframe index is populated (1-2 byte-range reads).
             //    Bounded: a missing/out-of-bounds Cues index degrades into a multi-GB linear scan;
             //    abort past the deadline and fall back to the uniform-stride plan.
-            let prewarmStart = DispatchTime.now()
-            let prewarmOK = dem.seekBounded(to: durationSeconds * 0.5, timeout: Self.cuePrewarmTimeout)
-            let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
-            if prewarmOK {
-                EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+            //    #268: a segmented time-seekable source (HLS VOD ingest) has no index libavformat could
+            //    load, and each reposition refetches a segment, so prewarming would buy the same
+            //    uniform-stride plan for the price of two segment downloads at every session start.
+            if dem.timeSeekableReader != nil {
+                EngineLog.emit("[HLSVideoEngine] cue prewarm: skipped for a segmented source (no index to load, every reposition refetches a segment)")
             } else {
-                EngineLog.emit("[HLSVideoEngine] cue prewarm: capped at \(String(format: "%.1f", prewarmMs))ms (no usable Cues index, index points past EOF or is absent); building plan from whatever keyframes were scanned")
+                let prewarmStart = DispatchTime.now()
+                let prewarmOK = dem.seekBounded(to: durationSeconds * 0.5, timeout: Self.cuePrewarmTimeout)
+                let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
+                if prewarmOK {
+                    EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+                } else {
+                    EngineLog.emit("[HLSVideoEngine] cue prewarm: capped at \(String(format: "%.1f", prewarmMs))ms (no usable Cues index, index points past EOF or is absent); building plan from whatever keyframes were scanned")
+                }
             }
 
             // 3. Build the segment plan. Uses the same cut algorithm as libavformat's hls muxer

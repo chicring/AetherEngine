@@ -224,6 +224,7 @@ extension AetherEngine {
         subtitleDrainerTask = nil
         subtitleDrainDecoders.removeAll()
         subtitleDrainCursors.removeAll()
+        subtitleDrainLastTickUptime = nil   // #271
         subtitleResolutionLastFrontier.removeAll()   // #250
         cancelSubtitleForwardPrefetcher()   // #151
     }
@@ -249,6 +250,11 @@ extension AetherEngine {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return }
         store.setProtectedStreams(Set(subtitleDrainTargets.values))   // #166: re-assert protection
         let playhead = sourceTime
+        // #271: wall time since the previous tick, so a tick that itself ran long cannot be read as
+        // a seek by the next one. See SubtitleOverlayDrainer.drainPlan.
+        let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let elapsed = subtitleDrainLastTickUptime.map { tickUptime - $0 } ?? 0
+        subtitleDrainLastTickUptime = tickUptime
         var prefetchNeedsReanchor = false
         for (channel, streamIndex) in subtitleDrainTargets {
             let hadCursor = subtitleDrainCursors[channel] != nil
@@ -257,7 +263,8 @@ extension AetherEngine {
                 playhead: playhead,
                 lead: Self.subtitleDrainLeadSeconds,
                 backscan: Self.subtitleDrainBackscanSeconds,
-                jumpThreshold: Self.subtitleDrainJumpThresholdSeconds)
+                jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
+                elapsedSinceLastPlan: elapsed)
             if Self.subtitleForwardPrefetchNeedsReanchor(plan: plan, hadCursor: hadCursor) {
                 prefetchNeedsReanchor = true
             }
@@ -291,33 +298,34 @@ extension AetherEngine {
             guard let decoder = subtitleDrainDecoders[channel] else { continue }
             let entries = store.entries(streamIndex: streamIndex,
                                         from: window.from, through: window.through)
-            // Bound the MainActor decode per tick: a fresh selection's backfill window on a
-            // frame-by-frame effects PGS track holds ~1800 packets (backscan 15 s + lead 60 s at
-            // ~24/s), and decoding them in one pass froze the UI for seconds at start. The cursor
-            // only advances to the last decoded packet, so following ticks pick up the remainder
-            // (192 packets/s decode far outruns the ~24/s arrival; normal tracks fit in one tick).
-            let batch = entries.prefix(Self.subtitleDrainMaxPacketsPerTick)
-            let truncated = batch.count < entries.count
+            // #271: bound the batch, on a PTS boundary. The window is bounded in seconds of
+            // content, so on a dense track it is thousands of packets and this loop has no
+            // suspension point.
+            let batchEnd = SubtitleOverlayDrainer.batchEnd(
+                count: entries.count,
+                cap: Self.subtitleDrainMaxPacketsPerTick,
+                ptsAt: { entries[$0].ptsSeconds })
+            // #271: bind the channel's cue array ONCE for the whole batch. `subtitleCues` is
+            // `@Published`, whose wrapper exposes get/set and no `_modify`, so passing it inout per
+            // event both copy-on-writes the array and publishes it: every consumer then walks a
+            // cumulative snapshot once per decoded packet, O(n) each, for a batch that added a
+            // handful of cues. One bind, one publish, and only when the batch changed something.
+            var cues = retainedSubtitleCues(for: channel)
+            var didMutate = false
             // The cursor only advances to an actually-decoded packet's PTS: a window that is
             // empty because the producer has not reached it yet must be rescanned next tick.
             var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
-            // One @Published write per tick, not per event: a frame-by-frame effects PGS track
-            // (~24 compositions/s) decodes hundreds of events in a single backfill window, and a
-            // per-event write storms the MainActor — each publish re-runs every host Combine sink
-            // over the full cue array (O(events × cues) per tick; device: UI frozen, CPU pegged).
-            var working = retainedSubtitleCues(for: channel)
-            var mutated = false
-            for entry in batch {
+            for entry in entries[..<batchEnd] {
                 // A cue-less event still matters: a PGS clear composition carries only
                 // pgsTrimAt and is what removes the line during silence.
                 if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder),
                    !event.cues.isEmpty || event.pgsTrimAt != nil,
-                   applySubtitleEvent(event, channel: channel, to: &working) {
-                    mutated = true
+                   applySubtitleEvent(event, to: &cues, channel: channel) {
+                    didMutate = true
                 }
                 lastDecoded = entry.ptsSeconds
             }
-            if case .resetAndDecode = plan, entries.isEmpty {
+            if case .resetAndDecode = plan, batchEnd == 0 {
                 // Fresh window with nothing stored yet: anchor just behind the window start so
                 // steady ticks rescan it without re-triggering the discontinuity path.
                 lastDecoded = window.from
@@ -330,22 +338,29 @@ extension AetherEngine {
             // decoding above. If the pass remains active with a candidate after the whole window,
             // finalize it. Raw packet presence cannot answer this: the landing line's own zero-object
             // CLEAR is stored ahead and trims the candidate, but carries no cues that can end the pass.
-            // A truncated tick has NOT seen the whole window: finalizing then would emit a candidate
-            // still seconds behind the playhead; the pass continues next tick (or ends naturally in
-            // admitDuringReconstruction once the decode reaches the playhead).
-            if !truncated, SubtitleOverlayDrainer.shouldFinalizeReconstruction(
+            //
+            // #271: "after the whole window" is now literal. A capped batch leaves the rest of the
+            // window undecoded, and its successor composition may sit in the remainder, so the pass
+            // carries into the next tick instead of finalizing on a partial view.
+            if batchEnd == entries.count,
+               SubtitleOverlayDrainer.shouldFinalizeReconstruction(
                 reconstructing: pgsStaleArrivalGates[channel]?.reconstructing ?? false,
                 hasCandidate: pgsStaleArrivalGates[channel]?.hasReconstructionCandidate ?? false) {
-                // #143 follow-up: the candidate is the genuinely active line at the seek target, so
-                // it bypasses `admit`, whose steady-state stale check would re-hold a landing line
-                // sitting more than the epsilon behind the playhead and re-dark the overlay.
+                // The candidate is the genuinely active line at the seek target, so it bypasses
+                // `admit`, whose steady-state stale check would re-hold a landing line sitting more
+                // than the epsilon behind the playhead and re-dark the overlay this fix exists to light.
                 for cue in pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
                     .finalizeReconstruction(playhead: playhead) {
-                    insertSorted(cue, into: &working)
-                    mutated = true
+                    if insertSorted(cue, into: &cues) { didMutate = true }
                 }
             }
-            if mutated { setRetainedSubtitleCues(working, for: channel) }
+            // Retention prune, once per batch instead of once per event: it depends only on the
+            // playhead, which the batch does not move.
+            if isSubtitleActive(for: channel),
+               Self.pruneCues(&cues, before: playhead - subtitleCueRetentionSeconds) {
+                didMutate = true
+            }
+            if didMutate { publishRetainedSubtitleCues(cues, for: channel) }
             // #250: the post-seek window has decoded, so state how far determination reaches.
             if case .resetAndDecode = plan {
                 emitSubtitleResolutionStatement(channel: channel, streamIndex: streamIndex,
@@ -680,25 +695,30 @@ extension AetherEngine {
         return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: 1000))
     }
 
-    /// The channel's retained cue store, as a value copy for tick-local mutation.
+    /// #271: the channel's retained array, bound once per drain tick. Reading it here and writing it
+    /// back once at the end of the batch is what keeps `$subtitleCues` to one publication per tick.
     private func retainedSubtitleCues(for channel: SubtitleChannel) -> [SubtitleCue] {
-        channel == .primary ? subtitleCues : secondarySubtitleCues
+        switch channel {
+        case .primary:   return subtitleCues
+        case .secondary: return secondarySubtitleCues
+        }
     }
 
-    /// Write a tick's accumulated mutations back — the single @Published publish per channel per tick.
-    private func setRetainedSubtitleCues(_ cues: [SubtitleCue], for channel: SubtitleChannel) {
+    private func publishRetainedSubtitleCues(_ cues: [SubtitleCue], for channel: SubtitleChannel) {
         switch channel {
-        case .primary: subtitleCues = cues
+        case .primary:   subtitleCues = cues
         case .secondary: secondarySubtitleCues = cues
         }
     }
 
-    /// Apply one decoded event to the tick's working array. Returns whether it was applied
-    /// (false when the channel's subtitle went inactive mid-tick).
+    /// Returns whether the event changed anything. An event that decodes but resolves to nothing new
+    /// (a re-decoded cue the store already holds, a trim matching no open window) must not cost a
+    /// publication: on a dense track that is the common case, and each publication makes every
+    /// consumer walk the whole cumulative snapshot (#271).
     @discardableResult
     private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent,
-                                    channel: SubtitleChannel,
-                                    to cues: inout [SubtitleCue]) -> Bool {
+                                    to cues: inout [SubtitleCue],
+                                    channel: SubtitleChannel) -> Bool {
         guard isSubtitleActive(for: channel) else { return false }
 
         // Per-session diagnostics: primary-only, capped at 20 to keep the in-app log readable.
@@ -713,19 +733,23 @@ extension AetherEngine {
             )
         }
 
-        applyEventMutations(event, to: &cues, channel: channel)
-        return true
+        return applyEventMutations(event, to: &cues, channel: channel)
     }
 
-    /// PGS clear-event trim + sorted insert + prune. Native mov_text stores (#55) are NOT fed here; those are owned by the multi-decode reader.
+    /// PGS clear-event trim + sorted insert. Native mov_text stores (#55) are NOT fed here; those are owned by the multi-decode reader.
+    /// #271: retention pruning moved to the drain tick (once per batch, not once per event) and the
+    /// return value reports whether `cues` actually changed.
     @MainActor
-    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue], channel: SubtitleChannel = .primary) {
+    @discardableResult
+    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue], channel: SubtitleChannel = .primary) -> Bool {
+        var changed = false
         if let trimAt = event.pgsTrimAt {
             for i in 0..<cues.count {
                 guard case .image = cues[i].body else { continue }
                 let cue = cues[i]
                 if cue.startTime < trimAt && cue.endTime > trimAt {
                     cues[i] = cue.with(endTime: trimAt)
+                    changed = true
                 }
             }
             // #100: this event is the held stale arrival's successor; its start closes the held
@@ -733,13 +757,13 @@ extension AetherEngine {
             // genuinely active cue), drop replayed history silently.
             for cue in pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
                 .resolveHeld(trimAt: trimAt, playhead: sourceTime) {
-                insertSorted(cue, into: &cues)
+                if insertSorted(cue, into: &cues) { changed = true }
             }
         }
         // #107: teletext page-state semantics; every event (content or erase) closes earlier
         // open text cues at its start, since libzvbi emits pages open-ended ("until replaced").
-        if let trimAt = event.textTrimAt {
-            Self.trimTextCues(&cues, at: trimAt)
+        if let trimAt = event.textTrimAt, Self.trimTextCues(&cues, at: trimAt) {
+            changed = true
         }
         // #100: a PGS event whose cues start well behind the playhead is a catch-up replay; its
         // open-ended placeholder window would cover the playhead the instant it inserts and flash
@@ -751,28 +775,34 @@ extension AetherEngine {
             .admit(cues: event.cues, isPGS: event.isPGS,
                    isSelfContained: event.isSelfContainedPGS, playhead: sourceTime)
         for cue in admitted {
-            insertSorted(cue, into: &cues)
+            if insertSorted(cue, into: &cues) { changed = true }
         }
-        pruneOldSubtitleCues(&cues)
+        return changed
     }
 
 
     @MainActor
-    private func insertSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) {
+    @discardableResult
+    private func insertSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) -> Bool {
         Self.insertCueSorted(cue, into: &cues, nextID: &nextRetainedSubtitleCueID)
     }
 
     /// #107: close every non-image cue (text or rich text) whose window covers `trimAt` (teletext
     /// page-state semantics: each page transmission or erase replaces what came before it). Image
     /// cues are untouched; they have their own PGS trim. Static and pure for unit tests.
-    nonisolated static func trimTextCues(_ cues: inout [SubtitleCue], at trimAt: Double) {
+    /// Returns whether any cue was actually closed (#271).
+    @discardableResult
+    nonisolated static func trimTextCues(_ cues: inout [SubtitleCue], at trimAt: Double) -> Bool {
+        var changed = false
         for i in 0..<cues.count {
             if case .image = cues[i].body { continue }
             let cue = cues[i]
             if cue.startTime < trimAt && cue.endTime > trimAt {
                 cues[i] = cue.with(endTime: trimAt)
+                changed = true
             }
         }
+        return changed
     }
 
     /// #112 full umbau: sorted insert of a decoded cue into the retained store, keeping ascending start order. An
@@ -791,7 +821,20 @@ extension AetherEngine {
     /// re-decodes cues still retained here; without a store-level guard the cues accumulate (report: 4 -> 7 -> 11)
     /// and the reset ids collide with retained ids (`ForEach(id:)` "occurs multiple times"). The retained store
     /// is the session-wide source of truth, so the invariant lives here, not on the ephemeral decoder.
-    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue], nextID: inout Int) {
+    ///
+    /// #271: both same-start lookups below run over the equal-start RUN found by binary search, not
+    /// over the whole array. The store is kept sorted by startTime by the insert at the bottom, and
+    /// both keys require an exact startTime match, so the run is the only place a match can live. On
+    /// a dense typeset track the retained array is thousands of cues and every decoded packet used
+    /// to walk all of them. Returns whether a cue was actually inserted or replaced.
+    @discardableResult
+    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue], nextID: inout Int) -> Bool {
+        // Index range, deliberately not an ArraySlice: a live slice keeps a second reference to the
+        // array's buffer, so the insert below would copy-on-write the whole store on every call.
+        let lower = lowerBoundByStartTime(cue.startTime, in: cues)
+        var upper = lower
+        while upper < cues.count, cues[upper].startTime == cue.startTime { upper += 1 }
+
         // A non-image cue already present with the same start and flattened text is a re-decode of a retained
         // line, not a new one. `cue.text` flattens both `.text` and `.richText` (#107 coloured teletext pages)
         // and is nil for `.image`, so image cues correctly skip this guard and use their own same-start replace
@@ -800,50 +843,59 @@ extension AetherEngine {
         // of the key: a retained teletext cue may have been trimmed by its successor (#107) while the re-decode
         // emits the original open-ended window; the retained (trimmed) cue stays authoritative. Deduped cues
         // consume no id.
-        if let text = cue.text,
-           cues.contains(where: { other in
-               other.startTime == cue.startTime && other.text == text
-           }) {
-            return
+        if let text = cue.text {
+            for i in lower..<upper where cues[i].text == text { return false }
         }
 
         let stamped = cue.with(id: nextID)
         nextID += 1
 
-        if case .image(let stampedImage) = stamped.body,
-           let existing = cues.firstIndex(where: { other in
-               guard case .image(let otherImage) = other.body,
-                     other.startTime == stamped.startTime else { return false }
-               return otherImage.position == stampedImage.position
-                   && otherImage.cgImage.width == stampedImage.cgImage.width
-                   && otherImage.cgImage.height == stampedImage.cgImage.height
-           }) {
-            cues[existing] = stamped
-            return
+        if case .image(let stampedImage) = stamped.body {
+            for i in lower..<upper {
+                guard case .image(let otherImage) = cues[i].body else { continue }
+                if otherImage.position == stampedImage.position
+                    && otherImage.cgImage.width == stampedImage.cgImage.width
+                    && otherImage.cgImage.height == stampedImage.cgImage.height {
+                    cues[i] = stamped
+                    return true
+                }
+            }
         }
+        cues.insert(stamped, at: lower)
+        return true
+    }
+
+    /// First index of the start-sorted retained array whose cue starts at or after `startTime`.
+    /// Also the insert position for a cue with that start: a new cue goes in front of the cues
+    /// already sharing it, which is where the pre-#271 linear insert put it too.
+    nonisolated static func lowerBoundByStartTime(_ startTime: Double, in cues: [SubtitleCue]) -> Int {
         var lo = 0, hi = cues.count
         while lo < hi {
             let mid = (lo + hi) / 2
-            if cues[mid].startTime < stamped.startTime { lo = mid + 1 } else { hi = mid }
+            if cues[mid].startTime < startTime { lo = mid + 1 } else { hi = mid }
         }
-        cues.insert(stamped, at: lo)
+        return lo
     }
 
     /// Legacy 2-arg entry that preserves the caller's cue id (test / utility use). The engine path uses the `nextID`
     /// overload so ids stay session-monotonic across decoder rebuilds (#121).
-    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) {
+    @discardableResult
+    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) -> Bool {
         var id = cue.id
-        insertCueSorted(cue, into: &cues, nextID: &id)
+        return insertCueSorted(cue, into: &cues, nextID: &id)
     }
 
-    /// Prune cues whose `endTime` is older than the retention window. Uses `sourceTime` because cue.startTime/endTime are absolute source PTS seconds (see EmbeddedSubtitleDecoder.decode).
-    @MainActor
-    private func pruneOldSubtitleCues(_ cues: inout [SubtitleCue]) {
-        guard !cues.isEmpty else { return }
-        let cutoff = sourceTime - subtitleCueRetentionSeconds
-        if cutoff > 0 {
-            cues.removeAll { $0.endTime < cutoff }
-        }
+    /// Prune cues whose `endTime` is older than the retention window. The caller passes
+    /// `sourceTime - subtitleCueRetentionSeconds` because cue.startTime/endTime are absolute source
+    /// PTS seconds (see EmbeddedSubtitleDecoder.decode). Returns whether anything was dropped (#271).
+    /// Fork addition: count backstop (below) so a frame-by-frame effects PGS track cannot balloon
+    /// the retained decoded-bitmap array beyond maxRetainedSubtitleCueCount.
+    nonisolated static func pruneCues(_ cues: inout [SubtitleCue], before cutoff: Double) -> Bool {
+        var changed = false
+        guard !cues.isEmpty, cutoff > 0 else { return false }
+        let before = cues.count
+        cues.removeAll { $0.endTime < cutoff }
+        changed = cues.count != before
         // Count backstop: the time window assumes ~1500-2000 cues per feature (see
         // subtitleCueRetentionSeconds), but a frame-by-frame effects PGS track emits ~24 cues/s
         // and retains ~8600 decoded bitmaps inside the same window. Evict oldest-start first:
@@ -851,7 +903,11 @@ extension AetherEngine {
         // the drainer just decoded must survive (the cursor has already advanced past it). The
         // cap exceeds a full 60 s drain lead at flood rate (~1450) so it can never starve display.
         let excess = cues.count - Self.maxRetainedSubtitleCueCount
-        if excess > 0 { cues.removeFirst(excess) }
+        if excess > 0 {
+            cues.removeFirst(excess)
+            changed = true
+        }
+        return changed
     }
 
 

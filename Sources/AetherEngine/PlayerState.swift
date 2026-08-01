@@ -200,8 +200,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// readyToPlay but never builds a video track for a master that advertises one. That signature means
     /// the master delivers HEVC in MPEG-TS segments, which AVFoundation's HLS demuxer does not support
     /// (the HLS Authoring Spec sanctions HEVC only in fMP4); the ingest path remuxes TS to fMP4 and plays
-    /// the same stream. Live-only (VOD remote HLS is the AE#154 reroute target). `httpHeaders` ride along
-    /// onto the ingest fetches. Default `true` (AetherEngine#168).
+    /// the same stream. Live-only; finite HEVC-in-MPEG-TS VOD is classified before the native mount and
+    /// uses the seekable #268 ingest instead. `httpHeaders` ride along onto the ingest fetches. Default
+    /// `true` (AetherEngine#168).
     public var nativeRemoteHLSIngestFallback: Bool
 
     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).

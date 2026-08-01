@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import CoreGraphics
 @testable import AetherEngine
 
 /// AE#266: an external subtitle URL can be a container holding several subtitle streams, and a host
@@ -129,6 +130,90 @@ struct Issue266ExternalSubtitleStreamIndexTests {
                 }
             }
         }
+    }
+
+    // MARK: - Per-stream PlayRes
+
+    /// The decode state a shared pass could accidentally share is not the header, it is the ASS
+    /// PlayRes that `\pos` normalizes against. Both streams of this fixture carry the SAME
+    /// `\pos(320,240)` under DIFFERENT declared resolutions, so one pinned PlayRes yields two equal
+    /// positions. A header comparison passes either way, which is why it cannot stand in for this.
+    @Test("each stream normalizes \\pos against its own declared PlayRes in a shared pass")
+    func multiStreamDecodeKeepsPlayResPerStream() async throws {
+        try await MultiASSPlayResFixture.withFixture { url in
+            let results = try await SubtitleDecoder.decodeFile(
+                url: url,
+                sourceStreamIndices: [MultiASSPlayResFixture.englishStreamIndex,
+                                      MultiASSPlayResFixture.spanishStreamIndex])
+
+            #expect(results.count == 2)
+            expectPosition(results.first?.cues.first?.placement?.position,
+                           MultiASSPlayResFixture.englishPosition, "english")
+            expectPosition(results.last?.cues.first?.placement?.position,
+                           MultiASSPlayResFixture.spanishPosition, "spanish")
+            // The cues are the right way round, and the tag really is identical in both scripts.
+            #expect(results.first?.cues.compactMap(\.text) == MultiASSPlayResFixture.englishLines)
+            #expect(results.last?.cues.compactMap(\.text) == MultiASSPlayResFixture.spanishLines)
+            #expect(MultiASSPlayResFixture.englishPosition != MultiASSPlayResFixture.spanishPosition)
+            // A placement belongs to the cue that asked for it: the second cue carries no \pos.
+            #expect(results.first?.cues.last?.placement?.position == nil)
+        }
+    }
+
+    /// The single-stream path resolves its own header too, rather than the container's first.
+    @Test("a single-stream decode normalizes against the requested stream's PlayRes")
+    func singleStreamDecodeUsesRequestedStreamPlayRes() async throws {
+        try await MultiASSPlayResFixture.withFixture { url in
+            let result = try await SubtitleDecoder.decodeFile(
+                url: url, sourceStreamIndex: MultiASSPlayResFixture.spanishStreamIndex)
+            expectPosition(result.cues.first?.placement?.position,
+                           MultiASSPlayResFixture.spanishPosition, "spanish")
+        }
+    }
+
+    /// The header stays per stream as well, which is the weaker property but the one a host reads
+    /// off `TrackInfo.assHeader` when it renders the markup itself.
+    @Test("preserved ASS headers stay per stream")
+    func multiStreamDecodeKeepsHeaderPerStream() async throws {
+        try await MultiASSPlayResFixture.withFixture { url in
+            let results = try await SubtitleDecoder.decodeFile(
+                url: url, preserveASSMarkup: true,
+                sourceStreamIndices: [MultiASSPlayResFixture.englishStreamIndex,
+                                      MultiASSPlayResFixture.spanishStreamIndex])
+
+            #expect(results.first?.assHeader?.contains("PlayResX: 640") == true)
+            #expect(results.last?.assHeader?.contains("PlayResX: 1920") == true)
+        }
+    }
+
+    /// The same, through the production route: a fill job over a shared container writes each
+    /// stream's normalized placement into its own store.
+    @Test("a shared fill job keeps each store's placement on its own PlayRes")
+    func fillRunKeepsPlayResPerTarget() async throws {
+        try await MultiASSPlayResFixture.withFixture { url in
+            let english = NativeSubtitleCueStore()
+            let spanish = NativeSubtitleCueStore()
+            let job = AetherEngine.ExternalSubtitleFillJob(
+                url: url, headers: [:],
+                targets: [.init(streamIndex: MultiASSPlayResFixture.englishStreamIndex, store: english),
+                          .init(streamIndex: MultiASSPlayResFixture.spanishStreamIndex, store: spanish)])
+
+            await AetherEngine.runExternalSubtitleFill(job: job)
+
+            expectPosition(english.snapshotCues().first?.placement?.position,
+                           MultiASSPlayResFixture.englishPosition, "english store")
+            expectPosition(spanish.snapshotCues().first?.placement?.position,
+                           MultiASSPlayResFixture.spanishPosition, "spanish store")
+        }
+    }
+
+    private func expectPosition(_ actual: CGPoint?, _ expected: CGPoint, _ label: String) {
+        guard let actual else {
+            Issue.record("\(label): expected a \\pos placement, got none")
+            return
+        }
+        #expect(abs(actual.x - expected.x) < 1e-6, "\(label) x: \(actual.x) vs \(expected.x)")
+        #expect(abs(actual.y - expected.y) < 1e-6, "\(label) y: \(actual.y) vs \(expected.y)")
     }
 
     // MARK: - Track identity
