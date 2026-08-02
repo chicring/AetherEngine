@@ -899,6 +899,13 @@ extension AetherEngine {
                 self.clock.bufferedPosition = renderedDisplay + max(0, readAhead)
             }
             .store(in: &nativeCancellables)
+        // First-frame-on-screen: mirror the host's display-ready latch so hosts can stamp
+        // "first frame rendered" on real pixels instead of transport state (.playing).
+        host.$isFirstFrameDisplayReady
+            .sink { [weak self] ready in
+                self?.isFirstFrameDisplayReady = ready
+            }
+            .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
         wireCommonHostSinks(
             duration: host.$duration,
