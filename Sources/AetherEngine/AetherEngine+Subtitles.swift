@@ -272,16 +272,25 @@ extension AetherEngine {
             // #250: a reset starts a fresh contiguous decoded run; a steady tick extends the one
             // already running.
             var coverageStart = subtitleDrainCursors[channel]?.coverageStart
+            // #276: the run retained across seeks. Folded here, banked after the decode.
+            var retained = subtitleDrainCursors[channel]?.retained
+            let isReset: Bool
             switch plan {
             case .idle:
                 subtitleDrainCursors[channel]?.lastPlayhead = playhead
+                // #276: an idle tick decoded nothing, so it banks nothing into the retained run.
+                // The frontier may well have moved under it; folding that in would claim
+                // determination the drainer never performed.
                 emitSubtitleResolutionStatementIfFrontierChanged(channel: channel,
                                                                  streamIndex: streamIndex)
                 continue
             case .decode(let from, let through):
+                isReset = false
                 window = (from, through)
             case .resetAndDecode(let from, let through):
+                isReset = true
                 coverageStart = from
+                retained = SubtitleResolutionStatement.fold(retained, windowFrom: from)
                 subtitleDrainDecoders[channel] = nil
                 // Fresh selection or seek: the backscan decodes compositions BEHIND the
                 // playhead. Run them through the gate's reconstruction admission so the
@@ -330,10 +339,13 @@ extension AetherEngine {
                 // steady ticks rescan it without re-triggering the discontinuity path.
                 lastDecoded = window.from
             }
+            // #276: floor now, ceiling after the statement below states it.
+            let runRetained = retained ?? .init(from: coverageStart ?? window.from, through: nil)
             subtitleDrainCursors[channel] = SubtitleDrainCursor(
                 lastDecodedPts: lastDecoded ?? window.from,
                 lastPlayhead: playhead,
-                coverageStart: coverageStart ?? window.from)
+                coverageStart: coverageStart ?? window.from,
+                retained: runRetained)
             // #143/#204: a renderable composition at/after the playhead ends reconstruction while
             // decoding above. If the pass remains active with a candidate after the whole window,
             // finalize it. Raw packet presence cannot answer this: the landing line's own zero-object
@@ -362,12 +374,18 @@ extension AetherEngine {
             }
             if didMutate { publishRetainedSubtitleCues(cues, for: channel) }
             // #250: the post-seek window has decoded, so state how far determination reaches.
-            if case .resetAndDecode = plan {
-                emitSubtitleResolutionStatement(channel: channel, streamIndex: streamIndex,
-                                                reason: .reconstruction)
-            } else {
-                emitSubtitleResolutionStatementIfFrontierChanged(channel: channel,
-                                                                 streamIndex: streamIndex)
+            // #276: one statement value per decoding tick, built whether or not it is printed. Its
+            // `resolvedThrough` is this run's determined end under the fence that is live RIGHT
+            // NOW, and banking it here is the only place it can be had: by the next reset tick the
+            // seek generation has moved on and the outgoing run's frontier no longer passes its
+            // own fence.
+            let statement = subtitleResolutionStatement(
+                channel: channel, streamIndex: streamIndex,
+                reason: isReset ? .reconstruction : .frontier)
+            subtitleDrainCursors[channel]?.retained = SubtitleResolutionStatement.extend(
+                runRetained, with: statement.resolvedThrough)
+            if isReset || subtitleResolutionLastFrontier[channel] != statement.via {
+                emitSubtitleResolutionStatement(statement, channel: channel)
             }
         }
         // #151: a jump (seek / producer re-anchor) moves the drain window out from under the

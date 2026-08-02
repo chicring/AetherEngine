@@ -884,7 +884,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 videoTimeBase: videoTimeBase,
                 sourceDurationSeconds: durationSeconds
             )
-            if keyframes.count >= 2, indexTrustworthy {
+            // AE#268: a segmented source declares its own random-access points. Prefer them over both
+            // builders below: the index is sparse on MPEG-TS, and the uniform grid advertises
+            // boundaries no keyframe sits on (a 4 s grid over a 10 s GOP is producible on one boundary
+            // in five; a restart at any other one opens its gate a GOP late and skews every index
+            // mapping until AVPlayer starves).
+            let declaredSegmentStarts = dem.timeSeekableReader?.segmentStartTimesSeconds ?? []
+            let segmentedAnchorPts: Int64 = keyframes.sorted().first
+                ?? (videoStream.pointee.start_time != Int64.min
+                    ? max(0, videoStream.pointee.start_time) : 0)
+            let segmentedPlan = Self.buildSegmentedSourcePlan(
+                segmentStartsSeconds: declaredSegmentStarts,
+                videoTimeBase: videoTimeBase,
+                sourceDurationSeconds: durationSeconds,
+                startPts0: segmentedAnchorPts
+            )
+            if !segmentedPlan.isEmpty {
+                plan = segmentedPlan
+                self.firstKeyframePts = segmentedAnchorPts
+                self.firstKeyframeSeconds = Double(segmentedAnchorPts)
+                    * Double(videoTimeBase.num) / Double(videoTimeBase.den)
+                EngineLog.emit(
+                    "[HLSVideoEngine] segment plan: source-declared boundaries, "
+                    + "\(plan.count) segments [anchorPts=\(segmentedAnchorPts) "
+                    + "shortestSegment=\(String(format: "%.3f", plan.map { $0.durationSeconds }.min() ?? 0))s]",
+                    category: .session
+                )
+            } else if keyframes.count >= 2, indexTrustworthy {
                 plan = Self.buildKeyframeSegmentPlan(
                     keyframes: keyframes,
                     videoTimeBase: videoTimeBase,
@@ -1834,7 +1860,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
             } ?? 0
         } else if baseIndex > 0, baseIndex < segmentPlan.count {
             videoTarget = segmentPlan[baseIndex].startPts
-            desiredVideoTfdt = segmentPlan[baseIndex].startPts - firstKeyframePts
+            // The produced timeline continues at the segment's ADVERTISED item-axis start, never at
+            // its (possibly backed-off) source boundary: `startPts` is a gate/seek target chosen to sit
+            // at-or-below the segment's IRAP (AE#268), while `startSeconds` is what the playlist told
+            // AVPlayer this segment starts at. Identical for the keyframe and uniform plans, where the
+            // boundary is the item-axis start plus the anchor.
+            desiredVideoTfdt = sourceVideoTbSeconds > 0
+                ? Int64((segmentPlan[baseIndex].startSeconds / sourceVideoTbSeconds).rounded())
+                : segmentPlan[baseIndex].startPts - firstKeyframePts
             // Rescale into source audio TB (not bridge.inputTimeBase=1/48000). The pre-fix bug
             // was FLAC-bridge-only: shift=-152485195 (off by 48x); stream-copy unaffected.
             desiredAudioTfdt = savedAudioConfig.map {
@@ -1872,6 +1905,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
             desiredFirstAudioTfdtPts: desiredAudioTfdt,
             segmentBoundaries: segmentBoundaries,
+            planAnchorVideoPts: firstKeyframePts,
             isLive: isLiveSession,
             packedSideAudioStartPts: packedSideAudioStartPts,
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,

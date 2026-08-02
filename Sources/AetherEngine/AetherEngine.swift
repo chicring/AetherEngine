@@ -2958,9 +2958,15 @@ public final class AetherEngine: ObservableObject {
                 // #133: unchanged criteria (same-format zap) mean the panel is already in the target mode and
                 // neither the engine nor AVKit will switch it, so there is nothing to settle here. Skipping
                 // avoids Stage 1's blind 1s (and, on unobservable-DV panels, the full ~3s cap) on every zap.
-                if !criteriaUnchanged {
-                    await displayCriteria.waitForSwitch()
-                }
+                // #274: the 1000ms Stage 1 budget is the DV-cold-start bet on a sole-writer host's inbound
+                // write. Sessions no dynamic-range switch can reach (engine-writer, or SDR content) take the
+                // 200ms budget instead of paying it on every load.
+                await displayCriteria.waitForSwitch(startGrace: Self.playGateGrace(
+                    criteriaUnchanged: criteriaUnchanged,
+                    engineIsCriteriaWriter: !options.suppressDisplayCriteria,
+                    formatKnown: probeOpened,
+                    effectiveFormat: effectiveFormat
+                ))
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded

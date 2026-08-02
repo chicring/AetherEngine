@@ -28,6 +28,16 @@ protocol TimeSeekableIOReader: IOReader {
     /// (`Demuxer.repositionTimeSeekable`). Landing at or before the requested time is the contract;
     /// the demuxer's packet gate drops what precedes the exact target.
     func seek(to seconds: Double) -> Bool
+
+    /// Elapsed media time in front of each of the source's own segments, ascending, starting at 0.
+    /// These are the source's declared random-access points: the segment plan is built on them so
+    /// every advertised boundary is one the producer's keyframe gate can actually open (AE#268).
+    /// Empty when the reader has no segment structure to report.
+    var segmentStartTimesSeconds: [Double] { get }
+}
+
+extension TimeSeekableIOReader {
+    var segmentStartTimesSeconds: [Double] { [] }
 }
 
 public extension IOReader {

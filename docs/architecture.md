@@ -139,7 +139,7 @@ Sources/AetherEngine/
 ├── AetherEngine+ClosedCaptions.swift        In-band CEA-608 closed captions + A53/SEI extraction: ClosedCaptionTap (read-only producer observer) + cue mirroring (#77, #131)
 ├── AetherEngine+Live.swift                  Live window publishing, edge snap, resume clamp, scrub thumbnails
 ├── AetherEngine+Diagnostics.swift           Memory probe + live-telemetry bridge
-├── AetherEngine+SubtitleResolution.swift    Emission of the #250 subtitle-resolution statement: one generation-fenced line stating the absolute source-time span display state has been decoded over, at post-seek reconstruction, the 30 s cadence, prefetcher EOF, and any change of frontier source
+├── AetherEngine+SubtitleResolution.swift    Emission of the #250 subtitle-resolution statement: one generation-fenced line stating the absolute source-time span display state has been decoded over, at post-seek reconstruction, the 30 s cadence, prefetcher EOF, and any change of frontier source; `retainedFrom=` additionally states the floor of the run RETAINED across seeks, so "empty because nothing was ever authored before this point" is provable from a post-seek line alone (#276)
 ├── AetherEngine+AudioTap.swift              Opt-in decoded PCM audio tap (#95): installAudioTap() vends the AsyncStream, dispatches native-loopback vs remote-HLS vs SW-mirror
 ├── AetherEngine+BackgroundAudioTestHooks.swift DEBUG-only hooks letting aetherctl bgaudio toggle the SW background-audio keepalive without a UIApplication lifecycle (never shipped)
 ├── PlaybackClock.swift                      engine.clock: the ~10 Hz ticking values (currentTime, sourceTime, bufferedPosition, progress, live-edge fields) as a separate ObservableObject

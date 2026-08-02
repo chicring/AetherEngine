@@ -1578,7 +1578,15 @@ extension AetherEngine {
                 activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
                 presentCurrentLayer()
                 // Wait for pending AVKit display-criteria handshake before resuming (first frame must not hit a mid-transition panel).
-                await displayCriteria.waitForSwitch()
+                // #274: this reload preserved the criteria (resetDisplayCriteria: false) and re-applies none,
+                // so only a sole-writer host's re-write on the swapped item can still switch anything; the
+                // published (panel-clamped) format decides whether that can be a dynamic-range switch.
+                await displayCriteria.waitForSwitch(startGrace: Self.playGateGrace(
+                    criteriaUnchanged: false,
+                    engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
+                    formatKnown: true,
+                    effectiveFormat: videoFormat
+                ))
                 try checkLoadCurrent(gen)
                 nativeHost?.play()
             }

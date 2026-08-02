@@ -46,17 +46,28 @@ extension AetherEngine {
             decodedThrough: cursor?.lastDecodedPts ?? .nan,
             prefetchFrontier: SubtitlePrefetchTelemetry.resolutionFrontier(matching: fence),
             prefetchAtEndOfFile: SubtitlePrefetchTelemetry.reachedEndOfFile(matching: fence),
+            // #276: the retained run's floor. Read straight off the cursor, which the drain tick
+            // has already folded for this tick; nothing is recomputed here.
+            retainedFrom: cursor?.retained?.from,
             reason: reason)
+    }
+
+    /// Emit an already-built statement. The drain tick builds one per tick either way, because
+    /// #276 banks its `resolvedThrough` into the retained run's high-water whether or not the line
+    /// is worth printing, and rebuilding it for the print would read the telemetry twice.
+    func emitSubtitleResolutionStatement(_ statement: SubtitleResolutionStatement.Statement,
+                                         channel: SubtitleChannel) {
+        subtitleResolutionLastFrontier[channel] = statement.via
+        EngineLog.emit(SubtitleResolutionStatement.format(statement), category: .engine)
     }
 
     func emitSubtitleResolutionStatement(
         channel: SubtitleChannel, streamIndex: Int32,
         reason: SubtitleResolutionStatement.Reason
     ) {
-        let statement = subtitleResolutionStatement(channel: channel, streamIndex: streamIndex,
-                                                    reason: reason)
-        subtitleResolutionLastFrontier[channel] = statement.via
-        EngineLog.emit(SubtitleResolutionStatement.format(statement), category: .engine)
+        emitSubtitleResolutionStatement(
+            subtitleResolutionStatement(channel: channel, streamIndex: streamIndex, reason: reason),
+            channel: channel)
     }
 
     /// A change of frontier source is a step change in what the engine can claim, so it is worth a

@@ -267,9 +267,10 @@ open(path, 'wb').write(bytes(data))
 PY
 
 # AetherEngine#268: finite HEVC-in-MPEG-TS HLS VOD, the carriage AVFoundation refuses to build a
-# video track for. Two shapes, because the seek axis only shows up in the second one:
-#   hls-hevc-vod/       PTS origin at ffmpeg's default 1.4 s
-#   hls-hevc-vod-offset/ PTS origin at ~1001 s, what broadcast-derived VOD carries
+# video track for. Three shapes, because each one only shows its own defect:
+#   hls-hevc-vod/        PTS origin at ffmpeg's default 1.4 s, 6 s segments, 2 s GOP
+#   hls-hevc-vod-offset/ PTS origin at ~1001 s, what broadcast-derived VOD carries (seek axis)
+#   hls-hevc-vod-longgop/ 20 min, 10 s segments, ONE I-frame per segment (segment plan)
 # plus an H.264 control that has to STAY on the native AVPlayer route. Serve the parent directory
 # over HTTP (any static, range-capable origin) and drive it with
 # `aetherctl play --seek-every 6 --seek-pattern 500,120 http://127.0.0.1:PORT/hls-hevc-vod/media.m3u8`.
@@ -287,6 +288,25 @@ hls_vod_fixture() {  # <dir> <encoder> <extra-out-args...>
 }
 hls_vod_fixture hls-hevc-vod libx265 -x265-params "keyint=50:min-keyint=50:scenecut=0:log-level=none"
 hls_vod_fixture hls-h264-vod libx264 -g 50 -keyint_min 50 -sc_threshold 0
+
+# The GOP is the point: one I-frame per 10 s segment, the reporter's shape. A 2 s GOP (above) hides
+# the #268 round 2 defect entirely, because every plan boundary then still catches a keyframe. It
+# also has to be long enough that a seek lands outside what the ingest has already produced, so
+# 20 min rather than 120 s. Drive it with a target that is NOT a multiple of 20 s, e.g.
+# `aetherctl play --seek-every 14 --seek-pattern 1055.79,333.3,777.7 http://127.0.0.1:PORT/hls-hevc-vod-longgop/media.m3u8`
+# and watch `video gate open`: `anchorPts - target` must stay at the plan's boundary backoff.
+LONGGOP_TS="$FIXTURES_DIR/user/hevc-longgop.ts"
+LONGGOP_DIR="$FIXTURES_DIR/user/hls-hevc-vod-longgop"
+rm -rf "$LONGGOP_DIR" && mkdir -p "$LONGGOP_DIR"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=320x180:rate=25" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 1200 \
+    -c:v libx265 -preset ultrafast \
+    -x265-params "keyint=250:min-keyint=250:scenecut=0:log-level=none" \
+    -pix_fmt yuv420p -c:a aac -b:a 64k -f mpegts "$LONGGOP_TS"
+ffmpeg -hide_banner -loglevel error -y -i "$LONGGOP_TS" -c copy \
+    -f hls -hls_time 10 -hls_list_size 0 -hls_playlist_type vod \
+    -hls_segment_filename "$LONGGOP_DIR/seg%03d.ts" "$LONGGOP_DIR/media.m3u8"
 
 # Broadcast-style PTS origin: mux once with the offset, then segment with -copyts so the segments
 # keep it. A reader that mistakes an absolute source PTS for playlist time seeks to the wrong end of

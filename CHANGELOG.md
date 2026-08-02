@@ -12,6 +12,84 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.4.4] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.4))
+
+### Added
+
+- **The `#250 subtitle-resolution` statement now states the determination span
+  it retains across a seek, as `retainedFrom=`.** `coveredFrom` is the last
+  reset's window start, so after a far seek it reads `target - 15` and can
+  neither affirm nor refute that determination still reaches back to track
+  start. That left one truth class inexpressible: "empty because nothing was
+  ever authored before this point", which needs coverage back to the earliest
+  point that could change the answer. The pre-seek line does carry the bound,
+  but under the previous `seekGen`, and combining across the fence is what the
+  fence exists to forbid. The engine now reconciles the runs itself: a
+  post-seek reset folds its window into the retained run instead of
+  overwriting it, and the line states that run's floor alongside the reset
+  window. `coveredFrom` is unchanged; the two are separate claims. The runs
+  join only when the new window opens inside the retained span, so a forward
+  seek past the determined end and a backward seek starting below the floor
+  both restart the run rather than span the hole. Requested by @cmcpherson274
+  (#276).
+
+## [6.4.3] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.3))
+
+### Fixed
+
+- **The post-load play-gate only pays the Dolby Vision cold-start budget when a
+  dynamic-range switch can still reach the session.** The gate blind-polls up to
+  1000 ms for a panel switch to *start*, a budget sized for the one case that
+  needs it: a sole-writer host (`LoadOptions.suppressDisplayCriteria`) whose
+  criteria write lands during the load, from AVKit's auto path. Every other
+  session paid the same wait for a switch that could not arrive. Sessions where
+  the engine wrote the criteria itself (synchronously, before the item loads, and
+  already settled in the pre-flight for an HDR write) and sessions on SDR content,
+  which no dynamic-range write can follow, now take a 200 ms budget instead, the
+  value that was in place before the AVKit-sole-writer architecture raised it. A
+  switch that has genuinely started still settles in Stage 2 unchanged, and a
+  failed probe keeps the full budget because the source range is then unknown.
+  Reported and measured by @digilearn-dev (#274).
+
+- **A panel switch the engine did not initiate is no longer logged as a failed
+  HDR handshake.** When a sole-writer host's own criteria write settled with EDR
+  headroom at 1.0, the settle classification read `didApply == false` as the HDR
+  branch and emitted `WARN ... panel stayed SDR despite HDR criteria` for what
+  was a correct SDR rate-only switch. The engine has no target range to compare
+  against for a write it never made, and now says so (#274).
+
+## [6.4.2] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.2))
+
+### Fixed
+
+- **A seekable HEVC-in-MPEG-TS HLS VOD plans its segments on the playlist's own
+  boundaries.** MPEG-TS carries no upfront keyframe table, so the plan fell back
+  to a synthetic uniform 4 s grid. On a source that carries one I-frame per 10 s
+  segment only every fifth grid boundary is a random-access point, so a restart
+  at any other index made the producer's scan-forward gate open up to 8 s late.
+  That overshoot rode in the producer's timeline shift, where the video cutter
+  and the audio index mapping folded it back on two different axes, and AVPlayer
+  was left waiting on a segment that never arrived at the position it asked for
+  (`CoreMediaErrorDomain -12889`). A seekable source now plans on the boundaries
+  it declares, each backed off half a segment (0.5 s cap) so manifest-versus-PTS
+  rounding cannot put a boundary past its own IRAP. Measured over five scattered
+  seeks on a 10 s-GOP fixture, the per-restart gate overshoot goes from
+  0/4/0/2/6 s to a flat 0.5 s. Reported and device-tested by @qoli (#268).
+
+- **The VOD segment cutter compares on the item axis.** Packets reach it with the
+  producer's shift already subtracted, while the plan boundaries are source PTS,
+  so every cut landed one PTS origin late on any source that does not start at
+  zero, and against boundaries that are themselves the source's IRAPs it would
+  never have cut at all. The audio index mapping folds back the plan anchor
+  rather than the shift for the same reason, and a restart's first `tfdt` is the
+  segment's advertised start rather than its seek boundary (#268).
+
 ## [6.4.1] - 2026-08-01
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.1))

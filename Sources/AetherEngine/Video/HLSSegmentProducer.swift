@@ -153,6 +153,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Start PTS (source video TB) for each segment at baseIndex+i; used to detect segment crossings.
     private let segmentBoundaries: [Int64]
 
+    /// Source PTS of plan time 0 (the plan's `firstKeyframePts`). The item axis every consumer sees is
+    /// `sourcePts - planAnchorVideoPts`, so this is what maps an item-axis timestamp back onto a plan
+    /// boundary. Deliberately NOT `videoShiftPts`: the shift additionally carries whatever this
+    /// producer's gate overshot its restart target by (AE#268).
+    private let planAnchorVideoPts: Int64
+
     /// Live mode: cuts at keyframes past targetSegmentDurationSeconds; ignores segmentBoundaries.
     private let isLive: Bool
 
@@ -719,6 +725,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         desiredFirstVideoTfdtPts: Int64,
         desiredFirstAudioTfdtPts: Int64 = 0,
         segmentBoundaries: [Int64],
+        planAnchorVideoPts: Int64 = 0,
         isLive: Bool = false,
         packedSideAudioStartPts: Int64? = nil,
         packedSideAudioFallbackDurationPts: Int64 = 0,
@@ -765,7 +772,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.sourceVideoTimeBase = video.timeBase
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
         self.segmentBoundaries = segmentBoundaries
-        self.vodCutter = VODSegmentCutter(boundaries: segmentBoundaries, baseIndex: baseIndex)
+        self.planAnchorVideoPts = planAnchorVideoPts
+        self.vodCutter = VODSegmentCutter(
+            sourceBoundaries: segmentBoundaries,
+            planAnchorPts: planAnchorVideoPts,
+            baseIndex: baseIndex
+        )
         self.isLive = isLive
         self.liveCurrentSegmentIndex = baseIndex
         self.videoFallbackDurationPts = videoFallbackDurationPts
@@ -866,10 +878,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return Double(sourceVideoTimeBase.num) / Double(sourceVideoTimeBase.den)
     }
 
-    /// Map post-shift pts to absolute segment index. Folds shift back before comparing against source-axis boundaries.
+    /// Map post-shift (item-axis) pts to absolute segment index.
+    ///
+    /// AE#268: folds back the PLAN ANCHOR, not `videoShiftPts`. The two are equal whenever the gate
+    /// opened on the boundary the restart aimed at, but a restart that landed off a random-access
+    /// point carries the whole overshoot in the shift, and folding that back routed audio into a
+    /// segment index the video cutter never opened (a 10 s GOP under a 4 s plan skewed them by up to
+    /// two segments). The anchor is what the plan's item axis is defined against, so it is what maps
+    /// an item-axis timestamp onto a plan boundary.
     private func segmentIndex(forSourcePts pts: Int64) -> Int {
-        let absolute = videoShiftPts == Int64.min ? pts : pts &+ videoShiftPts
-        return baseIndex + Self.segmentOffset(forAbsolutePts: absolute, boundaries: segmentBoundaries)
+        return baseIndex + Self.segmentOffset(
+            forAbsolutePts: pts &+ planAnchorVideoPts,
+            boundaries: segmentBoundaries
+        )
     }
 
     /// Source-axis value of a timestamp the pump has already rebased onto the output axis
@@ -1236,7 +1257,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
-    /// Returns [start, end) on the AVPlayer axis for subtitle injection. VOD: from segmentBoundaries+videoShiftPts. Live: from liveSegmentStartByIndex.
+    /// Returns [start, end) on the AVPlayer axis for subtitle injection. VOD: from segmentBoundaries
+    /// minus the plan anchor (AE#268: the anchor defines the item axis; the shift carries a restart's
+    /// gate overshoot on top of it and would move the window under the cues). Live: from liveSegmentStartByIndex.
     private func segmentWindowAVPlayerSeconds(
         segIdx: Int,
         nextSegIdx: Int
@@ -1251,8 +1274,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             let i = segIdx - baseIndex
             let iNext = nextSegIdx - baseIndex
             guard i >= 0, iNext < segmentBoundaries.count else { return nil }
-            let t0 = Double(segmentBoundaries[i] - videoShiftPts) * sourceVideoTbSeconds
-            let t1 = Double(segmentBoundaries[iNext] - videoShiftPts) * sourceVideoTbSeconds
+            let t0 = Double(segmentBoundaries[i] - planAnchorVideoPts) * sourceVideoTbSeconds
+            let t1 = Double(segmentBoundaries[iNext] - planAnchorVideoPts) * sourceVideoTbSeconds
             return (t0, t1)
         }
     }

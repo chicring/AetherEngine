@@ -154,6 +154,19 @@ final class Issue268HLSVODIngestTests: XCTestCase {
         XCTAssertEqual(HLSVODIngestReader.restartSegmentIndex(forElapsed: 6.001, starts: starts), 0)
     }
 
+    /// A target sitting just below a segment start belongs to that segment. The plan built on this
+    /// playlist backs each boundary off so an IRAP can never fall below its own boundary (AE#268);
+    /// without the same tolerance here, every seek to such a boundary would refetch one segment more
+    /// than it needs. The tolerance uses the plan's own formula, so it never reaches the previous start.
+    func testRestartSegmentIndexSnapsATargetJustBelowASegmentStart() {
+        let starts: [Double] = [0, 10, 20, 30, 40]
+        XCTAssertEqual(HLSVODIngestReader.restartSegmentIndex(forElapsed: 29.5, starts: starts), 2)
+        XCTAssertEqual(HLSVODIngestReader.restartSegmentIndex(forElapsed: 28.9, starts: starts), 1)
+        // Short segments cap the tolerance at half a segment, so it cannot skip one.
+        let short: [Double] = [0, 0.4, 0.8, 1.2]
+        XCTAssertEqual(HLSVODIngestReader.restartSegmentIndex(forElapsed: 0.79, starts: short), 1)
+    }
+
     func testRestartSegmentIndexClampsAtBothEnds() {
         let starts: [Double] = [0, 6, 12]
         XCTAssertEqual(HLSVODIngestReader.restartSegmentIndex(forElapsed: 0, starts: starts), 0)
@@ -193,6 +206,30 @@ final class Issue268HLSVODIngestTests: XCTestCase {
         XCTAssertEqual(count, 188)
         XCTAssertEqual(bytes[0], 0x47)
         XCTAssertEqual(bytes[Self.markerOffset], 2, "20s sits in segment 3, so the ingest restarts at 2")
+    }
+
+    /// The reader publishes the playlist's own boundaries so the segment plan can be built on them
+    /// instead of a synthetic grid that lands between the source's IRAPs (AE#268).
+    func testReaderPublishesItsSegmentStarts() async throws {
+        let root = try XCTUnwrap(URL(string: "https://vod.test/starts.m3u8"))
+        let names = (0..<5).map { "starts\($0).ts" }
+        Issue268URLProtocol.bodyByURL[root.absoluteString] = mediaPlaylist(names)
+        for (index, name) in names.enumerated() {
+            Issue268URLProtocol.bodyByURL["https://vod.test/\(name)"] =
+                transportStream(streamType: 0x24, marker: UInt8(index))
+        }
+
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: root,
+            httpHeaders: [:],
+            session: session
+        )
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        XCTAssertEqual(reader.segmentStartTimesSeconds, [0, 6, 12, 18, 24])
     }
 
     /// Byte seeks stay refused: the concatenated segment stream has no address space, and answering a

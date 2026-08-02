@@ -22,6 +22,7 @@ struct Issue250SubtitleResolutionTests {
         decodedThrough: Double = 1204,
         prefetchFrontier: Double? = nil,
         prefetchAtEndOfFile: Bool = false,
+        retainedFrom: Double? = 1185,
         reason: SubtitleResolutionStatement.Reason = .reconstruction
     ) -> SubtitleResolutionStatement.Statement {
         SubtitleResolutionStatement.make(
@@ -29,6 +30,7 @@ struct Issue250SubtitleResolutionTests {
             coveredFrom: coveredFrom, windowThrough: windowThrough,
             decodedThrough: decodedThrough,
             prefetchFrontier: prefetchFrontier, prefetchAtEndOfFile: prefetchAtEndOfFile,
+            retainedFrom: retainedFrom,
             reason: reason)
     }
 
@@ -199,6 +201,7 @@ struct Issue250SubtitleResolutionTests {
         #expect(line.contains("loadGen=3 seekGen=7 "))
         #expect(line.contains("stream=4 "))
         #expect(line.contains("coveredFrom=1185.00 "))
+        #expect(line.contains("retainedFrom=1185.00 "))   // #276
         #expect(line.contains("resolvedThrough=1218.00 "))
         #expect(line.contains("via=prefetch "))
         #expect(line.contains("decodedThrough=1204.00 "))

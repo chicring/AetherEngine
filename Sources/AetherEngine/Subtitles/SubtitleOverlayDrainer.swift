@@ -15,6 +15,11 @@ struct SubtitleDrainCursor: Sendable {
     /// `.resetAndDecode`. Steady ticks decode forward from the cursor, so the tick's own window
     /// start says nothing about how far back determination reaches. nil until the first reset.
     var coverageStart: Double? = nil
+    /// #276: the retained run, i.e. the same span folded ACROSS seeks for as long as the runs keep
+    /// touching. Lives on the cursor because the cursor's lifetime is exactly the claim's: both are
+    /// cleared by `stopSubtitleDrainer` and by every track switch, and those are the same points
+    /// that empty the channel's cue array.
+    var retained: SubtitleResolutionStatement.Retention? = nil
 }
 
 enum SubtitleDrainPlan: Equatable, Sendable {

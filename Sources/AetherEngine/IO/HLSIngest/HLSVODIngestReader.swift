@@ -126,6 +126,13 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         condition.withLock { resolved?.duration ?? 0 }
     }
 
+    /// EXTINF sum in front of each segment. A conforming HLS segment opens on a random-access point,
+    /// so these are the only boundaries the segment plan may advertise: a finer synthetic grid puts
+    /// boundaries where no keyframe is, and a restart there overshoots to the next IRAP (AE#268).
+    var segmentStartTimesSeconds: [Double] {
+        condition.withLock { resolved?.starts ?? [] }
+    }
+
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
         guard let buffer, size > 0 else { return -1 }
         startIfNeeded()
@@ -228,9 +235,20 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// contract and the engine's packet gate drops what precedes the exact target. A target past the
     /// end clamps to the last segment rather than failing, which keeps a rounding overshoot at the
     /// final boundary playable.
+    ///
+    /// A target sitting just BELOW a segment start counts as that segment: the plan built on this
+    /// playlist backs each boundary off by `HLSVideoEngine.segmentedPlanBoundaryBackoff` so an IRAP can
+    /// never fall below its own boundary (AE#268), and without the same tolerance here every such seek
+    /// would fetch one more segment than it needs. The tolerance uses that same formula, so it can
+    /// never reach past the previous segment start.
     static func restartSegmentIndex(forElapsed elapsed: Double, starts: [Double]) -> Int {
         guard !starts.isEmpty else { return 0 }
-        let containing = starts.lastIndex(where: { $0 <= elapsed }) ?? 0
+        var shortest = Double.greatestFiniteMagnitude
+        for i in 1..<max(1, starts.count) where starts[i] > starts[i - 1] {
+            shortest = min(shortest, starts[i] - starts[i - 1])
+        }
+        let tolerance = shortest.isFinite ? min(0.5, shortest / 2) : 0
+        let containing = starts.lastIndex(where: { $0 <= elapsed + tolerance }) ?? 0
         return max(0, containing - 1)
     }
 
