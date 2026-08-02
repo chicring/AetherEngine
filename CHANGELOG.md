@@ -12,6 +12,143 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.5.0] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.0))
+
+### Fixed
+
+- **A terminal error now says what went wrong instead of "The operation
+  couldn't be completed."** The engine publishes its terminal states as
+  `state = .error("Failed to load: \(error.localizedDescription)")`, and its own
+  error enums were only `CustomStringConvertible`. `localizedDescription` does
+  not reach `description`, so Foundation's generic bridge answered "The
+  operation couldn't be completed. (HLSIngestError error 0.)" and the HTTP
+  status the ingest reader had already resolved was dropped at that boundary:
+  an origin refusing a transcode with 500 was indistinguishable from a corrupt
+  file. Every error type the engine can throw now conforms to `LocalizedError`
+  with `errorDescription` returning the description it already computes, which
+  fixes the reload, audio-track-switch and mid-session playback boundaries in
+  the same move rather than the three load-path call sites alone.
+  `DemuxerError` is the most common failure at that boundary and carried no
+  description at all; it now renders its AVERROR code with libavutil's own
+  text, so `INVALIDDATA` reads as itself rather than as an error number 0.
+  Reported by @edde746, traced to the boundary (#283).
+
+### Added
+
+- **`LocalizedError` conformance on the public error types.** A minor rather
+  than a patch: `HLSIngestError`, `PacketTimingProbe.ProbeError`,
+  `AudioTapProbe.ProbeError` and the two `AetherEngineSMB` error structs gain
+  public conformance and an `errorDescription`, and an adopter that renders a
+  caught error with `localizedDescription` sees different text on this version
+  than it did on 6.4.x. The text is the `description` those types already
+  published, so anything already logging `"\(error)"` is unchanged.
+
+## [6.4.7] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.7))
+
+### Fixed
+
+- **A live DVR rewind deeper than about 40 s no longer asks for a segment the
+  cache has already deleted.** A live session resolved a segment retention
+  budget of 0, on the reasoning that the sliding playlist had already dropped
+  everything behind the window so retention would serve nothing. That had it
+  backwards: the playlist window is the looser bound (300 segments for a 600 s
+  DVR window at a 2 s cadence), while `pruneOutsideWindow` with a 0 budget
+  takes its hard-window branch and cuts at `currentTargetIndex -
+  backwardWindow`, i.e. 20 segments. Live therefore retained ~42 s no matter
+  what `dvrWindowSeconds` asked for, while the playlist and the published
+  `liveSeekableRange` advertised the whole window, and live has no
+  `restartHandler` to re-produce a segment that is gone. Measured on the
+  engine before the fix: `cacheCount` pinned at 21 for a whole 150 s session
+  with `dvrWindowSeconds: 600`. Live now resolves the same volume-aware budget
+  as VOD (2 GiB, clamped to a quarter of free space), which is the mechanism
+  built for exactly this, so the retained history tracks the advertised window
+  and stays bounded by it. `backwardWindow` keeps its own job as the
+  Continuous-Audio handover floor. The producer-side prefetch park the budget
+  also feeds is VOD-only, so live cannot park on it.
+
+## [6.4.6] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.6))
+
+### Fixed
+
+- **Live sessions no longer freeze 6-8 s at a time when the producer's
+  backpressure park meets an LL-HLS blocking reload.** The advance park
+  released only on a client segment GET, while the client's held
+  `?_HLS_msn=` reload was only satisfiable by a producer cut, and the held
+  reload occupies the serialized keep-alive connection, starving the very
+  segment GET that would release the park. The 18 s hold then expired into
+  `503 unsatisfiable` long after AVPlayer's ~4 s forward buffer had drained
+  into `playbackStalled`. Live production is source-paced now: the advance
+  and versioned-init parks are VOD-only, replaced on live by a logged
+  resident-segment runaway guard set far above the steady-state window, so
+  only a consumer that has already stopped polling can reach it (a live park
+  is a diagnostic, never steady state). Three aggravators fixed alongside:
+  the sliding window is sized by the observed segment cadence instead of the
+  cut target (fastZap's 0.5 s target vs ~2 s GOPs inflated the window 4x,
+  pinning MEDIA-SEQUENCE at 0 and deferring `evictBelow` for minutes), the
+  stall-recovery item reload now honors `LiveReloadPolicy` (live rejoin: no
+  stale-clock resume, no zero-tolerance initial seek), and the
+  blocking-reload hold is bounded by `3 x` the sealed TARGETDURATION
+  (= the advertised HOLD-BACK) instead of a hardcoded 18 s. VOD paths are
+  byte-identical. Reported and fixed by @tschuegy in #280.
+
+### Changed
+
+- **A live playlist whose sliding window overtakes the consumer's fetch point
+  now says so.** The removed advance park capped the producer 10 segments
+  ahead of that point, so the window could never pass it. Source-paced live
+  cannot get there, but an origin handing over more than one window of
+  backlog faster than the consumer drains it can, and the consumer then asks
+  for a segment `evictBelow` has already deleted. That reads downstream as a
+  cache miss or a live-edge jump with nothing naming the cause, so the
+  playlist builder logs `live window slid past the consumer` once per
+  excursion.
+
+## [6.4.5] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.5))
+
+### Fixed
+
+- **A non-faststart MP4 cold start no longer pays three sequential round trips
+  before the frame rate is known.** Opening one costs a data connection from
+  byte zero, a seek to the trailing `moov`, and a return to the first sample.
+  The third was self-inflicted: the seek to the tail discarded the window that
+  already held the bytes the return trip went back for, so the reader
+  re-fetched what it had just thrown away. That window is now kept for the
+  duration of the demuxer's open pass and serves the return trip as a copy.
+  Alongside it, `open()` issues one speculative 64 KB suffix range (`bytes=-n`,
+  which needs no size and therefore runs in parallel with the very first
+  request), covering the small trailing objects an open actually reads: `mfra`
+  on fragmented MP4, and a trailing `moov` whose sample tables fit. On a 51 MB
+  moov-at-end file the open goes from three sequential requests to two
+  concurrent ones. A feature-length file's `moov` is far larger than 64 KB and
+  still costs its own request, by design: fetching megabytes on a guess would
+  compete with playback bytes on exactly the slow links this helps. Reported
+  with before/after traces in #281.
+
+- **Display-criteria settle times in the log are measured now, instead of
+  having the Stage 1 budget added back in.** Stage 2 reported
+  `startGrace.ticks * 10 + stage2Ticks * 50`, which counts Stage 1's entire
+  blind-poll budget whether or not it was spent, so a rate switch that settled
+  one 50 ms tick after a start the gate saw immediately logged `~1050ms`. Every
+  settle time in every log collected so far reads up to a full second slow,
+  including the ones the `.brief` play-gate budget (#274) was reasoned about.
+  The line now carries the real numbers plus how Stage 1 learned of the switch:
+  `start pre-gate after 0ms, total 90ms`, where `pre-gate` means the panel was
+  already switching when the gate opened (so the switch began during the load
+  that built the AVPlayerItem) and `in-gate` means it started inside the gate.
+  That distinction is the ordering question these logs were added for and could
+  not answer. The Stage 2 cap also stops attributing every unobservable switch
+  to an unobservable DV panel: it reads the same attribution the settle branch
+  got in #274, so an engine rate-only write that never reports an end says so
+  rather than claiming DV. Measured from the logs on Sodalite#49.
+
 ## [6.4.4] - 2026-08-02
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.4))

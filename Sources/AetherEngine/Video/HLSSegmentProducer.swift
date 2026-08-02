@@ -11,7 +11,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum ProducerError: Error, CustomStringConvertible {
+    enum ProducerError: Error, CustomStringConvertible, LocalizedError {
         case muxerAllocFailed(code: Int32)
         case streamCreationFailed
         case copyParametersFailed(code: Int32)
@@ -25,6 +25,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .writeHeaderFailed(let c):    return "HLSSegmentProducer: avformat_write_header failed (\(c))"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     /// Per-stream codec config carried from `HLSVideoEngine` into the muxer setup.
@@ -463,6 +465,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// when `playbackPositionProvider` is wired; the dual-freeze guard is what keeps the short window
     /// safe (see BackpressureWedgeDetector.fastBreakThresholdSeconds).
     private static let backpressureWedgeFastBreakThresholdSeconds = 5
+
+    /// Live disk runaway cap for awaitLiveWindowHeadroom. In healthy play resident count tracks the
+    /// sliding window (~windowSegmentCount plus a few in flight) because every playlist build slides
+    /// evictBelow. It can only approach this cap when the consumer stopped polling entirely (dead
+    /// item), at which point the engine's stall watchdogs reload the item within ~12 s, so a park
+    /// here is diagnostic, never steady state. ~6 min of 2 s GOP segments.
+    private static let liveResidentSegmentCap = 180
 
     private let pumpQueue = DispatchQueue(
         label: "AetherEngine.HLSSegmentProducer.pump",
@@ -1086,6 +1095,48 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return false
     }
 
+    /// Live replacement for the advance-path backpressure park (#65). Live production is source-paced,
+    /// so overproduction is bounded by the origin's real-time delivery; the only unbounded case is a
+    /// consumer that stopped polling entirely, which this cap catches. Logs from the first cycle (the
+    /// old live park was silent below 12 s, which is why consumer-facing 6-8 s freezes never showed a
+    /// producer-side line). Returns true on release, false when stop was requested.
+    ///
+    /// What makes this safe against a held blocking reload is the HEIGHT of the cap, not the release
+    /// path. A parked pump finalizes no segment, so `segments.count` stops growing, so the playlist
+    /// window stops sliding and `notePlaylistBuild -> evictBelow` evicts nothing: while the park holds,
+    /// the only thing that lowers `cache.count` is `pruneOutsideWindow` off a consumer segment GET
+    /// (`declareTarget`), structurally the same release the #65 park waited on. The deadlock is out of
+    /// reach only because reaching `liveResidentSegmentCap` takes a consumer that is already dead, and
+    /// the engine's 12 s stall watchdogs reload the item (and thus issue a fresh GET) long before then.
+    /// Lowering the cap toward the steady-state window would put that deadlock back within reach.
+    private func awaitLiveWindowHeadroom(head: Int) -> Bool {
+        if cache.count < Self.liveResidentSegmentCap { return true }
+        // #240: a parked pump is not using the link.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
+        var parked = 0
+        while !checkShouldStop() {
+            if cache.count < Self.liveResidentSegmentCap {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] live headroom released head=\(head) after=\(parked)s "
+                    + "resident=\(cache.count)",
+                    category: .session
+                )
+                return true
+            }
+            if parked % 10 == 0 {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] live headroom PARK head=\(head) resident=\(cache.count) "
+                    + "cap=\(Self.liveResidentSegmentCap) parked=\(parked)s (playlist polls stopped?)",
+                    category: .session
+                )
+            }
+            Thread.sleep(forTimeInterval: 1.0)
+            parked += 1
+        }
+        return false
+    }
+
     /// #207 disk park. The segment window is a sanity bound; the real bound on an opt-in whole-source
     /// prefetch is the session retention budget, which `pruneOutsideWindow` cannot enforce because it
     /// never evicts the hard window. Parks the pump while the race-ahead has filled that budget AND the
@@ -1162,7 +1213,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // base segment is never overproduction: the consumer requested it (fetch-triggered restart)
         // or is about to (anchored start). seg0 sessions are unaffected (their target is negative
         // and releases immediately).
-        if initialSegmentIndex != baseIndex {
+        // Live never parks on the fetch high-water (see awaitLiveWindowHeadroom); an SSAI
+        // versioned-init re-alloc mid-live must not re-enter the park either.
+        if initialSegmentIndex != baseIndex, !isLive {
             let backpressureTarget = initialSegmentIndex - bufferAheadSegments
             if !awaitBackpressureRelease(target: backpressureTarget, head: initialSegmentIndex, context: "alloc") { return nil }
         }
@@ -1390,9 +1443,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return nil
         }
         currentMuxerSegmentIndex = newIdx
-        let backpressureTarget = newIdx - bufferAheadSegments
-        if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
-        if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance") { return nil }
+        if isLive {
+            // Live is source-paced: the pump only runs ahead of real time while draining the join
+            // backlog, and the sliding window (notePlaylistBuild -> evictBelow) bounds resident
+            // segments. Parking on the consumer's fetch high-water here deadlocked against a held
+            // LL-HLS blocking reload (the hold starves the segment GET that would release the park)
+            // and pushed TCP backpressure onto the single-connection origin whenever the join
+            // backlog exceeded bufferAheadSegments.
+            if !awaitLiveWindowHeadroom(head: newIdx) { return nil }
+        } else {
+            let backpressureTarget = newIdx - bufferAheadSegments
+            if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
+            if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance") { return nil }
+        }
         if checkShouldStop() { return nil }
 
         return muxer

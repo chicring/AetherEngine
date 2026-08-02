@@ -27,8 +27,12 @@ struct Issue220BoundedRangeTests {
         _ = reader.read(into: buf, size: 256 * 1024)
 
         let ranges = server.requestedRanges
-        let bounded = try #require(ranges.first(where: { $0.end != nil }),
-                                   "every VOD request was open-ended: \(ranges)")
+        // The claim is about the DATA connection, the one that streams playback bytes from the
+        // read position. Since #281 an open also issues a small speculative tail fetch, which is
+        // bounded too but deliberately not range-sized, so it is identified by its offset rather
+        // than by being the first bounded request to arrive.
+        let bounded = try #require(ranges.first(where: { $0.start == 0 && $0.end != nil }),
+                                   "the data connection was open-ended: \(ranges)")
         #expect(bounded.end! - bounded.start + 1 == AVIOReader.persistentRangeBytes)
     }
 

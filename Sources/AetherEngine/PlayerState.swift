@@ -280,7 +280,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// covers a whole feature film, so a host's "buffer without limit" option can pass `Int.max`).
     /// Beyond the historical 150 the real bound is bytes, not segments: the prefetch runs until it
     /// fills the session retention budget (a quarter of the tmp volume's free space, see
-    /// `HLSVideoEngine.vodRetentionBudgetBytes`) and then tracks the playhead, so a large window
+    /// `HLSVideoEngine.sessionRetentionBudgetBytes`) and then tracks the playhead, so a large window
     /// buffers as much of the source as safely fits rather than a fixed count (#207). nil keeps the
     /// historical default of 10 (~ 40 s). Ignored for `nativeRemoteHLS`, where AVPlayer talks to the
     /// remote server directly.

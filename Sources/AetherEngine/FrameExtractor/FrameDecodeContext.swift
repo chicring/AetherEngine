@@ -483,10 +483,22 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 }
 
-enum FrameDecodeError: Error {
+enum FrameDecodeError: Error, CustomStringConvertible, LocalizedError {
     case noVideoStream
     case noCodecParameters
     case unsupportedCodec
     case allocationFailed
     case decoderOpenFailed
+
+    var description: String {
+        switch self {
+        case .noVideoStream: "FrameDecode: source has no video stream"
+        case .noCodecParameters: "FrameDecode: video stream has no codec parameters"
+        case .unsupportedCodec: "FrameDecode: no decoder for the video codec"
+        case .allocationFailed: "FrameDecode: avcodec_alloc_context3 failed"
+        case .decoderOpenFailed: "FrameDecode: decoder open failed"
+        }
+    }
+
+    var errorDescription: String? { description }
 }

@@ -562,11 +562,22 @@ final class HLSFixtureServer: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum FixtureError: Error {
+    enum FixtureError: Error, CustomStringConvertible, LocalizedError {
         case socketCreate(errno: Int32)
         case bind(errno: Int32)
         case listen(errno: Int32)
         case getsockname(errno: Int32)
+
+        var description: String {
+            switch self {
+            case .socketCreate(let e): "HLSFixture: socket() failed (errno=\(e))"
+            case .bind(let e): "HLSFixture: bind() failed (errno=\(e))"
+            case .listen(let e): "HLSFixture: listen() failed (errno=\(e))"
+            case .getsockname(let e): "HLSFixture: getsockname() failed (errno=\(e))"
+            }
+        }
+
+        var errorDescription: String? { description }
     }
 }
 

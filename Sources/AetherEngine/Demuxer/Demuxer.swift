@@ -435,6 +435,10 @@ public final class Demuxer: @unchecked Sendable {
         formatContext = ctxPtr  // avformat_open_input may reallocate
 
         try probeStreams(ctxPtr!)
+        // #281: every parse seek this open performs has happened by now, so the provider can drop
+        // the cold-start state that only exists to serve them. Deliberately after probeStreams:
+        // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
+        avioProvider?.markOpenPhaseFinished()
     }
 
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
@@ -1530,8 +1534,21 @@ public final class Demuxer: @unchecked Sendable {
     }
 }
 
-enum DemuxerError: Error {
+enum DemuxerError: Error, CustomStringConvertible, LocalizedError {
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+
+    /// AE#283: this is the most common error at the load boundary, and the AVERROR code is the whole
+    /// diagnosis (INVALIDDATA vs a POSIX errno vs EOF). Rendering it keeps a refused transcode
+    /// distinguishable from a corrupt file.
+    var description: String {
+        switch self {
+        case .openFailed(let code): "Demuxer: open failed (\(FFmpegErr.text(for: code)))"
+        case .streamInfoFailed(let code): "Demuxer: stream info failed (\(FFmpegErr.text(for: code)))"
+        case .readFailed(let code): "Demuxer: read failed (\(FFmpegErr.text(for: code)))"
+        }
+    }
+
+    var errorDescription: String? { description }
 }

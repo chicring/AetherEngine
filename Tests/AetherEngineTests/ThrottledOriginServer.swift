@@ -138,9 +138,18 @@ final class ThrottledOriginServer: @unchecked Sendable {
             .first(where: { $0.lowercased().hasPrefix("range:") }),
            let eq = rangeLine.range(of: "bytes="),
            let dash = rangeLine.range(of: "-", range: eq.upperBound..<rangeLine.endIndex) {
-            if let start = Int64(rangeLine[eq.upperBound..<dash.lowerBound]) { offset = start }
+            let head = rangeLine[eq.upperBound..<dash.lowerBound].trimmingCharacters(in: .whitespaces)
             let tail = rangeLine[dash.upperBound...].trimmingCharacters(in: .whitespaces)
-            if !tail.isEmpty, let end = Int64(tail) { rangeEnd = min(end, totalSize - 1) }
+            if head.isEmpty, let suffixLength = Int64(tail) {
+                // #281: the suffix form `bytes=-n`, the last n bytes, which is what the speculative
+                // tail fetch uses because it needs no size. Logged in its resolved form so a test
+                // asserts against real offsets.
+                offset = max(0, totalSize - suffixLength)
+                rangeEnd = totalSize - 1
+            } else {
+                if let start = Int64(head) { offset = start }
+                if !tail.isEmpty, let end = Int64(tail) { rangeEnd = min(end, totalSize - 1) }
+            }
         }
         lock.lock()
         _requestedRanges.append((offset, rangeEnd))

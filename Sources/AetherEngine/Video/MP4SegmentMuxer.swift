@@ -91,7 +91,7 @@ final class MP4SegmentMuxer {
         case failed
     }
 
-    enum MuxerError: Error, CustomStringConvertible {
+    enum MuxerError: Error, CustomStringConvertible, LocalizedError {
         case allocFailed(code: Int32)
         case streamCreationFailed
         case copyParametersFailed(code: Int32)
@@ -109,6 +109,8 @@ final class MP4SegmentMuxer {
             case .openStagingFileFailed(let e): return "MP4SegmentMuxer: open() staging file failed errno=\(e)"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     // MARK: - State

@@ -3,7 +3,7 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-enum SubtitleDecoderError: Error {
+enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
     case openFailed(code: Int32)
     case noSubtitleStream
     /// #266: a requested absolute stream index is out of range or not a subtitle stream. Reported
@@ -12,6 +12,18 @@ enum SubtitleDecoderError: Error {
     case streamIndexNotSubtitle(index: Int32)
     case noDecoder
     case codecOpenFailed(code: Int32)
+
+    var description: String {
+        switch self {
+        case .openFailed(let code): "SubtitleDecoder: open failed (\(FFmpegErr.text(for: code)))"
+        case .noSubtitleStream: "SubtitleDecoder: file has no subtitle stream"
+        case .streamIndexNotSubtitle(let index): "SubtitleDecoder: stream \(index) is out of range or not a subtitle stream"
+        case .noDecoder: "SubtitleDecoder: no decoder for the subtitle codec"
+        case .codecOpenFailed(let code): "SubtitleDecoder: decoder open failed (\(FFmpegErr.text(for: code)))"
+        }
+    }
+
+    var errorDescription: String? { description }
 }
 
 /// Result of a sidecar decode: cue list plus, when preserveASSMarkup is set on an ASS/SSA file,
