@@ -235,6 +235,13 @@ extension AetherEngine {
                 }
             }
             .store(in: &nativeCancellables)
+        // First-frame-on-screen: mirror the host's display-ready latch so hosts can stamp
+        // "first frame rendered" on real pixels instead of transport state (.playing).
+        host.$isFirstFrameDisplayReady
+            .sink { [weak self] ready in
+                self?.isFirstFrameDisplayReady = ready
+            }
+            .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
         // settlePausedAtReadiness off when autostarting: the terminal host.play() runs, so readyToPlay is only a waypoint. Flipping to .paused here would drop the spinner during Jellyfin's ~10 s transcode spin-up. timeControlStatus sink holds .loading until AVPlayer renders.
         // #124: a paused mount (autoplay=false) skips that play(), so the readiness sink settles .loading -> .paused.

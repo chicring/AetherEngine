@@ -103,6 +103,12 @@ public final class AetherEngine: ObservableObject {
     /// regex-matching `EngineLog`.
     @Published public internal(set) var playbackPhase: PlaybackPhase = .idle
 
+    /// First-frame-on-screen latch for the current native session (mirrors NativeAVPlayerHost).
+    /// True once the AVPlayerLayer can actually display video (isReadyForDisplay). Hosts stamp
+    /// "first frame rendered" on this instead of transport state (.playing), which leads the
+    /// first pixel by up to ~1s on slow opens (audio-leads-black-video gap).
+    @Published public internal(set) var isFirstFrameDisplayReady = false
+
     /// Reader source-fetch axis feeding `playbackPhase`. Updated off the demux thread via
     /// `setReaderNetworkPhase`. `didSet` keeps `playbackPhase` in sync (#85).
     private var readerStall: ReaderNetworkPhase = .flowing {
@@ -4506,6 +4512,7 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
         nativeCancellables.removeAll()
+        isFirstFrameDisplayReady = false
         // AE#158: keepCurrentItem defers the item detach to the next host.load(inPlaceSwap:) so a
         // system PiP window never sees a nil-item gap across a native->native load. Only meaningful
         // together with keepNativeHost; load() computes it via shouldHandOverItemInPlace.

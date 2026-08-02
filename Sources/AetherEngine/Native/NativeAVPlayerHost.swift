@@ -58,6 +58,11 @@ final class NativeAVPlayerHost {
     /// AetherEngine#168: the same-read nominal frame rate, so the engine's remote-HLS criteria also carry
     /// Match Frame Rate (the reporter's 4K item is 50 fps). nil when no video track / rate resolves.
     @Published private(set) var detectedVideoFrameRate: Double?
+    /// First-frame-on-screen latch for the current load: true once the playerLayer can actually
+    /// display video (isReadyForDisplay). Hosts stamp "first frame rendered" on this instead of
+    /// transport state (.playing) — AVPlayer flips to .playing before the first pixel lands
+    /// (audio-leads-black-video gap), so .playing alone is a false positive. Reset on each load.
+    @Published private(set) var isFirstFrameDisplayReady = false
 
     /// AetherEngine#168 follow-up: fires once when the armed carriage watchdog concludes the master
     /// advertises a video rendition but AVPlayer never built a video track past the grace window
@@ -232,6 +237,7 @@ final class NativeAVPlayerHost {
 
         self.surfaceEndFailures = surfaceEndFailures
         self.carriageWatchdogArmed = armVideoCarriageWatchdog
+        isFirstFrameDisplayReady = false
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -243,12 +249,17 @@ final class NativeAVPlayerHost {
         // First-frame-visible diagnostic (see `layerReadyObservation`).
         layerReadyObservation = playerLayer.observe(
             \.isReadyForDisplay, options: [.new, .initial]
-        ) { layer, change in
+        ) { [weak self] layer, change in
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit(
                 "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(change.newValue ?? layer.isReadyForDisplay) t+\(String(format: "%.2f", elapsed))s",
                 category: .engine
             )
+            if change.newValue ?? layer.isReadyForDisplay {
+                Task { @MainActor [weak self] in
+                    self?.isFirstFrameDisplayReady = true
+                }
+            }
         }
 
         let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
