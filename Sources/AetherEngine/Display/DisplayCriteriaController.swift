@@ -30,6 +30,15 @@ final class DisplayCriteriaController {
     /// which on unobservable-DV panels otherwise burns the full ~3s waitForSwitch cap on every channel change.
     private var lastApplied: AppliedCriteria?
 
+    /// Has a criteria write ever demonstrably driven THIS display into HDR (headroom observed above 1.0)?
+    ///
+    /// Deliberately never cleared, not by `reset()` and not by a switch that ends at headroom 1.0. The
+    /// headroom is a transition artifact, so its absence proves nothing (see `panelPresentsHDR`) and any
+    /// invalidation rule built on it would re-arm the very false negative this exists to answer. A display
+    /// change cannot strand it either: `effectiveVideoFormat` clamps to `displayCapabilities` before
+    /// `apply()`, so an SDR route writes SDR criteria and never consults the proof.
+    private var panelProvenToEngageHDR: Bool = false
+
     /// The identifying inputs of an apply(): equal signatures mean the panel is already in the target mode.
     struct AppliedCriteria: Equatable {
         let isHDR: Bool
@@ -78,6 +87,23 @@ final class DisplayCriteriaController {
             case .full:  100
             }
         }
+
+        /// The budget as the log lines report it: one tick is a 10 ms poll. Latency fixes are verified off
+        /// the number they moved, so both the spent-time line and the #289 skip line name it (#274).
+        var budgetMs: Int { ticks * 10 }
+    }
+
+    /// #289: with Match Content off, nothing can start a switch, so waiting for one is pure startup latency
+    /// on the path that gates `play()`. `apply()` already declines to write criteria in that state, but it
+    /// returns `.applied`, which is neither of the two outcomes the play-gate short-circuits on, and a
+    /// sole-writer host never reaches `apply()` at all: tvOS ignores `preferredDisplayCriteria` for AVKit's
+    /// write just the same, so that path can only be caught here.
+    ///
+    /// Read live from the display manager rather than from `LoadOptions.matchContentEnabled`: the host flag
+    /// is a snapshot that can be stale in the dangerous direction (reporting off while matching is on would
+    /// skip a wait a DV cold start needs).
+    nonisolated static func shouldWait(startGrace: StartGrace, matchingEnabled: Bool) -> Bool {
+        startGrace != .skip && matchingEnabled
     }
 
     /// Who wrote the criteria a switch belongs to, and what range they asked for. Only the engine's own HDR
@@ -94,6 +120,36 @@ final class DisplayCriteriaController {
         /// Engine never wrote this session (sole-writer host): the switch was somebody else's, its target
         /// range is not knowable here.
         case hostDriven
+    }
+
+    /// Will the panel present this session in HDR?
+    ///
+    /// `UIScreen.currentEDRHeadroom` is not a readout of the panel's HDMI mode. It is raised around a
+    /// dynamic-range TRANSITION and decays back to 1.0 while the panel keeps presenting HDR (device trace,
+    /// HDR10+ panel, 2026-08-02: headroom fell 1.20 -> 1.00 thirteen seconds into a confirmed HDR10 session
+    /// with `isDisplayModeSwitchInProgress` false throughout). A replay that starts before the TV has dropped
+    /// back to SDR therefore makes no transition at all, the headroom never rises, and the single read taken
+    /// after `waitForSwitch` concluded "panel is SDR". On tvOS that one boolean IS the master-vs-media routing
+    /// gate (`resolveUseMasterPlaylist`, where `builtInPanelEngagesOnDemand` is false), so the session was
+    /// served media-direct with no HDR signaling and labelled SDR while the TV itself reported HDR.
+    ///
+    /// So the reading is trusted only as a positive. Its absence is answered by what this display has already
+    /// proven: once a criteria write has driven it into HDR, asking for HDR again puts it there. A panel that
+    /// never engages (Match Frame Rate on, Match Dynamic Range off, which tvOS reports through the same
+    /// combined toggle) never sets the proof and keeps the conservative answer, so it is still never offered a
+    /// PQ master it would reject with -11848.
+    ///
+    /// The residual risk is the reverse: Match Dynamic Range switched off in Settings after a proven session,
+    /// without the app being killed. That offers one master to an SDR panel, which the reactive master-to-media
+    /// fallback (#98) and the startup-readiness gate (#35) already recover from. Trading a rare, self-healing
+    /// fallback for a silent permanent HDR loss on every replay is the point of this function.
+    nonisolated static func panelPresentsHDR(
+        headroomAboveOne: Bool,
+        attribution: CriteriaAttribution,
+        panelProvenToEngageHDR: Bool
+    ) -> Bool {
+        if headroomAboveOne { return true }
+        return attribution == .engineHDR && panelProvenToEngageHDR
     }
 
     nonisolated static func criteriaAttribution(didApply: Bool, lastCriteriaWasHDR: Bool) -> CriteriaAttribution {
@@ -272,9 +328,18 @@ final class DisplayCriteriaController {
         let screen = window.screen
         let entry = DispatchTime.now()
 
+        // #289: Match Content off means no writer can start a switch, so every millisecond of the budget is
+        // dead startup time. The headroom fast-exit below cannot cover it: the panel never transitioned, so
+        // the headroom sits at 1.0 and the wait runs its full Stage 1.
+        guard Self.shouldWait(startGrace: startGrace,
+                              matchingEnabled: displayManager.isDisplayCriteriaMatchingEnabled) else {
+            EngineLog.emit("[DisplayCriteria] no wait: Match Content disabled, nothing can start a switch (skipped \(startGrace.budgetMs)ms Stage 1 budget)", category: .engine)
+            return
+        }
+
         // Fast exit: panel already in HDR (headroom already raised, e.g. a prior
         // HDR/DV session left it there).
-        if screen.currentEDRHeadroom > 1.001 {
+        if observeHeadroom(screen) {
             EngineLog.emit("[DisplayCriteria] no switch needed (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) at entry)", category: .engine)
             return
         }
@@ -310,7 +375,7 @@ final class DisplayCriteriaController {
         // switch that started inside the gate.
         var startSignal = StartSignal.none
         for _ in 0..<startGrace.ticks {
-            if switchEnded.fired || screen.currentEDRHeadroom > 1.001 {
+            if switchEnded.fired || observeHeadroom(screen) {
                 EngineLog.emit("[DisplayCriteria] settled during start phase (after \(Self.elapsedMs(since: entry))ms, EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
                 return
             }
@@ -321,7 +386,7 @@ final class DisplayCriteriaController {
         // Time spent, not the budget: the polls carry scheduler overhead, and everything downstream is
         // reported relative to this (#49).
         let stage1Ms = Self.elapsedMs(since: entry)
-        let startBudgetMs = startGrace.ticks * 10
+        let startBudgetMs = startGrace.budgetMs
         if startSignal == .none {
             // No switch started within the grace: panel already satisfies the criteria
             // or the setter was a no-op. Don't block; AVPlayer tonemaps or errors for real.
@@ -345,7 +410,7 @@ final class DisplayCriteriaController {
                 EngineLog.emit("[DisplayCriteria] switch settled via modeSwitchEnd (\(timing()))", category: .engine)
                 return
             }
-            if screen.currentEDRHeadroom > 1.001 {
+            if observeHeadroom(screen) {
                 EngineLog.emit("[DisplayCriteria] switch settled via EDR (\(timing()), headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
                 return
             }
@@ -356,8 +421,14 @@ final class DisplayCriteriaController {
                     // SDR rate-only criteria: refresh-rate switch settled, panel correctly stayed SDR.
                     EngineLog.emit("[DisplayCriteria] rate-only switch settled (\(timing()), SDR, EDR headroom 1.0 as expected)", category: .engine)
                 case .engineHDR:
-                    // HDR was requested but panel ended in SDR: real dynamic-range handshake failure.
-                    EngineLog.emit("[DisplayCriteria] WARN switch ended (\(timing())) but EDR headroom still 1.0 (panel stayed SDR despite HDR criteria)", category: .engine)
+                    // Headroom 1.0 after an HDR write is NOT evidence of a refusal. The value is only raised
+                    // by a dynamic-range transition, so a panel that was already in HDR reads identically to
+                    // one that refused. The proof is the tie-breaker this line used to lack, and without it
+                    // it accused a panel that was demonstrably showing HDR at that moment.
+                    EngineLog.emit(panelProvenToEngageHDR
+                        ? "[DisplayCriteria] switch ended (\(timing())) at EDR headroom 1.0; this panel is proven to engage HDR, so it was already in the target mode and no transition raised the headroom"
+                        : "[DisplayCriteria] WARN switch ended (\(timing())) at EDR headroom 1.0 and this panel has never been observed engaging HDR: rate-only matching, or a real dynamic-range handshake failure",
+                        category: .engine)
                 case .hostDriven:
                     // #274: sole-writer host. The engine wrote nothing, so it has no target range to compare
                     // the SDR end state against; a host SDR rate write ending SDR is correct and used to be
@@ -376,7 +447,13 @@ final class DisplayCriteriaController {
         case .engineRateOnly:
             EngineLog.emit("[DisplayCriteria] proceed after cap (\(timing()); engine rate-only criteria, switch never reported end, panel may still be mid-switch; EDR headroom \(headroom))", category: .engine)
         case .engineHDR:
-            EngineLog.emit("[DisplayCriteria] proceed after cap (\(timing()); engine HDR criteria, switch not observable, likely DV; EDR headroom \(headroom))", category: .engine)
+            // "Unobservable DV panel" was the blanket reading here, but a panel that was already in HDR
+            // when the criteria were re-written produces the same silence: no transition, so no headroom
+            // rise and no end within the cap. The proof separates the two.
+            EngineLog.emit(panelProvenToEngageHDR
+                ? "[DisplayCriteria] proceed after cap (\(timing()); engine HDR criteria on a panel proven to engage HDR, so most likely already in the target mode; EDR headroom \(headroom))"
+                : "[DisplayCriteria] proceed after cap (\(timing()); engine HDR criteria, switch not observable, likely DV; EDR headroom \(headroom))",
+                category: .engine)
         case .hostDriven:
             EngineLog.emit("[DisplayCriteria] proceed after cap (\(timing()); engine wrote no criteria this session, switch not observable; EDR headroom \(headroom))", category: .engine)
         }
@@ -404,15 +481,34 @@ final class DisplayCriteriaController {
         #endif
     }
 
-    /// True when UIScreen.currentEDRHeadroom > 1.001 after apply() + waitForSwitch() settle. Reading headroom post-settle is the only authoritative way to distinguish Match Dynamic Range ON vs. rate-only (no public per-sub-toggle API).
+    /// Whether the panel presents this session in HDR, read after apply() + waitForSwitch() settle. A live
+    /// headroom above 1.0 answers it; a decayed one is answered by `panelPresentsHDR` from what this display
+    /// has already proven, because the headroom is a transition artifact and its absence proves nothing.
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }
-        return window.screen.currentEDRHeadroom > 1.001
+        return Self.panelPresentsHDR(
+            headroomAboveOne: observeHeadroom(window.screen),
+            attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
+            panelProvenToEngageHDR: panelProvenToEngageHDR
+        )
         #else
         return false
         #endif
     }
+
+    #if os(tvOS)
+    /// Single funnel for every headroom read, so one observation of a real HDR engage is remembered after the
+    /// value decays. Returns whether the panel reports HDR right now.
+    private func observeHeadroom(_ screen: UIScreen) -> Bool {
+        guard screen.currentEDRHeadroom > 1.001 else { return false }
+        if !panelProvenToEngageHDR {
+            EngineLog.emit("[DisplayCriteria] panel proven to engage HDR (headroom \(String(format: "%.2f", screen.currentEDRHeadroom))); later sessions trust an accepted HDR write even after the headroom decays", category: .engine)
+            panelProvenToEngageHDR = true
+        }
+        return true
+    }
+    #endif
 
     /// Nil-out preferredDisplayCriteria to return the panel to default. No-op when apply() was never called this session (suppressed host) to avoid racing AVKit's in-flight criteria management.
     func reset() {

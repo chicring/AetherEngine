@@ -10,7 +10,190 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- **A live HEVC-in-MPEG-TS channel reaches the ingest without paying for a
+  doomed native mount first.** The carriage verdict used to come only from the
+  #168 watchdog, which needs a full mount, readyToPlay and a 4 s grace before it
+  can conclude that AVPlayer will never build a video track, so every first open
+  of such a channel spent that grace as audio over black, in every process. The
+  same question is now answered from the source itself, the playlist plus the
+  head of one segment (the evidence chain #268 already uses for finite VOD),
+  read concurrently with the mount so nothing is serialized in front of first
+  frame. A master that advertises H.264 never reaches the network for it, and a
+  live media playlist URL with no master to judge is covered for the first time:
+  its carriage was previously unjudgeable, which left it audio-only
+  indefinitely. A video track that does build still wins at any point, so no
+  working session is taken off the native path (#293).
+
+## [6.5.6] - 2026-08-03
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.6))
+
+### Fixed
+
+- **A VOD whose audio track outlives its video no longer ends when the picture
+  runs out.** AVPlayer fires `didPlayToEndTime` the moment its video renderer
+  runs dry, and the engine forwarded that as an organic finish. On a dual-audio
+  BDRip whose selected English AAC runs 53 s past the last video sample, the item
+  stopped 53 s early, and because `.ended` is terminal the tail was unreachable
+  for the rest of the session. Reproduced deterministically on a 60 s-video /
+  113 s-audio MKV, and identically with an 8 s and a 2 s tail, so the trigger is
+  the video exhaustion rather than the length of the tail. An end that lands more
+  than a second inside the range AVPlayer itself still reports as seekable is now
+  refused, and the item is re-seeked in place and resumed: the tail plays out to
+  an organic end at the real duration with no audio dropped. Bounded to three
+  recoveries per item, each requiring the playhead to have moved, so a source
+  that genuinely cannot continue costs one re-seek and then completes as before.
+
+## [6.5.5] - 2026-08-03
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.5))
+
+### Fixed
+
+- **The retained file head now survives to serve playback's first read.** It was
+  released when the demuxer finished parsing, on the reasoning that a far seek
+  from there on is a scrub. After a trailing-index parse the anchored connection
+  sits at the END of the file, so playback's first read is a backward one, and it
+  lands at the head: measured landings of 48 and 263303 under `aetherctl` and
+  5752 in a field trace, where it cost a fresh connection whose first byte took
+  865 ms. No `probe`-based measurement could see it, because `probe` exits at
+  exactly that call. Against a 300 ms origin on a fragmented fixture, playback's
+  first read becomes a copy out of the head and the next connection is deferred
+  by 3.93 MB of already-resident bytes. The head is released instead by the first
+  post-open read it cannot answer.
+- **An origin that declines suffix ranges is asked once per session, not once per
+  open.** Some origins answer `bytes=-65536` with a 200 and the whole file. That
+  body was already refused at the response header, but the request itself was
+  re-issued on every open: a second connection opened at the same instant as the
+  data connection whose first byte is the cold start, sharing the same uplink,
+  against a server that had already shown it cannot serve it. Its answer is now
+  remembered per origin. Only the origin's own answer latches immediately; a
+  transport failure takes two, since a link bad enough to lose this request loses
+  others.
+
+## [6.5.4] - 2026-08-03
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.4))
+
+### Changed
+
+- **The HLS segment pump runs at the efficiency QoS whenever nothing is waiting
+  on it.** Its queue was pinned to `.userInitiated` for the whole session, which
+  is right for the windows where AVPlayer is blocked on a segment that has not
+  been cut yet and wrong for the steady state, where the producer is minutes of
+  content ahead and parked on backpressure. It cannot simply be demoted either:
+  `HLSLocalServer` answers segment requests from a `.userInitiated` work queue
+  and a cache miss parks that thread in `cache.fetch` until the pump produces the
+  segment, a dependency dispatch has no way to see. Pinned to `.utility` on a
+  fully saturated M1, filling the forward window took 1.21 s against 0.16 s and
+  time to first frame rose from 0.14 s to 0.24 s; on an idle box the two are
+  indistinguishable, which is why a single measurement on a device with thermal
+  headroom cannot settle it. The pump therefore owns its thread now and retunes
+  its own class as it runs: responsive until the consumer has started rendering
+  and while the consumer sits within 16 s of content of what this pump has
+  produced, `.utility` beyond that. Over a 120 s steady-state window that leaves
+  it in the efficiency class for 416 ms of CPU against 419 ms for a build pinned
+  to `.utility`. Live is unchanged, its production is source-paced and the
+  blocking reload holds an AVPlayer request open on the very next segment.
+  Reported and measured on iOS by edde746 (#286).
+
+## [6.5.3] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.3))
+
+### Fixed
+
+- **A session that starts on a panel already in HDR is no longer routed as SDR.**
+  `UIScreen.currentEDRHeadroom` is not a readout of the panel's HDMI mode. It is
+  raised around a dynamic-range transition and decays back to 1.0 while the panel
+  keeps presenting HDR, measured on an HDR10+ panel as a fall from 1.20 to 1.00
+  thirteen seconds into a confirmed HDR10 session with no mode switch in progress.
+  A replay that begins before the TV has dropped back to SDR therefore makes no
+  transition at all, so the single read taken after `waitForSwitch` concluded that
+  the panel was SDR. On tvOS that one boolean is the whole master-vs-media routing
+  gate, so every such session was served media-direct with no HDR signaling and
+  labelled SDR while the TV itself reported HDR. The reading now counts only as a
+  positive; its absence is answered by whether a criteria write has ever
+  demonstrably driven this display into HDR.
+
+- **The settle diagnostics stop accusing a panel that was already in HDR.** Both
+  the Stage 2 WARN and the cap line read headroom 1.0 after an HDR write as a
+  refusal, which is indistinguishable from a panel that needed no transition.
+  They now separate the two, and an unproven panel still names the real
+  candidates.
+
+## [6.5.2] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.2))
+
+### Fixed
+
+- **A range that finished delivering is now read out of the window instead of
+  fetched again.** A completed range clears `activeTask` exactly as a dropped
+  one does, and the no-connection branch reconnected at the READ position
+  regardless, which resets `winStart` and drops everything still resident. A
+  consumer slower than the transfer, which is what the parse pass is (one 256 KB
+  AVIO buffer at a time), therefore re-fetched what it had just been handed.
+  Measured with aetherctl against a Range-logging origin: a 764450 B trailing
+  `moov` cost three connections and 1506918 delivered bytes, 1.97x its own size.
+  It now costs one. Serving what is in hand first also lets the #220 frontier
+  refill run, which it could not while this branch preempted it on every
+  completed range.
+
+- **A read at the end of the file no longer opens a connection for it.** The EOF
+  decision sat below the reconnect, so a position at exactly `fileSize` first
+  issued `bytes=<fileSize>-` and took an empty 206 whose reconnect reset
+  `winStart` past the last byte, dropping a window the parse was still reading.
+  On the same trailing-`moov` measurement that was one of the three connections.
+
+- **The head of the file is retained across the open phase, so the return trip
+  after a parse excursion is a copy.** #281 parked the open window at seek time,
+  cut from `winStart`, on the reasoning that the demuxer returns to the window's
+  start. It returns to the FILE's start: landings of 48, 1161, 5752 and 265159
+  across four MP4 layouts and a field trace. Those coincide only when the parse
+  seeks away before reading anything. A fragmented MP4 reads 33 MB first, so
+  `winStart` has long left the head and the parked copy covers nothing that is
+  asked for. The head is now collected as the data connection delivers it, which
+  is the only point at which it can be, since `trimWindowLocked` drops it as the
+  parse moves forward. Measured with aetherctl against an origin with 300 ms of
+  latency per request: opening a fragmented fixture went from 1732 ms and four
+  requests to 1219 ms and three. The parked window is gone: across six container
+  layouts (four MP4, two MKV) it served no read that the retained head does not.
+
+## [6.5.1] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.1))
+
+### Fixed
+
+- **The speculative tail fetch now removes the round trip it was added for.**
+  6.4.5 issued a 64 KB suffix range alongside the open and let nothing wait on
+  it, on the reasoning that a fetch landing late costs no more than the
+  reconnect it failed to save. That reasoning was wrong about the timing, and
+  the reporter's retest measured it: the demuxer reaches the trailing object
+  within microseconds of the data connection's first byte, and the speculative
+  fetch pays the same round trip plus a body, so on any origin whose first byte
+  costs anything it is still on the wire at that moment. It never once served
+  the read it exists for, it only added a request. A read landing in the
+  fetched range now waits for it, bounded by what a round trip against this
+  origin was measured to cost (the data connection's own time to first data),
+  so waiting can never be the more expensive choice, and an origin that
+  declines suffix ranges falls straight back to a reconnect. Only a loopback
+  origin, which answers before the race can be lost, made the first version
+  look like it worked, so the regression test models an origin whose first byte
+  costs something.
+
+### Changed
+
+- The cold-start paths now say what they did. `tail prefetch issued`, then
+  `installed` or `rejected` with the reason (status, disagreeing
+  `Content-Range`, short body), and one line per span when it serves a read
+  that would otherwise have reconnected. The advertised way to verify #281 was
+  to look for a `bytes=-65536` request, which the engine never printed, so its
+  absence from a log was not evidence of anything. Slow-read summaries gained
+  `tailWaits=`.
 
 ## [6.5.0] - 2026-08-02
 

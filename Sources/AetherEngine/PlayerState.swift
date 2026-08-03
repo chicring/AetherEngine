@@ -203,6 +203,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// the same stream. Live-only; finite HEVC-in-MPEG-TS VOD is classified before the native mount and
     /// uses the seekable #268 ingest instead. `httpHeaders` ride along onto the ingest fetches. Default
     /// `true` (AetherEngine#168).
+    ///
+    /// AE#293: the same verdict is also read off the source while the mount runs (the playlist plus the
+    /// head of one segment), so the reroute no longer waits out the watchdog grace and a media playlist
+    /// URL with no master to judge is covered as well. That read is gated on the master advertising a
+    /// codec sanctioned in fMP4 only, so an H.264 channel never spends the requests; this flag disables
+    /// it along with the watchdog.
     public var nativeRemoteHLSIngestFallback: Bool
 
     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).

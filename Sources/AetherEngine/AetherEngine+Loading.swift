@@ -295,7 +295,8 @@ extension AetherEngine {
                   // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting it
                   // back would ping-pong), and hosts can opt out via LoadOptions.
                   armVideoCarriageWatchdog: RemoteHLSIngestFallback.shouldArm(
-                      isLive: options.isLive, fallbackEnabled: options.nativeRemoteHLSIngestFallback))
+                      isLive: options.isLive, fallbackEnabled: options.nativeRemoteHLSIngestFallback),
+                  isLive: options.isLive)
 
         // AE#154: surface the item's legible AVMediaSelectionGroup as `subtitleTracks` so hosts with
         // their own picker see the external WebVTT renditions AVPlayer renders on this bypass.
@@ -1068,7 +1069,8 @@ extension AetherEngine {
                   perFrameHDR: true,
                   skipInitialSeek: LiveReloadPolicy.skipInitialSeek(
                       isLive: isLive, isRejoin: liveRejoin),
-                  inPlaceSwap: inPlaceHandover)
+                  inPlaceSwap: inPlaceHandover,
+                  isLive: isLive)
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 

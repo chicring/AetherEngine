@@ -63,6 +63,38 @@ struct DisplayCriteriaPlayGateTests {
         #expect(DisplayCriteriaController.StartGrace.skip.ticks == 0)
         #expect(DisplayCriteriaController.StartGrace.brief.ticks == 20)   // 20 x 10ms = 200ms
         #expect(DisplayCriteriaController.StartGrace.full.ticks == 100)   // 100 x 10ms = 1000ms
+        #expect(DisplayCriteriaController.StartGrace.skip.budgetMs == 0)
+        #expect(DisplayCriteriaController.StartGrace.brief.budgetMs == 200)
+        #expect(DisplayCriteriaController.StartGrace.full.budgetMs == 1000)
+    }
+
+    // MARK: - Match Content off (#289)
+
+    @Test("Match Content off drops the wait for every budget: nothing can start a switch")
+    func matchContentOffSkipsTheWait() {
+        for grace: DisplayCriteriaController.StartGrace in [.skip, .brief, .full] {
+            #expect(DisplayCriteriaController.shouldWait(startGrace: grace, matchingEnabled: false) == false)
+        }
+    }
+
+    @Test("Match Content on keeps every non-skip budget")
+    func matchContentOnKeepsTheWait() {
+        #expect(DisplayCriteriaController.shouldWait(startGrace: .full, matchingEnabled: true))
+        #expect(DisplayCriteriaController.shouldWait(startGrace: .brief, matchingEnabled: true))
+        // #133's unchanged-skip stays a skip regardless of the toggle.
+        #expect(DisplayCriteriaController.shouldWait(startGrace: .skip, matchingEnabled: true) == false)
+    }
+
+    @Test("The sole-writer DV cold start is the case the wait exists for and must survive")
+    func soleWriterHDRStillWaitsWhenMatchingIsOn() {
+        // playGateGrace hands this path .full; with matching on it must still be waited out (#274).
+        let grace = AetherEngine.playGateGrace(
+            criteriaUnchanged: false, engineIsCriteriaWriter: false,
+            formatKnown: true, effectiveFormat: .dolbyVision)
+        #expect(grace == .full)
+        #expect(DisplayCriteriaController.shouldWait(startGrace: grace, matchingEnabled: true))
+        // ... and is dead time only once the panel cannot switch at all.
+        #expect(DisplayCriteriaController.shouldWait(startGrace: grace, matchingEnabled: false) == false)
     }
 
     // MARK: - Criteria attribution

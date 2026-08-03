@@ -19,12 +19,6 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// FIFO ceiling, matched to `HLSLiveIngestReader`: the producer parks here until the demuxer drains.
     private static let maximumBufferedBytes = 16 * 1024 * 1024
     private static let maximumPlaylistBytes = 2 * 1024 * 1024
-    /// Carriage-probe ceiling. A conforming muxer repeats PAT + PMT at the head of every segment and
-    /// the probe stops at its first definitive verdict, so this bound is only reached by a source that
-    /// hides its PMT; 128 KiB is ~700 TS packets deep and keeps the rejected (H.264) case cheap.
-    private static let maximumCarriageProbeBytes = 128 * 1024
-    /// Probe verdict granularity: re-inspect after this much fresh payload, packet-aligned.
-    private static let carriageProbeChunkBytes = 188 * 32
     private static let maxConcurrentSegmentFetches = 4
     /// Segment bytes the prefetch window may hold in memory. 4K VOD segments run 15-25 MB, so a fixed
     /// window of four would peak near 100 MB on a device that also holds decode buffers; the window
@@ -533,40 +527,14 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         return data
     }
 
-    /// Reads the head of the first segment and classifies its carriage. The body is streamed and
-    /// abandoned at the first definitive verdict, so a conforming segment costs the two packets that
-    /// carry PAT and PMT rather than the full ceiling; an origin that ignores the Range request is
-    /// bounded the same way, by cancelling the task instead of buffering the segment.
+    /// Reads the head of the first segment and classifies its carriage (AE#293 shares this read with the
+    /// live probe, so both paths judge a source the same way).
     private func probeCarriage(_ url: URL) async throws -> MPEGTransportStreamCodecProbe.Verdict {
-        var request = makeRequest(url)
-        request.setValue(
-            "bytes=0-\(Self.maximumCarriageProbeBytes - 1)",
-            forHTTPHeaderField: "Range"
+        try await HLSCarriageProbe.classifySegmentHead(
+            url: url,
+            httpHeaders: httpHeaders,
+            session: session
         )
-        let (bytes, response) = try await session.bytes(for: request)
-        defer { bytes.task.cancel() }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        guard status == 200 || status == 206 else {
-            throw HLSIngestError.playlistUnreachable(status: status)
-        }
-        var data = Data()
-        data.reserveCapacity(Self.carriageProbeChunkBytes)
-        var nextVerdictAt = Self.carriageProbeChunkBytes
-        for try await byte in bytes {
-            data.append(byte)
-            guard data.count >= nextVerdictAt else { continue }
-            let verdict = MPEGTransportStreamCodecProbe.classify(data)
-            if verdict != .inconclusive { return verdict }
-            guard data.count < Self.maximumCarriageProbeBytes else { break }
-            nextVerdictAt = min(
-                Self.maximumCarriageProbeBytes,
-                data.count + Self.carriageProbeChunkBytes
-            )
-        }
-        guard !data.isEmpty else {
-            throw HLSIngestError.unsupportedSegmentFormat
-        }
-        return MPEGTransportStreamCodecProbe.classify(data)
     }
 
     private func decrypt(

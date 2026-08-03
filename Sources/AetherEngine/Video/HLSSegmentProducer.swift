@@ -473,10 +473,55 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// here is diagnostic, never steady state. ~6 min of 2 s GOP segments.
     private static let liveResidentSegmentCap = 180
 
-    private let pumpQueue = DispatchQueue(
-        label: "AetherEngine.HLSSegmentProducer.pump",
-        qos: .userInitiated
-    )
+    static func qosName(_ c: qos_class_t) -> String {
+        switch c {
+        case QOS_CLASS_USER_INTERACTIVE: return "userInteractive"
+        case QOS_CLASS_USER_INITIATED: return "userInitiated"
+        case QOS_CLASS_DEFAULT: return "default"
+        case QOS_CLASS_UTILITY: return "utility"
+        case QOS_CLASS_BACKGROUND: return "background"
+        default: return "unspecified"
+        }
+    }
+
+    /// AE#286: how much produced-but-unfetched content has to sit ahead of the consumer before the
+    /// pump's work stops being latency-critical. `HLSLocalServer` answers segment requests from a
+    /// `.userInitiated` work queue, and a cache miss parks that thread in `cache.fetch` until this pump
+    /// produces the segment, so a permanently demoted pump is a priority inversion dispatch cannot see.
+    /// Held well below the `forwardWindow` the pump parks at, so the two states cannot flap.
+    private static let pumpRelaxedLeadSeconds = 16.0
+
+    /// `pumpRelaxedLeadSeconds` in this session's segments, floor 2.
+    private var pumpRelaxedLeadSegments: Int {
+        Self.relaxedLeadSegments(targetSegmentDurationSeconds: targetSegmentDurationSeconds)
+    }
+
+    static func relaxedLeadSegments(targetSegmentDurationSeconds: Double) -> Int {
+        max(2, Int((pumpRelaxedLeadSeconds / max(1.0, targetSegmentDurationSeconds)).rounded(.up)))
+    }
+
+    /// Whether the pump may run at the relaxed (efficiency) QoS. Pure so the guards are testable
+    /// without a session: `targetIndex < 0` is a consumer that has not fetched at all,
+    /// `hasStartedRendering == false` is one still filling its startup buffer, and a short lead is a
+    /// consumer sitting on the production head, which is a rebuffer in progress.
+    ///
+    /// `epochHighestStored` is what THIS pump has written since it started, not `cache.highestStoredIndex`.
+    /// The cache's high-water is monotonic across producer epochs, so a pump restarted for a seek reads
+    /// the previous epoch's head, computes a comfortable lead over content it has not produced, and
+    /// demotes itself in the one window where the consumer is provably blocked on it. Measured: a
+    /// restart at idx=127 with the old epoch at 135 demoted 5 ms into the seek landing.
+    static func pumpMayRelax(hasStartedRendering: Bool, targetIndex: Int,
+                             epochHighestStored: Int, relaxedLeadSegments: Int) -> Bool {
+        guard hasStartedRendering, targetIndex >= 0, epochHighestStored >= 0 else { return false }
+        return epochHighestStored - targetIndex >= relaxedLeadSegments
+    }
+
+    /// Pump-thread-only: the QoS class the pump last requested for itself, the segment index the last
+    /// decision was taken at, and the highest segment index THIS pump has written to the cache. No
+    /// lock; only `runPumpLoop` and its callees touch these.
+    private var pumpQoSCurrent: qos_class_t = QOS_CLASS_USER_INITIATED
+    private var pumpQoSLastSeg = Int.min
+    private var pumpEpochHighestStored = Int.min
 
     private let stateLock = NSLock()
     private var pumpStarted = false
@@ -1047,6 +1092,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         )
         while !checkShouldStop() {
             if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
+                retunePumpQoS()
                 if parked >= Self.backpressureWedgeLogThresholdSeconds {
                     EngineLog.emit(
                         "[HLSSegmentProducer] #65 backpressure released (\(context)) head=\(head) "
@@ -1408,6 +1454,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             cache.adopt(index: currentMuxerSegmentIndex,
                         stagingPath: path,
                         byteCount: bytesWritten)
+            // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
+            // credit this pump with the previous epoch's production.
+            pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
             if isLive {
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
@@ -1552,9 +1601,46 @@ final class HLSSegmentProducer: @unchecked Sendable {
         pumpStarted = true
         stateLock.unlock()
 
-        pumpQueue.async { [weak self] in
+        // AE#286: a thread we own rather than a dispatch queue, because the pump's urgency changes
+        // within one long-running block and a queue's QoS is fixed at creation.
+        let thread = Thread { [weak self] in
             self?.runPumpLoop()
         }
+        thread.name = "AetherEngine.HLSSegmentProducer.pump"
+        thread.stackSize = 1 << 20
+        thread.qualityOfService = .userInitiated
+        thread.start()
+    }
+
+    /// AE#286: match the pump's QoS to whether anything is waiting on it. Called at segment
+    /// boundaries and after a backpressure park, both cheap and both points where the answer can
+    /// have changed. VOD only: live production is source-paced and the LL-HLS blocking reload holds
+    /// an AVPlayer request open on the very next segment, so live is latency-critical throughout.
+    private func retunePumpQoS() {
+        guard !isLive else { return }
+        let target = cache.targetIndex
+        let lead = pumpEpochHighestStored >= 0 ? String(pumpEpochHighestStored - target) : "n/a"
+        // A consumer that has fetched has still not necessarily started rendering: AVPlayer keeps
+        // filling its startup buffer after the first segment, and demoting there cost 80 ms of
+        // time-to-first-frame under load with the forward buffer already 9 segments deep.
+        let relaxed = Self.pumpMayRelax(
+            hasStartedRendering: hasStartedRenderingProvider?() ?? true,
+            targetIndex: target,
+            epochHighestStored: pumpEpochHighestStored,
+            relaxedLeadSegments: pumpRelaxedLeadSegments
+        )
+        let desired: qos_class_t = relaxed ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED
+        guard desired != pumpQoSCurrent else { return }
+        pumpQoSCurrent = desired
+        pthread_set_qos_class_self_np(desired, 0)
+        // Read the class back: a thread that was opted out of the QoS system silently keeps the old
+        // one, and then the whole mechanism is a no-op that still looks configured.
+        EngineLog.emit(
+            "[HLSSegmentProducer] pump qos -> \(Self.qosName(desired)) "
+            + "(now=\(Self.qosName(qos_class_self())) epochHead=\(pumpEpochHighestStored) "
+            + "target=\(target) lead=\(lead))",
+            category: .session
+        )
     }
 
     /// Async stop; also wakes backpressure waiter so restart doesn't wait a full poll timeout.
@@ -1694,6 +1780,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - Pump
 
     private func runPumpLoop() {
+        // AE#286: a (re)started pump always begins latency-critical. Nothing has been produced for
+        // this epoch yet, and both of its entry reasons, cold start and a seek landing, have the
+        // consumer waiting on the first segment it cuts.
+        pumpQoSCurrent = QOS_CLASS_USER_INITIATED
+        pumpQoSLastSeg = Int.min
+        pumpEpochHighestStored = Int.min
+        pthread_set_qos_class_self_np(pumpQoSCurrent, 0)
+        EngineLog.emit(
+            "[HLSSegmentProducer] pump thread qos=\(Self.qosName(qos_class_self()))",
+            category: .session
+        )
         if restartTargetVideoPts > Int64.min {
             bumpRestartCount()
         }
@@ -2646,6 +2743,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     let thisVideoSeg = isLive
                         ? liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
                         : vodCutter.index(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
+                    if thisVideoSeg != pumpQoSLastSeg {
+                        pumpQoSLastSeg = thisVideoSeg
+                        retunePumpQoS()
+                    }
                     if let prev = pendingVideoPkt {
                         let prevSeg = pendingVideoSegIndex
                         // #65 ledger: at each VOD segment open, map the segment's item-axis start (what AVPlayer and

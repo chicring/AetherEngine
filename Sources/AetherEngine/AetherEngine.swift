@@ -534,6 +534,18 @@ public final class AetherEngine: ObservableObject {
     /// SW-PiP bridge, the software-path analog of `currentAVPlayer`: set when a SW session has its
     /// display layer, nil on teardown. Hosts build their sample-buffer PiP ContentSource from it.
     @Published public internal(set) var softwarePiPSource: SoftwarePiPSource?
+
+    /// #288: the native-path counterpart of `softwarePiPSource.layer`. `AVPictureInPictureController`
+    /// wants the layer, not the player, so a host presenting its own PiP on the native path (tvOS has
+    /// no reachable AVKit affordance behind suppressed chrome) cannot get there from `currentAVPlayer`.
+    /// nil while no native session exists, which is also the honest signal for hiding a PiP button:
+    /// a software session has no AVPlayerLayer, it has `softwarePiPSource`.
+    ///
+    /// Read it per session rather than caching it. The layer survives item swaps and the PiP
+    /// next-episode handover (AE#158), but `stop()` tears the host down and the next `load()` builds
+    /// a fresh layer. A host driving PiP must still set `pictureInPictureActive`, which arms both the
+    /// keepalive policy and that in-place handover.
+    public var nativePlayerLayer: AVPlayerLayer? { nativeHost?.playerLayer }
     #if os(iOS) || os(tvOS)
     /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown
     /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS).
@@ -1865,6 +1877,71 @@ public final class AetherEngine: ObservableObject {
     /// Synthesize organic end-of-media once the tail park has persisted past the grace window.
     nonisolated static func shouldSynthesizeEndOfMediaFromPark(frozenTicks: Int) -> Bool {
         frozenTicks >= endOfMediaParkGraceTicks
+    }
+
+    /// How far short of `duration` an end-of-item event must land before it counts as premature
+    /// (AetherEngine#287). Deliberately above `endOfMediaEpsilonSeconds` so the #169 tail park owns the
+    /// last half second and the two can never contend for the same event.
+    nonisolated static let prematureEndShortfallSeconds: Double = 1.0
+
+    /// How far past the playhead AVPlayer's own seekable range must reach before its end-of-item event
+    /// counts as self-contradicted (AetherEngine#287).
+    nonisolated static let prematureEndSeekableLeadSeconds: Double = 1.0
+
+    /// Cap on premature-end recoveries per item (AetherEngine#287). A source whose video track has
+    /// several holes gets a recovery at each of them; a pathological one cannot spin.
+    nonisolated static let prematureEndRecoveryMaxAttempts: Int = 3
+
+    /// A recovery must have moved the playhead by at least this much before another one is allowed
+    /// (AetherEngine#287). Re-seeking a position that already failed to resume would loop forever.
+    nonisolated static let prematureEndRecoveryMinProgressSeconds: Double = 0.5
+
+    /// True when AVPlayer's `didPlayToEndTime` is contradicted by AVPlayer's own seekable range, i.e. it
+    /// ended the item tens of seconds inside a presentation it still reports as seekable
+    /// (AetherEngine#287).
+    ///
+    /// A VOD whose selected audio track outruns its video track (the reporter's dual-audio BDRip: video
+    /// ends 1431.971 s, the selected English AAC 1484.935 s, container 1484.936 s) makes AVPlayer end the
+    /// item the moment the video renderer runs dry, ~53 s short of the advertised duration. Reproduced
+    /// on a synthesized 60 s-video / 113 s-audio MKV: the end fires at 60.03 s of a 113.02 s
+    /// presentation whose final segment had already been fetched whole, and identically for a 2 s, an
+    /// 8 s and a 53 s tail, so the trigger is the video exhaustion rather than the length of the tail.
+    /// The playlist is not the culprit either: its EXTINF sum equals the container duration to the
+    /// millisecond (measured 14 x 4.004 + 56.967 = 113.023).
+    ///
+    /// The engine cannot talk AVPlayer out of that call, but it must not forward it as an organic
+    /// finish. `.ended` is terminal (#63/#164), so seek and play become no-ops and the tail is
+    /// unreachable for the rest of the session; the host sees a hard stop tens of seconds early. Seeking
+    /// back to the SAME position and resuming re-arms the renderers and plays the tail out to an organic
+    /// end at the real duration with no audio dropped (measured; `play()` without the seek leaves the
+    /// clock frozen at the boundary indefinitely).
+    ///
+    /// The witness is the SEEKABLE range, not the loaded one that carries #169. Measured at the instant
+    /// the premature end fires: `loadedTimeRanges` has already been trimmed back to the exhaustion point
+    /// ([22.34, 60.01] with the playhead at 60.03), so the loaded range agrees with AVPlayer's mistake
+    /// and cannot refute it, while `seekableTimeRanges` still reports the whole presentation
+    /// ([0, 113.02]). A live session fails this guard on its own, its seekable end being the live edge.
+    ///
+    /// A real serve failure does not reach here: a segment that never arrives fails the item with
+    /// `failedToPlayToEndTime` / -12889, a different notification with its own recovery. And a recovery
+    /// that cannot work costs one re-seek before the same end is accepted, so the worst case is today's
+    /// behaviour one seek later.
+    nonisolated static func prematureEndRecoveryQualifies(
+        isLive: Bool,
+        duration: Double,
+        playhead: Double,
+        seekableEnd: Double?,
+        attemptsUsed: Int,
+        lastAttemptPlayhead: Double?
+    ) -> Bool {
+        guard !isLive, duration > 0, playhead.isFinite else { return false }
+        guard attemptsUsed < prematureEndRecoveryMaxAttempts else { return false }
+        guard duration - playhead > prematureEndShortfallSeconds else { return false }
+        guard let seekableEnd, seekableEnd.isFinite,
+              seekableEnd - playhead >= prematureEndSeekableLeadSeconds else { return false }
+        if let lastAttemptPlayhead,
+           playhead - lastAttemptPlayhead < prematureEndRecoveryMinProgressSeconds { return false }
+        return true
     }
 
     /// Complete a native VOD that parked a hair short of its advertised duration because the final

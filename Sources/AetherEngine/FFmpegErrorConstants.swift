@@ -20,7 +20,7 @@ enum FFmpegErr {
     static func text(for code: Int32) -> String {
         var buffer = [CChar](repeating: 0, count: 128)
         guard av_strerror(code, &buffer, buffer.count) == 0 else { return "\(code)" }
-        let message = String(cString: buffer)
+        let message = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         return message.isEmpty ? "\(code)" : "\(message) (\(code))"
     }
 }

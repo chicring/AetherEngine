@@ -317,7 +317,17 @@ extension AetherEngine {
     }
 
     /// Frames the SW host enqueued into AVSampleBufferDisplayLayer. Zero on native path or pre-start.
-    var softwareHostFramesEnqueued: Int {
+    ///
+    /// #288: the software-path answer to "is there a picture, or is this audio into a black view".
+    /// `AVPlayerItemVideoOutput.hasNewPixelBuffer` answers it on the native path, but a software
+    /// session has no AVPlayer at all, so a host watchdog built on that probe alone reads every
+    /// dav1d/libavcodec session as picture-less and kills healthy playback. Pair it with
+    /// `currentAVPlayer == nil` to pick the backend, then watch this counter for movement.
+    ///
+    /// Monotonic within a session only: it belongs to the current SW host, and a `load()` that
+    /// builds a new one restarts it at zero. A watchdog measuring deltas must treat a decrease as
+    /// a new session, not as a stall.
+    public var softwareHostFramesEnqueued: Int {
         softwareHost?.framesEnqueued ?? 0
     }
 
