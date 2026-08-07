@@ -43,6 +43,32 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
     private var skipUntilPTS: CMTime?
 
+    /// #311: fires for every frame handed to the queue target, on the decode thread. Guarded by
+    /// `reorderLock` for the swap only; the call itself happens with no lock held, so a host that
+    /// re-enters the renderer from it cannot deadlock.
+    private var _frameEnqueuedObserver: SoftwareVideoFrameTimeObserver?
+    func setFrameEnqueuedObserver(_ observer: SoftwareVideoFrameTimeObserver?) {
+        reorderLock.lock()
+        _frameEnqueuedObserver = observer
+        reorderLock.unlock()
+    }
+
+    /// #311: moved on by every flush, so a consumer can drop the frame times it recorded for frames the
+    /// compositor has since discarded. Guarded by `reorderLock`.
+    ///
+    /// Drawn from a process-wide allocator rather than counted from zero (#314). A load builds a new
+    /// renderer, and a renderer that started at zero would report below the outgoing one, which is the
+    /// order a consumer reads as "stale". The first value is drawn at init for the same reason: the
+    /// generation a renderer reports before its first flush has to rank above the previous renderer's
+    /// last, not tie with it. Successive values are therefore strictly increasing but not consecutive.
+    private static let flushGenerations = FrameTimeSequence()
+    private var _flushGeneration: UInt64 = SampleBufferRenderer.flushGenerations.next()
+    var flushGeneration: UInt64 {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _flushGeneration
+    }
+
     /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry + pixel aspect ratio. CMVideoFormatDescriptionCreateForImageBuffer snapshots color AND aspect attachments at creation, so a mid-stream change at same dimensions must invalidate the cache; a PAR-less first frame froze a PAR-less description for the whole stream and collapsed anamorphic content to coded dimensions (#177). Guarded by reorderLock; nil'd by flush().
     private var cachedFormatDesc: CMVideoFormatDescription?
     private var cachedFormatKey: FormatDescriptionKey?
@@ -61,11 +87,67 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     private var loggedLayerFailed = false
     private var loggedNotReady = false
-    private var enqueueCount = 0
+    /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
+    private(set) var enqueueCount = 0
     private var hdr10PlusAttachedCount = 0
+
+    /// #298: frames refused at the enqueue gate for carrying an unschedulable PTS. Guarded by `reorderLock`.
+    private var _untimedFramesDropped = 0
+    var untimedFramesDropped: Int {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _untimedFramesDropped
+    }
+
+    /// #303: newest presentation timestamp this renderer has admitted, in seconds on the source
+    /// axis, nil before the first frame. Recorded at admission into the reorder buffer, so it is
+    /// past the unschedulable-PTS gate and the post-seek skip: everything counted here is decoded
+    /// and will be displayed. Its lead over the synchronizer is the cushion an IO hiccup eats into.
+    /// Guarded by `reorderLock`.
+    private var _newestEnqueuedPtsSeconds: Double?
+    var newestEnqueuedPtsSeconds: Double? {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _newestEnqueuedPtsSeconds
+    }
 
     init() {
         displayLayer = Self.makeDisplayLayer(isHDR: false)
+    }
+
+    /// #303: what the display did with the frames, as the renderer itself counts them. Our own
+    /// counters can only see what we refuse; `numberOfDroppedFrames` also covers frames dropped for
+    /// missing their display deadline, which is the class that shows up as a stutter.
+    struct RenderMetrics: Sendable {
+        let total: Int
+        let dropped: Int
+        let corrupted: Int
+        let accumulatedDelay: TimeInterval
+    }
+
+    /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
+    /// where the queue target is the display layer itself rather than an `AVSampleBufferVideoRenderer`.
+    ///
+    /// #313: main-actor isolated, and reading through the completion-handler accessor rather than
+    /// the async one, because the two halves of that constraint come from different toolchains and
+    /// no single `await` on `videoPerformanceMetrics` satisfies both. An SDK that isolates the layer
+    /// to the main actor refuses to hand `sampleBufferRenderer` to any other domain; a toolchain
+    /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
+    /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
+    /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    @MainActor
+    func loadRenderMetrics() async -> RenderMetrics? {
+        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) else { return nil }
+        let renderer = displayLayer.sampleBufferRenderer
+        return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
+            renderer.loadVideoPerformanceMetrics { m in
+                guard let m else { return cont.resume(returning: nil) }
+                cont.resume(returning: RenderMetrics(total: m.totalNumberOfFrames,
+                                                     dropped: m.numberOfDroppedFrames,
+                                                     corrupted: m.numberOfCorruptedFrames,
+                                                     accumulatedDelay: m.totalAccumulatedFrameDelay))
+            }
+        }
     }
 
     // MARK: - Queue rendering target
@@ -136,9 +218,32 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// #298: whether a frame's presentation timestamp can be scheduled at all. AV_NOPTS_VALUE reaches
+    /// the decoder callback as `CMTime.invalid`, and CoreMedia builds a sample buffer from it without
+    /// complaint (`CMSampleBufferCreateReadyWithImageBuffer` returns noErr, the sample's PTS reads back
+    /// as NaN seconds), so the display queue is the first place it can do damage: the render
+    /// synchronizer cannot pace an untimed sample. The deinterlace path already drops its untimestamped
+    /// output for exactly this reason (see `SoftwareVideoDecoder.drainDecodedFrames`); this is the same
+    /// rule one layer lower, so no producer can put an unschedulable sample in the queue.
+    static func isSchedulable(_ pts: CMTime) -> Bool { pts.isNumeric }
+
     /// Enqueue a decoded frame through the B-frame reorder buffer. `hdr10PlusData` carries per-frame ST 2094-40 metadata serialised to T.35 SEI format for kCMSampleAttachmentKey_HDR10PlusPerFrameData.
     func enqueue(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data? = nil) {
         reorderLock.lock()
+
+        // Refused before the reorder buffer, not at flush: `CMTimeGetSeconds(.invalid)` is NaN and
+        // every comparison against NaN is false, so an untimed frame lands past frames it should
+        // precede and reorders its neighbours on the way out.
+        guard Self.isSchedulable(pts) else {
+            _untimedFramesDropped += 1
+            let dropped = _untimedFramesDropped
+            reorderLock.unlock()
+            if dropped == 1 || dropped % 250 == 0 {
+                EngineLog.emit("[Renderer] dropped \(dropped) frame(s) with no usable timestamp (unschedulable)",
+                               category: .swPlayback)
+            }
+            return
+        }
 
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {
@@ -149,6 +254,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         let ptsSeconds = CMTimeGetSeconds(pts)
+        // #303: the frontier is the newest timestamp HELD, not the newest handed over. A B-frame run
+        // arrives out of order, so taking the last call's timestamp would report a cushion that
+        // shrinks and grows with the coding pattern rather than with the buffer.
+        if ptsSeconds > (_newestEnqueuedPtsSeconds ?? -.greatestFiniteMagnitude) {
+            _newestEnqueuedPtsSeconds = ptsSeconds
+        }
         let insertIdx = reorderBuffer.firstIndex(where: {
             CMTimeGetSeconds($0.1) > ptsSeconds
         }) ?? reorderBuffer.endIndex
@@ -170,6 +281,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        // #303: nothing is held any more, so the frontier is not a frontier. Left standing, a
+        // backward seek would keep reporting the pre-seek timestamp and read as a cushion of
+        // however far the seek travelled.
+        _newestEnqueuedPtsSeconds = nil
+        // #311: everything reported before this point describes frames that are now gone.
+        _flushGeneration = SampleBufferRenderer.flushGenerations.next()
         // Invalidate the format description cache; the next load() may open a stream with different colorimetry at the same resolution.
         cachedFormatDesc = nil
         cachedFormatKey = nil
@@ -235,6 +352,15 @@ final class SampleBufferRenderer: @unchecked Sendable {
             EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
         }
         target.enqueue(sampleBuffer)
+
+        // #311: reported here rather than at admission, so it describes frames the compositor has
+        // been given. A frame refused for an unschedulable timestamp, skipped after a seek, or lost
+        // to a failed sample-buffer creation never reaches this line and is never reported.
+        reorderLock.lock()
+        let observer = _frameEnqueuedObserver
+        let generation = _flushGeneration
+        reorderLock.unlock()
+        observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
 
         enqueueCount += 1
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.

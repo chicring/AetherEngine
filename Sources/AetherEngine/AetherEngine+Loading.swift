@@ -89,14 +89,41 @@ extension AetherEngine {
     /// `isReady` always feeds the public `isSessionReady` mirror and replays a deferred pre-ready host
     /// seek (#127); pass `settlePausedAtReadiness: false` for paths that skip the readiness -> .paused
     /// waypoint (autostarting loadRemoteHLS, where the terminal play() runs and readiness is a waypoint).
+    /// #315: fold a host's raw `isVideoReadyForDisplay` level into the load-scoped public latch.
+    ///
+    /// Two operators carry the whole contract. `dropFirst()` discards the value the publisher
+    /// replays on subscribe: every call site wires its sinks BEFORE it loads the host, so on a
+    /// reused native host that replay is still the outgoing item's picture, and taking it would
+    /// latch this load's flag on the previous load's frame. `prefix(1)` is the latch itself: after
+    /// the first rise nothing can lower it again, which is what keeps a host from re-covering the
+    /// few tens of milliseconds an item swap spends without a picture.
+    func latchFirstFrameReadyForDisplay(
+        from publisher: Published<Bool>.Publisher,
+        storeIn cancellables: inout Set<AnyCancellable>
+    ) {
+        publisher
+            .dropFirst()
+            .filter { $0 }
+            .prefix(1)
+            .sink { [weak self] _ in self?.hasFirstFrameReadyForDisplay = true }
+            .store(in: &cancellables)
+    }
+
+    /// `videoReadyForDisplay` is the host's raw layer level (#315); nil on the audio hosts, which
+    /// have nothing to display. It is folded, never mirrored: the engine's published flag is latched
+    /// for the load, so the seams that reuse a host and briefly lose the picture do not surface.
     private func wireCommonHostSinks(
         duration: Published<Double>.Publisher,
         isReady: Published<Bool>.Publisher,
         settlePausedAtReadiness: Bool = true,
         failureMessage: Published<String?>.Publisher,
         didReachEnd: Published<Bool>.Publisher,
+        videoReadyForDisplay: Published<Bool>.Publisher? = nil,
         storeIn cancellables: inout Set<AnyCancellable>
     ) {
+        if let videoReadyForDisplay {
+            latchFirstFrameReadyForDisplay(from: videoReadyForDisplay, storeIn: &cancellables)
+        }
         duration
             .sink { [weak self] value in
                 if value > 0 { self?.duration = value }
@@ -235,13 +262,6 @@ extension AetherEngine {
                 }
             }
             .store(in: &nativeCancellables)
-        // First-frame-on-screen: mirror the host's display-ready latch so hosts can stamp
-        // "first frame rendered" on real pixels instead of transport state (.playing).
-        host.$isFirstFrameDisplayReady
-            .sink { [weak self] ready in
-                self?.isFirstFrameDisplayReady = ready
-            }
-            .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
         // settlePausedAtReadiness off when autostarting: the terminal host.play() runs, so readyToPlay is only a waypoint. Flipping to .paused here would drop the spinner during Jellyfin's ~10 s transcode spin-up. timeControlStatus sink holds .loading until AVPlayer renders.
         // #124: a paused mount (autoplay=false) skips that play(), so the readiness sink settles .loading -> .paused.
@@ -251,6 +271,7 @@ extension AetherEngine {
             settlePausedAtReadiness: !Self.loadPerformsAutostart(options),
             failureMessage: host.$failureMessage,
             didReachEnd: host.$didReachEnd,
+            videoReadyForDisplay: host.$isVideoReadyForDisplay,
             storeIn: &nativeCancellables
         )
         // Track AVPlayer's REAL transport state. Eager .playing caused a ~10 s black screen during Jellyfin transcode spin-up.
@@ -586,8 +607,9 @@ extension AetherEngine {
                 self.liveSourceReset.send()
             }
         }
-        // #126: zero-progress VOD pump death (readError before any packet/segment). Without this
-        // the host sees isPlayable=true, tracks=0, waitingToPlay until its own first-frame timeout.
+        // #126: zero-progress VOD pump death (readError before any packet/segment), and #169:
+        // mid-session readError after the revive cap. Without this the host sees
+        // isPlayable=true / a stalled item and waits until its own timeout.
         session.onVODSourceFailed = { [weak self, weak session] code in
             Task { @MainActor in
                 guard let self, let session, self.nativeVideoSession === session else {
@@ -597,7 +619,7 @@ extension AetherEngine {
                     )
                     return
                 }
-                self.state = .error("Source read failed before any media was produced (code \(code))")
+                self.state = .error("Source read failed (code \(code))")
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().
@@ -900,19 +922,13 @@ extension AetherEngine {
                 self.clock.bufferedPosition = renderedDisplay + max(0, readAhead)
             }
             .store(in: &nativeCancellables)
-        // First-frame-on-screen: mirror the host's display-ready latch so hosts can stamp
-        // "first frame rendered" on real pixels instead of transport state (.playing).
-        host.$isFirstFrameDisplayReady
-            .sink { [weak self] ready in
-                self?.isFirstFrameDisplayReady = ready
-            }
-            .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
             failureMessage: host.$failureMessage,
             didReachEnd: host.$didReachEnd,
+            videoReadyForDisplay: host.$isVideoReadyForDisplay,
             storeIn: &nativeCancellables
         )
         host.$timeControlStatus
@@ -1145,6 +1161,9 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        // #311: a load builds a new host and a new renderer, so an observer installed once by the
+        // host app has to be carried across the seam, exactly as the native session does at load.
+        host.setVideoFrameTimeObserver(softwareVideoFrameTimeObserver)
         // SW-PiP: publish the bridge once the session owns its layer (the layer object is stable for
         // the session; the host attaches it to the view and, on PiP start, to the system window).
         softwarePiPSource = SoftwarePiPSource(layer: host.displayLayer, isLive: isLive, engine: self)
@@ -1196,7 +1215,13 @@ extension AetherEngine {
                 guard let self = self else { return }
                 self.clock.currentTime = value
                 // bufferedPosition = newest demuxed source PTS, clamped to never trail the playhead (#54).
-                self.clock.bufferedPosition = max(value, host.bufferedSessionTime)
+                // #303: `bufferedSessionTime` is fed from `noteEdge`, which only runs on live
+                // sessions, so a VOD software session used to publish the playhead back as its own
+                // frontier. The decoded cushion is what it has instead.
+                self.clock.bufferedPosition = SoftwareBufferFrontier.bufferedPosition(
+                    currentTime: value,
+                    liveFrontier: host.bufferedSessionTime,
+                    cushion: host.displayCushionSeconds)
             }
             .store(in: &softwareCancellables)
         // #107: sourceTime rides the RAW synchronizer clock (source axis) so subtitle cues
@@ -1212,6 +1237,7 @@ extension AetherEngine {
             isReady: host.$isReady,
             failureMessage: host.$failureMessage,
             didReachEnd: host.$didReachEnd,
+            videoReadyForDisplay: host.$isVideoReadyForDisplay,
             storeIn: &softwareCancellables
         )
 

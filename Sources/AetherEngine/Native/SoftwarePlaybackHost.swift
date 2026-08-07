@@ -32,7 +32,7 @@ final class SoftwarePlaybackHost {
 
     /// #220: the pump demuxer's network sliding window, for the periodic memprobe. Paired with
     /// the subtitle side reader's own window, the two connections are separately attributable.
-    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)? {
+    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
         demuxer?.ioWindowDiagnostics
     }
 
@@ -54,6 +54,20 @@ final class SoftwarePlaybackHost {
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
     @Published private(set) var didReachEnd: Bool = false
+
+    /// #315: `AVSampleBufferDisplayLayer.isReadyForDisplay` for the renderer's layer, this path's
+    /// answer to "there is a picture". Frames enqueued is not that answer: it counts what the
+    /// decoder handed over, and #298 is the report where every one of them went into a layer no
+    /// host had bound.
+    ///
+    /// A LEVEL that falls whenever the layer loses its picture; the engine folds it into the
+    /// load-scoped `AetherEngine.hasFirstFrameReadyForDisplay`, which is what hosts consume. A
+    /// session with no video stream never arms the observation and leaves this false.
+    @Published private(set) var isVideoReadyForDisplay: Bool = false
+
+    /// #315: `readyForDisplay` observation on the renderer's layer, re-armed per load and torn down
+    /// with the session.
+    private var readyForDisplayObserver: NSObjectProtocol?
 
     /// Fires (off-main) once per session the first time HDR10+ dynamic
     /// metadata appears on a decoded frame. Hooked by `AetherEngine` to
@@ -100,6 +114,12 @@ final class SoftwarePlaybackHost {
     /// the length of the reposition and then snap to the target.
     private var seekInFlight = false
 
+    /// Transport intent for the reposition currently in flight (#292). `seek` clears `isPlaying` to park
+    /// the loops, so a seek entering while another is suspended in its off-main reposition (#254) would
+    /// read that cleared flag as "was paused" and land a playing session at rate 0. Rewritten by
+    /// `pause()` / `play()` so an explicit transport call inside the window still wins.
+    private var inFlightSeekResumeIntent = false
+
     /// Guards isPlaying/stopRequested across demux thread reads and main-actor writes.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
@@ -132,6 +152,40 @@ final class SoftwarePlaybackHost {
     /// Guards `sessionStartPts` / `newestSourcePts` against the demux
     /// thread writing while the main-actor time tick reads them.
     private let liveEdgeLock = NSLock()
+
+    /// #303: seconds of decoded video queued ahead of the clock, nil before the first frame. This is
+    /// the cushion an IO hiccup eats into, and the reason a blocked read reaches the picture here
+    /// while the native path swallows the same event. Distinct from `bufferedSessionTime`, which is
+    /// the DEMUXED frontier and is only fed on live sessions.
+    var displayCushionSeconds: Double? {
+        SoftwareBufferFrontier.cushionSeconds(newestEnqueuedPts: renderer.newestEnqueuedPtsSeconds,
+                                              sourceClock: sourceClockSeconds)
+    }
+
+    /// #311: the timebase the master clock runs on, or nil before the session owns one. This is the
+    /// `AVSampleBufferRenderSynchronizer`'s timebase, and it is created unconditionally, including for
+    /// a source with no audio track, so on this path it exists for the whole session rather than only
+    /// when something is playing.
+    ///
+    /// It reads the SOURCE axis, the same axis as `SoftwareVideoFrameTime.presentation` and as the
+    /// subtitle cues, so an overlay paced against it needs no conversion.
+    var presentationTimebase: CMTimebase? {
+        audioOutput?.synchronizer.timebase
+    }
+
+    /// #311: forwarded to the renderer, which is where a frame is actually handed over. Set through
+    /// the host rather than on the renderer directly so the engine has one place to re-arm it across
+    /// a `load()`, the same shape the native path uses for its own observer.
+    func setVideoFrameTimeObserver(_ observer: SoftwareVideoFrameTimeObserver?) {
+        renderer.setFrameEnqueuedObserver(observer)
+    }
+
+    /// #303: the renderer's own view of what reached the display. Async because the AVFoundation
+    /// accessor is; the memprobe already runs in an async context, so it is read there rather than
+    /// cached, and the line never carries a stale snapshot.
+    func loadRenderMetrics() async -> SampleBufferRenderer.RenderMetrics? {
+        await renderer.loadRenderMetrics()
+    }
 
     /// SW path's buffered frontier (AetherEngine#54): newest demuxed source PTS in session time. Published as clock.bufferedPosition.
     nonisolated var bufferedSessionTime: Double {
@@ -249,6 +303,108 @@ final class SoftwarePlaybackHost {
 
     private var timeTimer: AnyCancellable?
 
+    // MARK: - Surface visibility (#298)
+
+    /// Where a software session's frames end up on screen, or why they cannot.
+    enum SurfaceVisibility: Equatable {
+        case onScreen
+        /// The display layer is in no view hierarchy: the host never bound a render surface.
+        case notInViewHierarchy
+        /// Attached, but the bound view never got a layout, so nothing can be visible.
+        case zeroSized(width: Int, height: Int)
+    }
+
+    /// #298: a software session renders into `renderer.displayLayer`, which only reaches the screen
+    /// once the host binds a surface (`AetherEngine.bind(view:)` / `AetherPlayerSurface`). A host that
+    /// presents an AVPlayerViewController instead gets audio, a completely healthy engine log, and no
+    /// picture, because this path has no AVPlayerItem for AVKit to show (its own spinner then sits
+    /// there forever). Neither condition left a trace before, so the report reads as a renderer stall.
+    /// "Never bound" wins over the size: an unbound layer is usually zero-sized as well, and the bind
+    /// is the actionable half.
+    nonisolated static func assessSurface(hasSuperlayer: Bool, size: CGSize) -> SurfaceVisibility {
+        guard hasSuperlayer else { return .notInViewHierarchy }
+        guard size.width > 0, size.height > 0 else {
+            return .zeroSized(width: Int(size.width), height: Int(size.height))
+        }
+        return .onScreen
+    }
+
+    /// Ticks (0.25 s each) the surface check waits after the first enqueued frame. A host binding its
+    /// view during load, and the first layout pass after that, both land well inside this.
+    private static let surfaceCheckTicks = 8
+
+    private var surfaceCheckTicksSeen = 0
+    private var surfaceChecked = false
+
+    /// Runs once per session, ~2 s after frames start flowing. Reads CALayer state, so main actor only.
+    private func checkSurfaceVisibilityIfDue() {
+        guard !surfaceChecked, !backgroundAudioOnly, framesEnqueued > 0 else { return }
+        surfaceCheckTicksSeen += 1
+        guard surfaceCheckTicksSeen >= Self.surfaceCheckTicks else { return }
+        surfaceChecked = true
+
+        let layer = renderer.displayLayer
+        switch Self.assessSurface(hasSuperlayer: layer.superlayer != nil, size: layer.bounds.size) {
+        case .onScreen:
+            return
+        case .notInViewHierarchy:
+            EngineLog.emit(
+                "[SWHost] \(framesEnqueued) frames decoded into a display layer that is in no view "
+                + "hierarchy: the host never bound a render surface (AetherEngine.bind(view:) / "
+                + "AetherPlayerSurface). The software path renders into that layer, not through "
+                + "AVPlayerViewController, so audio plays and no picture can appear",
+                category: .swPlayback
+            )
+        case .zeroSized(let width, let height):
+            EngineLog.emit(
+                "[SWHost] display layer is bound but sized \(width)x\(height) after "
+                + "\(framesEnqueued) frames: the bound view has no layout, so no frame can be visible",
+                category: .swPlayback
+            )
+        }
+    }
+
+    /// #315: publish the renderer layer's own `readyForDisplay` as `isVideoReadyForDisplay`.
+    /// AVFoundation posts a notification for it rather than supporting KVO, and it arrived in
+    /// tvOS/iOS 17.4 and macOS 14.4, below the engine's own floor. Where it is missing the fallback
+    /// is the first frame handed to the renderer (`disarmedFallbackFirstFrame`), which is one hop
+    /// earlier than presentation and is documented as such on the public property.
+    private func armReadyForDisplayObserver() {
+        disarmReadyForDisplayObserver()
+        guard #available(tvOS 17.4, iOS 17.4, macOS 14.4, *) else { return }
+        let layer = renderer.displayLayer
+        readyForDisplayObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferDisplayLayerReadyForDisplayDidChange,
+            object: layer,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let ready = self.renderer.displayLayer.isReadyForDisplay
+                guard ready != self.isVideoReadyForDisplay else { return }
+                EngineLog.emit(
+                    "[SWHost] layer.isReadyForDisplay=\(ready) after \(self.framesEnqueued) frames",
+                    category: .swPlayback
+                )
+                self.isVideoReadyForDisplay = ready
+            }
+        }
+    }
+
+    private func disarmReadyForDisplayObserver() {
+        if let readyForDisplayObserver {
+            NotificationCenter.default.removeObserver(readyForDisplayObserver)
+            self.readyForDisplayObserver = nil
+        }
+    }
+
+    /// #315 fallback below tvOS/iOS 17.4 and macOS 14.4: no `readyForDisplay` on the layer, so the
+    /// first frame the decoder hands the renderer is the closest observable. Called off-main.
+    nonisolated private func noteFirstFrameEnqueuedForDisplayFallback() {
+        guard #unavailable(tvOS 17.4, iOS 17.4, macOS 14.4) else { return }
+        Task { @MainActor [weak self] in self?.isVideoReadyForDisplay = true }
+    }
+
     /// Caching the chosen rate so resume() restores the right speed after a pause without the
     /// host needing to know its history. Lock-guarded: the demux/feeder threads read it at clock
     /// arming so a host rate change between load and arm is not lost (#107).
@@ -350,6 +506,9 @@ final class SoftwarePlaybackHost {
         self.videoStreamIndex = dem.videoStreamIndex
         let vtb = vStream.pointee.time_base
         self.videoTimeBaseSeconds = vtb.den > 0 ? Double(vtb.num) / Double(vtb.den) : 0
+        // #315: armed once there is a video stream to display. A fresh host means a fresh layer, so
+        // there is no carried-in picture to guard against here (the native path's problem).
+        armReadyForDisplayObserver()
 
         // DVR ring scratch dir mirrors SegmentCache's <tmpdir>/aether-segments/<uuid> convention.
         if isLive, let window = dvrWindowSeconds {
@@ -442,6 +601,7 @@ final class SoftwarePlaybackHost {
             self?.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
             if self?.bumpFramesEnqueued() == 0 {
+                self?.noteFirstFrameEnqueuedForDisplayFallback()
                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                 EngineLog.emit(
                     "[SWHost] first video frame enqueued: "
@@ -556,6 +716,7 @@ final class SoftwarePlaybackHost {
         // Cold start: demux loop arms the clock on first decoded audio sample; don't eager-start.
         rate = lastRate
         isPlaying = true
+        inFlightSeekResumeIntent = true
     }
 
     private var demuxLoopStarted: Bool = false
@@ -608,6 +769,7 @@ final class SoftwarePlaybackHost {
         pausedByHost = true
         rate = 0
         isPlaying = false
+        inFlightSeekResumeIntent = false
     }
 
     /// Background-enter (iOS keepalive): keep audio flowing, stop feeding video. The demux loop reads the flag.
@@ -649,7 +811,12 @@ final class SoftwarePlaybackHost {
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
-        let wasPlaying = isPlaying
+        // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
+        // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
+        let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
+                                                  seekInFlight: seekInFlight,
+                                                  inFlightIntent: inFlightSeekResumeIntent)
+        inFlightSeekResumeIntent = wasPlaying
         isPlaying = false
 
         videoDecoder.flush()
@@ -692,7 +859,10 @@ final class SoftwarePlaybackHost {
 
         currentTime = seconds
 
-        if wasPlaying {
+        // #292: the intent is read HERE, not from what this seek captured on entry. `pause()` / `play()`
+        // during the reposition rewrite the stash, and a landing that ignored them either overrode the
+        // pause (kept playing) or, from the other side, anchored at rate 0 under a running loop.
+        if inFlightSeekResumeIntent {
             // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true
@@ -820,6 +990,9 @@ final class SoftwarePlaybackHost {
         demuxer = nil
 
         isReady = false
+        // #315: the session's picture goes with the session. `flush()` above already removed it.
+        disarmReadyForDisplayObserver()
+        isVideoReadyForDisplay = false
     }
 
     var volume: Float {
@@ -1717,7 +1890,10 @@ final class SoftwarePlaybackHost {
         timeTimer = Timer.publish(every: 0.25, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                guard let self, let aOut = self.audioOutput else { return }
+                guard let self else { return }
+                // Independent of the clock below: a seek in flight must not defer the one check.
+                self.checkSurfaceVisibilityIfDue()
+                guard let aOut = self.audioOutput else { return }
                 // #254: a reposition in flight holds `currentTime` at its target; the synchronizer is
                 // still on the pre-seek anchor and would drag the published position backwards.
                 guard !self.seekInFlight else { return }

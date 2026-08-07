@@ -158,15 +158,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return _nativeVideoFrameTimeObserver
     }
 
-    /// Monotonic producer generation handed to each producer (#260). Own lock: `makeProducer` runs both
-    /// under `restartLock` (live reopen) and outside it (initial bring-up).
-    private let producerEpochLock = NSLock()
-    private var producerEpochCounter: UInt64 = 0
+    /// Monotonic producer generation handed to each producer (#260). Process-wide rather than per
+    /// session (#314): a `load()` builds a new HLSVideoEngine, and a per-instance counter would restart
+    /// under a host that is still holding the outgoing session's reports. Its own allocator, with its
+    /// own lock, because `makeProducer` runs both under `restartLock` (live reopen) and outside it
+    /// (initial bring-up), and because two sessions overlap while the outgoing one unwinds.
+    private static let producerEpochs = FrameTimeSequence()
 
     private func nextProducerEpoch() -> UInt64 {
-        producerEpochLock.lock(); defer { producerEpochLock.unlock() }
-        producerEpochCounter &+= 1
-        return producerEpochCounter
+        HLSVideoEngine.producerEpochs.next()
     }
 
     /// Sodalite#32: ordinal-aligned source stream indices for the native subtitle cue stores (nil entry =

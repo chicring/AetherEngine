@@ -226,6 +226,7 @@ extension AetherEngine {
         subtitleDrainCursors.removeAll()
         subtitleDrainLastTickUptime = nil   // #271
         subtitleResolutionLastFrontier.removeAll()   // #250
+        subtitleResolutionCoverageStated.removeAll()   // #318
         cancelSubtitleForwardPrefetcher()   // #151
     }
 
@@ -235,6 +236,7 @@ extension AetherEngine {
         subtitleDrainDecoders[channel] = nil
         subtitleDrainCursors[channel] = nil
         subtitleResolutionLastFrontier[channel] = nil   // #250
+        subtitleResolutionCoverageStated.remove(channel)   // #318
         refreshSubtitleStoreProtection()   // #166
         if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
     }
@@ -281,8 +283,9 @@ extension AetherEngine {
                 // #276: an idle tick decoded nothing, so it banks nothing into the retained run.
                 // The frontier may well have moved under it; folding that in would claim
                 // determination the drainer never performed.
-                emitSubtitleResolutionStatementIfFrontierChanged(channel: channel,
-                                                                 streamIndex: streamIndex)
+                emitSubtitleResolutionStatementIfTransitioned(channel: channel,
+                                                              streamIndex: streamIndex,
+                                                              playhead: playhead)
                 continue
             case .decode(let from, let through):
                 isReset = false
@@ -379,13 +382,21 @@ extension AetherEngine {
             // NOW, and banking it here is the only place it can be had: by the next reset tick the
             // seek generation has moved on and the outgoing run's frontier no longer passes its
             // own fence.
-            let statement = subtitleResolutionStatement(
+            var statement = subtitleResolutionStatement(
                 channel: channel, streamIndex: streamIndex,
-                reason: isReset ? .reconstruction : .frontier)
+                reason: isReset ? .reconstruction : .frontier, playhead: playhead)
             subtitleDrainCursors[channel]?.retained = SubtitleResolutionStatement.extend(
                 runRetained, with: statement.resolvedThrough)
-            if isReset || subtitleResolutionLastFrontier[channel] != statement.via {
-                emitSubtitleResolutionStatement(statement, channel: channel)
+            // #318: a reset starts a fresh run, and whether THAT run reaches the playhead is a
+            // fresh question. Cleared before the decision below so a reconstruction line that
+            // already states coverage can latch it again on the way out.
+            if isReset { subtitleResolutionCoverageStated.remove(channel) }
+            if let reason = SubtitleResolutionStatement.transitionReason(
+                statement, playhead: playhead, isReset: isReset,
+                coverageStated: subtitleResolutionCoverageStated.contains(channel),
+                lastFrontier: subtitleResolutionLastFrontier[channel]) {
+                statement.reason = reason
+                emitSubtitleResolutionStatement(statement, channel: channel, playhead: playhead)
             }
         }
         // #151: a jump (seek / producer re-anchor) moves the drain window out from under the

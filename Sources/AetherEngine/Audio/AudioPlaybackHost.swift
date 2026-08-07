@@ -43,6 +43,11 @@ final class AudioPlaybackHost {
     /// the pre-seek synchronizer position over the target this seek already committed to.
     private var seekInFlight = false
 
+    /// Transport intent for the reposition currently in flight (#292; mirrors
+    /// `SoftwarePlaybackHost.inFlightSeekResumeIntent`). A seek entering while another is suspended in
+    /// its off-main reposition (#254) must not read the `isPlaying` its predecessor cleared.
+    private var inFlightSeekResumeIntent = false
+
     /// Guards playing/stop flags: read on demux thread every iteration, written on main actor.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
@@ -176,6 +181,7 @@ final class AudioPlaybackHost {
         // with that sample's PTS. Eager-starting against an empty queue would drop the first samples (silent gap).
         rate = lastRate
         isPlaying = true
+        inFlightSeekResumeIntent = true
     }
 
     func pause() {
@@ -183,6 +189,7 @@ final class AudioPlaybackHost {
         pausedByHost = true
         rate = 0
         isPlaying = false
+        inFlightSeekResumeIntent = false
     }
 
     func setRate(_ newRate: Float) {
@@ -203,7 +210,12 @@ final class AudioPlaybackHost {
         // and it invalidates in-flight packets from the moment the seek starts rather than after it.
         bumpSeekGeneration()
         let generation = seekGeneration
-        let wasPlaying = isPlaying
+        // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
+        // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
+        let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
+                                                  seekInFlight: seekInFlight,
+                                                  inFlightIntent: inFlightSeekResumeIntent)
+        inFlightSeekResumeIntent = wasPlaying
         isPlaying = false
 
         audioDecoder?.flush()
@@ -231,7 +243,9 @@ final class AudioPlaybackHost {
             initialClockTime = targetTime
             return outcome
         }
-        if wasPlaying {
+        // #292: read the intent at the landing, not what this seek captured on entry, so a `pause()` or
+        // `play()` issued during the reposition still decides (mirrors SoftwarePlaybackHost).
+        if inFlightSeekResumeIntent {
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true
         } else {

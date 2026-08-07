@@ -191,7 +191,7 @@ public final class Demuxer: @unchecked Sendable {
     /// #220: sliding-window snapshot of this demuxer's network reader, nil for disc / custom /
     /// file providers that have no window. Surfaced per demuxer (pump and subtitle side reader
     /// are separate readers against the same origin) in the periodic memprobe.
-    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)? {
+    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
         (avioProvider as? AVIOReader)?.windowDiagnostics
     }
 
@@ -348,10 +348,12 @@ public final class Demuxer: @unchecked Sendable {
     /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
     /// no filename is available. `isLive` suppresses SEEK_END that latches EOF
     /// on forward-only readers (38ad60b). AetherEngine#36: DiscReader adapts
-    /// DVD/BD ISOs to VOB/MPEGTS concat streams.
+    /// DVD/BD ISOs to VOB/MPEGTS concat streams unless the reader opts out via
+    /// `discImageProbeEnabled`.
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         self.openProfile = profile
-        if let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
+        if reader.discImageProbeEnabled,
+           let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
             adoptDiscInfo(discInfo)
             let bridge = CustomIOReaderBridge(reader: discInfo.reader)
             let inputFormat = av_find_input_format(discInfo.formatHint)

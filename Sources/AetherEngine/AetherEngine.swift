@@ -103,12 +103,6 @@ public final class AetherEngine: ObservableObject {
     /// regex-matching `EngineLog`.
     @Published public internal(set) var playbackPhase: PlaybackPhase = .idle
 
-    /// First-frame-on-screen latch for the current native session (mirrors NativeAVPlayerHost).
-    /// True once the AVPlayerLayer can actually display video (isReadyForDisplay). Hosts stamp
-    /// "first frame rendered" on this instead of transport state (.playing), which leads the
-    /// first pixel by up to ~1s on slow opens (audio-leads-black-video gap).
-    @Published public internal(set) var isFirstFrameDisplayReady = false
-
     /// Reader source-fetch axis feeding `playbackPhase`. Updated off the demux thread via
     /// `setReaderNetworkPhase`. `didSet` keeps `playbackPhase` in sync (#85).
     private var readerStall: ReaderNetworkPhase = .flowing {
@@ -526,6 +520,43 @@ public final class AetherEngine: ObservableObject {
     /// readiness from currentTime being pinned at 0.
     @Published public internal(set) var isSessionReady = false
 
+    /// #315: the running path has a first frame ready for display, for the media this `load()`
+    /// opened. This is the edge a black cover comes off on; `isSessionReady` is not that edge and
+    /// cannot be made into one.
+    ///
+    /// `isSessionReady` is `AVPlayerItem.readyToPlay`, which AVFoundation reaches before the layer
+    /// holds a picture and which stays true across a seek. Measured on a loopback origin, the
+    /// player's layer reports its first frame ~0.05 s into a load and `timeControlStatus` follows
+    /// at ~0.10 s; on a slow origin those separate by as much as the source is slow, and a load
+    /// opened paused never produces the second one at all. Hosts approximating presentation from
+    /// `phase == .playing/.paused && isSessionReady` therefore lift the cover onto black.
+    ///
+    /// What backs it: `AVPlayerLayer.isReadyForDisplay` on the native path,
+    /// `AVSampleBufferDisplayLayer.isReadyForDisplay` on the software one (below tvOS/iOS 17.4 and
+    /// macOS 14.4, where that property does not exist, the software path falls back to the first
+    /// frame handed to the renderer, one hop earlier than presentation). Audio-only sessions have
+    /// nothing to display and leave it false.
+    ///
+    /// Two things it does NOT claim:
+    ///
+    /// - **Not "the viewer sees it".** It is the pipeline's own statement that a first frame is
+    ///   ready. The engine's layer reaches it even when it is in no view hierarchy (measured), so
+    ///   a host that never bound a surface still gets true here while showing nothing (#298), and
+    ///   an `AVPlayerViewController` host presents through AVKit's own layer a frame or so later.
+    /// - **Not a level.** It is latched for the load: false at every `load()` and at `stop()`, true
+    ///   once and then held. The seams that reuse the running host (media fallback, the wired-HDMI
+    ///   AirPlay master swap, the #93 recovery reload, the AE#158 in-place handover) each drop the
+    ///   layer's picture for a few tens of milliseconds, measured, and this holds true through
+    ///   them: reporting them would make a host re-cover a seam it is deliberately not meant to
+    ///   see, and a falling edge would be ambiguous in exactly the way `SeekEvent` was introduced
+    ///   to fix, since nothing in a level says why it fell. A rebuild that goes back through
+    ///   `load()`, `reloadAtCurrentPosition()` included, does reset it: there the item is genuinely
+    ///   gone and its first frame has to be reached again.
+    ///
+    /// For "has this seek reached the screen", the per-seek answer is `SeekEvent.landed`, not this
+    /// flag: a seek keeps the previous frame up, so the layer never stops being ready for display.
+    @Published public internal(set) var hasFirstFrameReadyForDisplay = false
+
     /// #127: latest host seek issued while the native item was pre-ready; replayed at readiness.
     var pendingPreReadySeekSeconds: Double?
     /// AE#158: set by load() when the running item must survive until the new master attaches (PiP
@@ -737,6 +768,10 @@ public final class AetherEngine: ObservableObject {
     /// (the prefetcher dying, EOF landing) gets its own line instead of waiting for the 30 s
     /// cadence. nil before the first statement of a session.
     var subtitleResolutionLastFrontier: [SubtitleChannel: SubtitleResolutionStatement.Frontier] = [:]
+    /// #318: channels whose current decoded run has already stated determination at the playhead,
+    /// so the crossing is announced once and not on every tick after it. Cleared per channel by
+    /// every reset, because a fresh run's coverage is a fresh question.
+    var subtitleResolutionCoverageStated: Set<SubtitleChannel> = []
     /// #151: subtitle-only forward side reader filling the session packet store up to
     /// playhead + subtitleDrainLeadSeconds independent of the producer's forward park, so the
     /// drainer's lead window holds cues for host-applied ADVANCE sync offsets (text and bitmap).
@@ -889,6 +924,11 @@ public final class AetherEngine: ObservableObject {
     public nonisolated static func setSourceThrottleKbpsForTesting(_ kbps: Int) {
         sourceThrottleKbpsForTesting = max(0, kbps)
     }
+
+    /// TEST-ONLY: scales the reader's reconnect backoff (1.0 = real timing). Read once by each
+    /// `AVIOReader` at init, so set it before `load`/`start`. Lets a bounded give-up that spans
+    /// ~13 exponential backoffs finish in test time instead of a minute of real sleeping.
+    nonisolated(unsafe) static var reconnectBackoffScaleForTesting = 1.0
 
     /// Reads `AVPlayer.eligibleForHDRPlayback` and `AVPlayer.availableHDRModes` at call time.
     /// Eligibility is display-configuration aware on all platforms (its change notification fires
@@ -1155,6 +1195,10 @@ public final class AetherEngine: ObservableObject {
     /// Host observer for per-frame presentation times (#260). Held here so it survives across loads and is
     /// re-installed on each new native session; see `setNativeVideoFrameTimeObserver`.
     var nativeVideoFrameTimeObserver: NativeVideoFrameTimeObserver?
+
+    /// The software path's equivalent (#311), held for the same reason: a `load()` builds a fresh
+    /// host, and the observer has to survive it. See `setSoftwareVideoFrameTimeObserver`.
+    var softwareVideoFrameTimeObserver: SoftwareVideoFrameTimeObserver?
 
     func setPresentationAxis(_ map: PresentationAxisMap) {
         presentationAxis = map
@@ -2341,6 +2385,9 @@ public final class AetherEngine: ObservableObject {
         // #35/#93: a genuinely new item has not rendered yet; re-arm the cold-startup wedge suspension.
         // Scrub/seek/producer-restart never route through load(), so mid-stream #93 detection stays armed.
         hasRenderedFirstFrameMirror.set(false)
+        // The public #315 counterpart is un-latched by the stopInternal() above, which every load()
+        // runs. The seams that reuse the running host call host.load() directly, reach neither, and
+        // keep the latch through their few tens of ms without a picture.
         // Drop disc recognition memoized for the previous media. Track-switch reopens (audio / subtitle
         // side demuxer) deliberately keep it so a remote ISO is parsed once per session (#76); only a
         // genuinely new load clears it, which also keeps custom sources (shared placeholder URL) from
@@ -3708,10 +3755,14 @@ public final class AetherEngine: ObservableObject {
         // Seek has physically landed. #122: preserve the transport intent in effect when the seek
         // was issued: a scrub started while paused lands paused, so the engine never reports playing
         // after a paused scrub and the #93 recovery reassert can't misread the paused landing as a
-        // spurious pause and call host.play(). A seek on any non-native host keeps the prior
-        // `.playing` default (those paths do not carry the durable intent and are not affected).
+        // spurious pause and call host.play().
+        // #292: the SW/audio hosts carry that intent through their seek window now, so read it off
+        // them instead of defaulting to `.playing`. Reporting playing over a host that landed paused
+        // is half of what the #292 report describes. AVPlayer-backed audio keeps the default.
         if let nativeHost {
             reconcileNativeSeekTransport(host: nativeHost, isStarved: false)
+        } else if !audioAVPlayerActive, let hostIsPlaying = softwareHost?.isPlaying ?? audioHost?.isPlaying {
+            state = hostIsPlaying ? .playing : .paused
         } else {
             state = .playing
         }
@@ -4595,7 +4646,6 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
         nativeCancellables.removeAll()
-        isFirstFrameDisplayReady = false
         // AE#158: keepCurrentItem defers the item detach to the next host.load(inPlaceSwap:) so a
         // system PiP window never sees a nil-item gap across a native->native load. Only meaningful
         // together with keepNativeHost; load() computes it via shouldHandOverItemInPlace.
@@ -4606,6 +4656,10 @@ public final class AetherEngine: ObservableObject {
             nativeHost = nil
             currentAVPlayer = nil
         }
+        // #314: detach before stop() so a pump still unwinding does not report frames into a table the
+        // host has already retired for the next item. Only the session's slot is cleared; the engine
+        // keeps the host's observer and re-arms the next session with it in load().
+        nativeVideoSession?.setNativeVideoFrameTimeObserver(nil)
         nativeVideoSession?.stop()
         nativeVideoSession = nil
         nativeSubtitleRenditionsServed = false
@@ -4619,6 +4673,8 @@ public final class AetherEngine: ObservableObject {
         // #127: readiness + deferred host seeks are session-scoped; the host-side sink can't clear them
         // once nativeCancellables are gone.
         isSessionReady = false
+        // #315: session-scoped for the same reason, and the host mirrors are being cut here.
+        hasFirstFrameReadyForDisplay = false
         pendingPreReadySeekSeconds = nil
 
         // Shut down cache-backed scrub-thumbnail FrameExtractors with the session.
@@ -4629,6 +4685,9 @@ public final class AetherEngine: ObservableObject {
         }
 
         softwareCancellables.removeAll()
+        // #314: same detach on the software path, where the outgoing renderer's decode thread is what
+        // can still hand a frame over while the next host comes up.
+        softwareHost?.setVideoFrameTimeObserver(nil)
         softwareHost?.stop()
         softwarePiPSource = nil
         softwareHost = nil

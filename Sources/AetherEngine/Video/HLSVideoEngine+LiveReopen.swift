@@ -255,6 +255,10 @@ extension HLSVideoEngine {
                 + "(\(attempts) failures, cap \(cap)); giving up (source not readable in this session)",
                 category: .session
             )
+            // The session is dead: no producer will be rebuilt and AVPlayer would park
+            // in waitingToPlay forever. Surface the same terminal failure as the
+            // produced-nothing arm so the host can tear down or retry.
+            onVODSourceFailed?(code)
             return
         }
         let frozen = currentPlaybackPositionProvider?() ?? 0

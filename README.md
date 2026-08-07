@@ -134,6 +134,13 @@ player.$playbackPhase  // unified: .idle/.loading/.playing/.paused/.seeking/.reb
                        // .stalled(reconnecting:)/.ended/.error. One source of truth for a status
                        // spinner; derived from state + isBuffering + isSeeking + source reconnect.
                        // Prefer this over stitching the raw signals or matching EngineLog text.
+player.$hasFirstFrameReadyForDisplay
+                       // the running path has a first frame ready for display, for the media THIS
+                       // load opened: the edge a black cover comes off on. readyToPlay is not that
+                       // edge (AVFoundation reaches it before the layer holds a picture, and it
+                       // stays true across a seek), so a cover lifted on isSessionReady lifts onto
+                       // black. Latched for the load, false again at the next load() / stop().
+                       // For "has this seek reached the screen" use seekEvents .landed instead.
 player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession)
 
 // System Now-Playing on the native video path (tvOS / iOS). Off by default: an
@@ -216,17 +223,28 @@ player.$currentAVPlayerItem                       // items swap in place; this i
 
 // Per muxed video frame, on both axes at once. Called on the producer's pump thread in DECODE order,
 // so `source` is not monotonic under B-frames; sort before using it as a frame-boundary list.
+// `epoch` rises strictly, process-wide: a restart and a load() both continue the sequence, so
+// "a higher epoch retires my older entries" separates one item's frames from the next's.
 player.setNativeVideoFrameTimeObserver { frame in
     frame.source; frame.item; frame.segmentIndex; frame.isKeyframe; frame.epoch
 }
+
+// The same question on the software path (#311), where the engine decodes and enqueues the source
+// timestamp unchanged: one axis, no segments, and the reports arrive past the reorder buffer in
+// ASCENDING presentation order. `generation` moves on every renderer flush, i.e. on a seek, and
+// rises across a load() the same way `epoch` does.
+player.softwarePresentationTimebase               // the master clock, on the source axis
+player.setSoftwareVideoFrameTimeObserver { frame in
+    frame.presentation; frame.generation
+}
 ```
 
-Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
+Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. On the software path neither is needed: `softwarePresentationTimebase` hands out the clock the frames are presented against and `setSoftwareVideoFrameTimeObserver` reports them, both on the same axis as the cues. Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
 
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.5.6")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.13.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -242,9 +260,13 @@ final class MyArchiveReader: IOReader {
     func seek(offset: Int64, whence: Int32) -> Int64 { /* ... */ }  // AVSEEK_SIZE (65536) returns total size
     func close() { /* ... */ }
 
-    // Optional (both have defaults). Override to unlock extra features:
+    // Optional requirements have defaults. Override to unlock extra features:
     func cancel() { /* unblock a blocked read at teardown, do NOT invalidate the reader */ }
     func makeIndependentReader() -> IOReader? { /* a fresh cursor over the same source, or nil */ }
+
+    // Optional, defaults to true. Return false when this is known to be an
+    // ordinary media file rather than a raw ISO/UDF disc image.
+    var discImageProbeEnabled: Bool { false }
 }
 
 let probe = try await engine.load(source: .custom(MyArchiveReader(), formatHint: "mp4"))
@@ -265,8 +287,15 @@ let smb = try await SMBConnection.connect(
     server: URL(string: "smb://nas.local")!, share: "media",
     path: "Movies/film.mkv", user: "alice", password: "s3cret"
 )
-try await engine.load(source: .custom(SMBIOReader(source: smb), formatHint: "matroska"))
+try await engine.load(source: .custom(
+    SMBIOReader(source: smb),
+    formatHint: "matroska"
+))
 ```
+
+When the SMB path is known to be an ordinary media file, construct the reader with
+`discImageProbeEnabled: false` to skip ISO/UDF signature reads. Keep the default for raw disc
+images so DVD/Blu-ray recognition remains available.
 
 Read-only, NTLMv2 / guest auth (no Kerberos). On tvOS the host must declare `NSLocalNetworkUsageDescription` + the local-network entitlement to reach a LAN share. See [`aetherctl smbtest`](docs/cli.md#smbtest) to validate a share from macOS.
 
@@ -333,6 +362,18 @@ try await engine.load(url: url, options: LoadOptions(
 
 > **Custom chrome with a SwiftUI `Menu`?** On tvOS 26 an open `Menu`'s focused row blinks on any render transaction in the tree. Build the menu button in UIKit (`UIButton.menu` + `showsMenuAsPrimaryAction`) and guard `updateUIView` so the open dropdown never rebuilds. Pattern in [docs/architecture.md › SwiftUI Menu](docs/architecture.md#swiftui-menu-in-custom-player-chrome).
 
+## Diagnostics
+
+Every diagnostic line the engine emits goes to `os.Logger` under the subsystem `de.superuser404.AetherEngine`, one category per subsystem (`engine`, `session`, `demux`, `muxer`, `hls.server`, `audio.bridge`, `sw.playback`, `scrub`, `ffmpeg`). Release builds keep emitting; Console.app against the attached device, or `log stream --predicate 'subsystem == "de.superuser404.AetherEngine"'`, shows them without a debugger attached.
+
+A test rig that only captures stdout / stderr (`devicectl device process launch --console`, CI harnesses) sees none of that, because os_log is not stdio. Mirror the same lines into your own capture path with the host handler:
+
+```swift
+EngineLog.handler = { print($0) }   // every info-level line, verbatim
+```
+
+The handler fires from whatever thread emitted the line (demuxer, producer pump, local server, audio bridge), so it must be thread-safe and non-blocking; serialize onto a queue before writing to a file. Per-segment trace lines are emitted at `.verbose` and reach os_log's debug level only, never the handler, so the mirrored stream stays readable. `aetherctl` installs exactly this handler, which is why the CLI prints what the app hides.
+
 ## Non-goals
 
 Things AetherEngine deliberately doesn't do, so you don't have to read the source to find out:
@@ -358,10 +399,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.5.6")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.13.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.5.6")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.13.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

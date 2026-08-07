@@ -15,6 +15,13 @@ public protocol IOReader: AnyObject, Sendable {
 
     /// Return an independent reader with its own cursor over the same source for concurrent access (side demuxer, scrub previews). Return nil for one-shot streams; the engine skips that feature. The returned reader is owned and closed by the engine.
     func makeIndependentReader() -> IOReader?
+
+    /// Whether the engine should inspect this custom byte source for an ISO/UDF disc image before
+    /// opening it as an ordinary media container. Keep the default for raw disc images. Remote
+    /// readers that already know they represent a regular media file can return `false` to avoid
+    /// the sparse signature reads performed by disc recognition. Independent readers should
+    /// preserve the same value.
+    var discImageProbeEnabled: Bool { get }
 }
 
 /// Internal seam for finite segmented sources whose natural seek axis is time,
@@ -43,6 +50,7 @@ extension TimeSeekableIOReader {
 public extension IOReader {
     func cancel() {}
     func makeIndependentReader() -> IOReader? { nil }
+    var discImageProbeEnabled: Bool { true }
 }
 
 /// The source AetherEngine loads media from.

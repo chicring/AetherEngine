@@ -110,7 +110,15 @@ enum RemoteHLSIngestFallback {
         if advertisesVideo == false { return false }
         guard advertisesVideo == true else { return true }
         guard !advertisedVideoCodecs.isEmpty else { return true }
-        return advertisedVideoCodecs.contains { fragmentedMP4OnlyVideoCodecs.contains($0) }
+        return advertisesFragmentedMP4OnlyVideo(advertisedVideoCodecs)
+    }
+
+    /// #296: whether the master's own `CODECS` names a sample type the HLS Authoring Spec sanctions in
+    /// fMP4 alone. Combined with a media playlist that carries no `EXT-X-MAP` (an fMP4 media segment
+    /// requires one), this settles the carriage from the playlists, so the probe spends no segment fetch
+    /// on the shape that produced #293 in the first place.
+    static func advertisesFragmentedMP4OnlyVideo(_ advertisedVideoCodecs: [FourCharCode]) -> Bool {
+        advertisedVideoCodecs.contains { fragmentedMP4OnlyVideoCodecs.contains($0) }
     }
 
     /// #199: a load whose master already fired the carriage verdict (`RerouteVerdictMemory`) routes

@@ -5,6 +5,10 @@ import Foundation
 /// after it. Same evidence chain #268 uses for finite VOD, minus the VOD-only requirements (no
 /// EXT-X-ENDLIST, no duration axis), so a rolling live window can be judged as well.
 ///
+/// AE#296: two stages, because they cost different things. The playlist stage is free of a per-token
+/// connection cap and settles every source whose playlists already carry the answer; only what is left
+/// reaches a segment, and the caller spends that read once a lost connection can no longer cost the mount.
+///
 /// Never throws: a caller acts on positive evidence only, so every failure collapses to `inconclusive`
 /// and leaves the source on the route it is already taking.
 enum HLSCarriageProbe {
@@ -25,34 +29,82 @@ enum HLSCarriageProbe {
         return URLSession(configuration: configuration)
     }()
 
-    private enum PlaylistOutcome {
-        case segment(URL)
+    /// AE#296: what the playlist chain established, and whether a media byte is still needed to settle it.
+    /// The two stages are separated because they have different costs: playlists are free of a per-token
+    /// connection cap, a segment fetch is not.
+    enum PlaylistEvidence: Equatable {
+        /// Answered from the playlists alone; no segment was fetched.
         case settled(MPEGTransportStreamCodecProbe.Verdict)
+        /// Only this segment's PMT separates the carriages here.
+        case needsSegmentHead(URL)
     }
 
-    /// Classifies the carriage behind a master or media playlist URL. Costs one playlist fetch for a
-    /// media playlist, two for a master, plus a bounded ranged read of one segment head. An `EXT-X-MAP`
-    /// settles it as fMP4 before any segment byte is fetched.
-    static func classifyLiveCarriage(
+    /// AE#296: the playlist stage. Costs one playlist fetch for a media playlist, two for a master, and
+    /// never a media byte, so it can run against the native mount on a connection-capped origin.
+    ///
+    /// It settles the case outright when the playlists already carry the answer: an `EXT-X-MAP` is fMP4
+    /// carriage, and an fMP4-only advertised codec (`advertisesFragmentedMP4OnlyVideo`, from the master
+    /// `CODECS` AVFoundation has already parsed) *without* an `EXT-X-MAP` is that codec in MPEG-TS, since
+    /// an fMP4 media segment requires an EXT-X-MAP (RFC 8216 4.3.2.5). Everything else hands back the
+    /// segment whose PMT decides it, for the caller to spend when a lost connection can no longer cost
+    /// the mount.
+    static func classifyFromPlaylists(
         playlistURL: URL,
+        httpHeaders: [String: String],
+        advertisesFragmentedMP4OnlyVideo: Bool,
+        session: URLSession? = nil
+    ) async -> PlaylistEvidence {
+        do {
+            return try await resolveFirstSegment(
+                playlistURL: playlistURL,
+                httpHeaders: httpHeaders,
+                advertisesFragmentedMP4OnlyVideo: advertisesFragmentedMP4OnlyVideo,
+                session: session ?? sharedSession
+            )
+        } catch {
+            EngineLog.emit("[HLSCarriageProbe] carriage probe inconclusive: \(error)", category: .engine)
+            return .settled(.inconclusive)
+        }
+    }
+
+    /// AE#296: the segment stage, run apart from the playlist stage so the one media byte the probe ever
+    /// spends is spent where losing it costs the verdict rather than the mount. Never throws: an origin
+    /// that refuses this read leaves the source on the route it is already taking.
+    static func classifyDeferredSegmentHead(
+        url: URL,
         httpHeaders: [String: String],
         session: URLSession? = nil
     ) async -> MPEGTransportStreamCodecProbe.Verdict {
-        let session = session ?? sharedSession
         do {
-            switch try await resolveFirstSegment(
-                playlistURL: playlistURL, httpHeaders: httpHeaders, session: session
-            ) {
-            case .settled(let verdict):
-                return verdict
-            case .segment(let segmentURL):
-                return try await classifySegmentHead(
-                    url: segmentURL, httpHeaders: httpHeaders, session: session
-                )
-            }
+            return try await classifySegmentHead(
+                url: url, httpHeaders: httpHeaders, session: session ?? sharedSession
+            )
         } catch {
             EngineLog.emit("[HLSCarriageProbe] carriage probe inconclusive: \(error)", category: .engine)
             return .inconclusive
+        }
+    }
+
+    /// Both stages back to back. The host runs them at different times (AE#296); this is the composed
+    /// chain for harnesses and tests that want one verdict.
+    static func classifyLiveCarriage(
+        playlistURL: URL,
+        httpHeaders: [String: String],
+        advertisesFragmentedMP4OnlyVideo: Bool = false,
+        session: URLSession? = nil
+    ) async -> MPEGTransportStreamCodecProbe.Verdict {
+        switch await classifyFromPlaylists(
+            playlistURL: playlistURL,
+            httpHeaders: httpHeaders,
+            advertisesFragmentedMP4OnlyVideo: advertisesFragmentedMP4OnlyVideo,
+            session: session
+        ) {
+        case .settled(let verdict):
+            return verdict
+        case .needsSegmentHead(let segmentURL):
+            return await classifyDeferredSegmentHead(
+                url: segmentURL, httpHeaders: httpHeaders, session: session
+            )
         }
     }
 
@@ -96,8 +148,9 @@ enum HLSCarriageProbe {
     private static func resolveFirstSegment(
         playlistURL: URL,
         httpHeaders: [String: String],
+        advertisesFragmentedMP4OnlyVideo: Bool,
         session: URLSession
-    ) async throws -> PlaylistOutcome {
+    ) async throws -> PlaylistEvidence {
         let (root, rootURL) = try await fetchPlaylist(playlistURL, httpHeaders: httpHeaders, session: session)
         let media: HLSMediaPlaylist
         let mediaURL: URL
@@ -119,6 +172,13 @@ enum HLSCarriageProbe {
         }
         // fMP4 carriage is what AVFoundation wants; the playlist says so before a segment is touched.
         guard !media.hasMap else { return .settled(.otherCarriage) }
+        // AE#296: an fMP4 media segment requires an EXT-X-MAP, so an fMP4-only codec advertised over a
+        // window that has none is that codec in MPEG-TS, settled without a media connection. Encryption
+        // does not block this branch the way it blocks the PMT read (nothing is being decrypted here),
+        // except where the ingest could not serve the carriage anyway.
+        if advertisesFragmentedMP4OnlyVideo, !media.hasUnsupportedEncryption, !media.segments.isEmpty {
+            return .settled(.hevcInMPEGTS)
+        }
         // An encrypted segment hides its PMT, and an absence of evidence never reroutes.
         guard let first = media.segments.first,
               first.crypt == nil,
@@ -126,7 +186,7 @@ enum HLSCarriageProbe {
               let segmentURL = HLSPlaylistParser.resolve(uri: first.uri, against: mediaURL) else {
             return .settled(.inconclusive)
         }
-        return .segment(segmentURL)
+        return .needsSegmentHead(segmentURL)
     }
 
     private static func fetchPlaylist(

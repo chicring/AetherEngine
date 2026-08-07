@@ -139,14 +139,16 @@ Sources/AetherEngine/
 ├── AetherEngine+ClosedCaptions.swift        In-band CEA-608 closed captions + A53/SEI extraction: ClosedCaptionTap (read-only producer observer) + cue mirroring (#77, #131)
 ├── AetherEngine+Live.swift                  Live window publishing, edge snap, resume clamp, scrub thumbnails
 ├── AetherEngine+Diagnostics.swift           Memory probe + live-telemetry bridge
-├── AetherEngine+SubtitleResolution.swift    Emission of the #250 subtitle-resolution statement: one generation-fenced line stating the absolute source-time span display state has been decoded over, at post-seek reconstruction, the 30 s cadence, prefetcher EOF, and any change of frontier source; `retainedFrom=` additionally states the floor of the run RETAINED across seeks, so "empty because nothing was ever authored before this point" is provable from a post-seek line alone (#276)
+├── AetherEngine+SubtitleResolution.swift    Emission of the #250 subtitle-resolution statement: one generation-fenced line stating the absolute source-time span display state has been decoded over, at post-seek reconstruction, the 30 s cadence, prefetcher EOF, any change of frontier source, and the tick where determination first reaches the playhead (`reason=coverage`, #318); `retainedFrom=` additionally states the floor of the run RETAINED across seeks, so "empty because nothing was ever authored before this point" is provable from a post-seek line alone (#276)
 ├── AetherEngine+AudioTap.swift              Opt-in decoded PCM audio tap (#95): installAudioTap() vends the AsyncStream, dispatches native-loopback vs remote-HLS vs SW-mirror
 ├── AetherEngine+BackgroundAudioTestHooks.swift DEBUG-only hooks letting aetherctl bgaudio toggle the SW background-audio keepalive without a UIApplication lifecycle (never shipped)
 ├── PlaybackClock.swift                      engine.clock: the ~10 Hz ticking values (currentTime, sourceTime, bufferedPosition, progress, live-edge fields) as a separate ObservableObject
 ├── PresentationAxis.swift                   Display-axis fold for disc titles (source PTS <-> 0-based published axis, AE#105)
 ├── PresentationAxisMap.swift                Source axis <-> item axis (#260): the seam history of producer shifts as a piecewise-constant map, plus its off-main mirror. Written by the shift-changed / rebased handlers, read by the clock fold, the live thumbnail path and hosts
 ├── NativeVideoFrameTime.swift               Per-muxed-frame presentation times on both axes (#260): the value type + observer typealias; emitted from HLSSegmentProducer.finalizeAndWriteVideo
-├── AetherEngine+FrameTimes.swift            Public installer for the per-frame time observer, re-armed on each native session
+├── SoftwareVideoFrameTime.swift             Per-enqueued-frame presentation time on the software path (#311): one axis (source == presentation there), plus a flush generation that a seek moves; emitted from SampleBufferRenderer.flushFrame
+├── AetherEngine+FrameTimes.swift            Public installers for both per-frame time observers (native re-armed on each session, software on each host) plus `softwarePresentationTimebase`, the render synchronizer's clock
+├── FrameTimeSequence.swift                  Process-wide monotonic allocator behind NativeVideoFrameTime.epoch and SoftwareVideoFrameTime.generation (#314), so the ordering rule holds across a load() and not only inside one session
 ├── PlayerState.swift                        PlaybackState, PlaybackPhase, VideoFormat, PlaybackBackend, LoadOptions, SourceProbe, TrackInfo, FontAttachment, MediaMetadata, SubtitleCue, SubtitleImage
 ├── LiveReloadPolicy.swift                   Pure decision functions for live reloads: rejoin at the live edge (no stale resume position), skip the pre-readiness zero seek
 ├── TransportControllable.swift              Common transport surface of the four playback hosts (single active-host dispatch)
@@ -196,7 +198,7 @@ Sources/AetherEngine/
 │   ├── EngineDiagnostics.swift              engine.diagnostics: timer-sampled values (liveTelemetry) as a separate ObservableObject
 │   ├── EngineLog.swift                      Gated OSLog emission with severity levels (.verbose suppressed from default + host handler)
 │   ├── FFmpegLogBridge.swift                av_log_set_callback funnel: FFmpeg's internal warnings surface through EngineLog
-│   ├── LiveTelemetry.swift                  Value type emitted at 1 Hz: instant / avg bitrate, buffer, network, dropped frames, observed FPS, A/V sync gap, plus subsystem byte counters
+│   ├── LiveTelemetry.swift                  Value type emitted at 1 Hz: instant / avg bitrate, buffer, network, dropped frames, observed FPS, A/V sync gap, plus subsystem byte counters. The software path reports its own read bytes, throughput, reader runway (`readerWindowAheadBytes`), decoded cushion (`displayCushionSeconds`) and dropped / late frames (#306); `forwardBufferSeconds` stays nil there because a renderer-back-pressured pump holds no seconds-deep reservoir to report
 │   ├── FourCC.swift                         Printable FourCC rendering for codec-tag diagnostics
 │   ├── LiveTelemetrySampler.swift           @MainActor 1 Hz sampler that reads existing subsystem counters and assembles LiveTelemetry snapshots
 │   ├── PacketBalanceTracker.swift           Process-wide AVPacket alloc/free balance counter for leak diagnostics
