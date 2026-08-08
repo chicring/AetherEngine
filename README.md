@@ -134,6 +134,13 @@ player.$playbackPhase  // unified: .idle/.loading/.playing/.paused/.seeking/.reb
                        // .stalled(reconnecting:)/.ended/.error. One source of truth for a status
                        // spinner; derived from state + isBuffering + isSeeking + source reconnect.
                        // Prefer this over stitching the raw signals or matching EngineLog text.
+player.$videoRoute     // pipeline actually serving the session: .remoteBypass (AVPlayer on the
+                       // origin URL) / .loopback / .software / .audio / .none. LoadOptions
+                       // .nativeRemoteHLS is only the request: the carriage watchdog, the
+                       // remembered verdict and the HLS reroutes move a session between the
+                       // bypass and the loopback, mid-session too. Branch on this where behaviour
+                       // differs per pipeline, above all who draws subtitles: on .remoteBypass
+                       // AVPlayer renders the origin's renditions, elsewhere the host renders.
 player.$hasFirstFrameReadyForDisplay
                        // the running path has a first frame ready for display, for the media THIS
                        // load opened: the edge a black cover comes off on. readyToPlay is not that
@@ -141,7 +148,13 @@ player.$hasFirstFrameReadyForDisplay
                        // stays true across a seek), so a cover lifted on isSessionReady lifts onto
                        // black. Latched for the load, false again at the next load() / stop().
                        // For "has this seek reached the screen" use seekEvents .landed instead.
-player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession)
+player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession).
+                       // nil on the .software route: that pipeline renders into its own display
+                       // layer, and the property is cleared so AVKit cannot hold a player nothing
+                       // feeds any more. A host that only ever hands currentAVPlayer to an
+                       // AVPlayerViewController therefore gets audio and AVKit's own spinner over an
+                       // empty video plane on that route (#298). Bind a surface for it, and pick the
+                       // presentation off $videoRoute rather than off the source's codec.
 
 // System Now-Playing on the native video path (tvOS / iOS). Off by default: an
 // AVPlayerViewController host already gets this from AVKit and must NOT opt in.
@@ -244,7 +257,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.13.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.15.1")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -336,6 +349,8 @@ A live channel whose master advertises HEVC (or Dolby Vision / AV1) while delive
 
 A non-live remote `m3u8` handed to the default (loopback) path reroutes onto this bypass automatically: the bundled FFmpeg is built without network support, so the playlist can never be demuxed locally, and remote HLS is AVPlayer's native domain anyway (#154). On the bypass the engine surfaces the stream's external WebVTT subtitle renditions (the legible `AVMediaSelectionGroup`) as `subtitleTracks`; `selectSubtitleTrack(index:)` and `clearSubtitle()` drive AVPlayer's media selection, and AVPlayer renders the cues itself.
 
+Sidecar subtitles declared in `LoadOptions.externalSubtitles` become renditions on this bypass too (#316). Media selection on an HLS asset comes from the playlist and nowhere else, so for a VOD source the engine fetches the origin master, rewrites every variant, audio and key URI to an absolute origin URL, adds one `EXT-X-MEDIA:TYPE=SUBTITLES` entry per sidecar, and serves that master from the loopback origin. AVPlayer still fetches all A/V bytes straight from the origin, so E-AC-3 / Atmos passthrough is untouched; only the master and the WebVTT renditions are local. The tracks keep the external ids they were registered under, and selecting one drives media selection instead of the host overlay, so the subtitle survives PiP, AirPlay and a wired external display. Live sources (no `EXT-X-ENDLIST`), bitmap sidecars, a playlist that will not rewrite and a slow origin all fall back to playing the origin URL with host-overlay subtitles, which is the behaviour before #316; the load is never failed over this.
+
 ## Host setup on tvOS
 
 For HDR / Dolby Vision sources to play reliably on tvOS 26.5+, the engine must drive `AVDisplayManager.preferredDisplayCriteria` itself (synchronously, before the AVPlayerItem assignment). Apple Tech Talk 503 has prescribed this ordering since 2017, and tvOS 26.5 now enforces it synchronously at HLS variant validation: the validator rejects variants whose `VIDEO-RANGE` the panel can't currently host with `AVFoundationErrorDomain -11868`, before fetching the `EXT-X-MAP` init segment, producing `item.status = .failed` with zero `errorLog().events`. SDR variants are unaffected.
@@ -399,10 +414,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.13.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.15.1")
 ```
 
-Pin to `.upToNextMinor(from: "6.13.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.15.1")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

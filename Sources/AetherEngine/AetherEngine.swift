@@ -485,8 +485,29 @@ public final class AetherEngine: ObservableObject {
     var sourceStartSeconds: Double = 0
 
     /// Active playback backend: `.native` (AVPlayer) or `.software` (SoftwarePlaybackHost/dav1d/libavcodec).
-    /// Exposed for diagnostic overlays; hosts should not branch on it.
-    @Published public internal(set) var playbackBackend: PlaybackBackend = .none
+    /// Exposed for diagnostic overlays; hosts should not branch on it. Branch on `videoRoute` instead,
+    /// which also separates the two native pipelines (#321).
+    @Published public internal(set) var playbackBackend: PlaybackBackend = .none {
+        didSet { recomputeVideoRoute() }
+    }
+
+    /// Pipeline actually serving this session (#321), including the reroutes the host never asked for.
+    /// Derived from `playbackBackend` + `loadedOptions.nativeRemoteHLS`, the two properties every reroute
+    /// site already writes, so it cannot desync from them. See `VideoRoute` for the transitions.
+    @Published public internal(set) var videoRoute: VideoRoute = .none
+
+    /// Idempotent: assigns only on a real change, so options writes that leave the route alone (the
+    /// per-reopen replay) do not flap the publisher. Logs every route the session takes; the drop to
+    /// `.none` is teardown, which carries no route information and is already loud in the log.
+    private func recomputeVideoRoute() {
+        let next = VideoRoute.derive(backend: playbackBackend,
+                                     nativeRemoteHLS: loadedOptions.nativeRemoteHLS)
+        guard videoRoute != next else { return }
+        videoRoute = next
+        if next != .none {
+            EngineLog.emit("[AetherEngine] #321: effective video route = \(next.rawValue)", category: .engine)
+        }
+    }
 
     /// Master enable for background playback (iOS: PiP + background audio; tvOS: PiP keepalive). Default on.
     public var backgroundPlaybackEnabled = true
@@ -1223,8 +1244,11 @@ public final class AetherEngine: ObservableObject {
     /// subtitle side-demuxer, background reload) so auth, matchContentEnabled, and dvh1 tag survive pipeline
     /// rebuilds. Without replay, audio-switch was silently reverting matchContentEnabled=true to false, causing
     /// HDR HEVC to route via the master playlist on a non-DV panel and surface "Öffnen fehlgeschlagen".
-    /// Read by AetherEngine+FrameExtractor.
-    private(set) var loadedOptions: LoadOptions = .init()
+    /// Read by AetherEngine+FrameExtractor. Every internal reroute (#154, #168, #199, #246, #268) reaches
+    /// the published route through this property, so its writes feed `recomputeVideoRoute` (#321).
+    private(set) var loadedOptions: LoadOptions = .init() {
+        didSet { recomputeVideoRoute() }
+    }
 
     #if DEBUG
     /// Test-only: install LoadOptions without a load (#88 unit tests exercise selection gating).
@@ -1336,6 +1360,16 @@ public final class AetherEngine: ObservableObject {
     /// AE#154: publishes the remote-HLS bypass item's legible options as `subtitleTracks`.
     /// Session-scoped; cancelled on load()/stop() alongside the other subtitle tasks.
     var remoteHLSSubtitleDiscoveryTask: Task<Void, Never>? = nil
+
+    /// #316: the loopback origin standing in front of a remote HLS master to carry the host's declared
+    /// sidecars as legible renditions. Nil whenever the bypass plays the origin URL directly, which is
+    /// every live source, every source without declared sidecars, and every refused rewrite.
+    var remoteHLSSubtitleProxy: RemoteHLSSubtitleProxy.Prepared?
+
+    /// #316: external track id -> the NAME its injected rendition carries in the served master. Selecting
+    /// one of these must drive AVMediaSelection, not the sidecar overlay, or the two draw on top of
+    /// each other. Empty when no proxy is standing.
+    var injectedSubtitleRenditionNames: [Int: String] = [:]
 
     /// Deferred lazy-reader start while a producer restart is in flight (#93 residual): the
     /// readers' side demuxer competed with the restart for the starved link. Cancelled by
@@ -2444,6 +2478,9 @@ public final class AetherEngine: ObservableObject {
         resetSubtitleOCRState()   // Phase D: new session, new axis
         remoteHLSSubtitleDiscoveryTask?.cancel()
         remoteHLSSubtitleDiscoveryTask = nil
+        remoteHLSSubtitleProxy?.tearDown()   // #316
+        remoteHLSSubtitleProxy = nil
+        injectedSubtitleRenditionNames = [:]
         stallRecoveryWindowUntil = .distantPast
         stallRecoveryReasserts = 0
         stallReengageTask?.cancel()
@@ -2484,6 +2521,9 @@ public final class AetherEngine: ObservableObject {
         // nativeRemoteHLS: skip probe + loopback; play HLS URL directly with AVPlayer (Jellyfin already serves HLS).
         // Routed before the probe because we never demux the m3u8.
         if options.nativeRemoteHLS {
+            // #316: this bypass returns before the probe path's registration, so a host that declared
+            // sidecars at load time used to get nothing at all, silently. Seat them here instead.
+            registerDeclaredExternalSubtitles(options)
             do {
                 // AE#246: a VOD playlist honors the resume anchor here the same way the AE#154 reroute
                 // does; without it a rerouted (or directly requested) VOD bypass always restarted at 0.
@@ -2617,6 +2657,8 @@ public final class AetherEngine: ObservableObject {
             }
             EngineLog.emit("[AetherEngine] AE#154: HLS playlist on the VOD loopback path; rerouting to the native remote-HLS bypass", category: .engine)
             loadedOptions.nativeRemoteHLS = true
+            // #316: the reroute returns before the registration below, same as the direct bypass.
+            registerDeclaredExternalSubtitles(loadedOptions)
             do {
                 try await loadRemoteHLS(url: hlsURL, options: loadedOptions, startPosition: startPosition)
             } catch is CancellationError {
@@ -2653,11 +2695,7 @@ public final class AetherEngine: ObservableObject {
         // instead: mid-session adds survive with their ids (and, registered pre-table, become
         // rendition-eligible on the reloaded item); mid-session removals stay removed; the host's
         // subtitle authority carries over so the load-end auto-selection cannot override it.
-        if let carryover = options.subtitleSessionCarryover {
-            applySubtitleSessionCarryoverRegistrations(carryover)
-        } else {
-            for track in options.externalSubtitles { registerExternalSubtitleTrack(track) }
-        }
+        registerDeclaredExternalSubtitles(options)
         metadata = probeOpened ? probe.mediaMetadata() : nil
         fontAttachments = probeOpened ? probe.fontAttachmentInfos() : []
         // Disc titles/chapters off the probe demuxer (post-detach, on MainActor) so the host can populate
@@ -3934,6 +3972,11 @@ public final class AetherEngine: ObservableObject {
         resetSubtitleOCRState()   // Phase D: new session, new axis
         remoteHLSSubtitleDiscoveryTask?.cancel()
         remoteHLSSubtitleDiscoveryTask = nil
+        // #316: the proxy serves exactly one session's master; a standing socket outliving it would keep a
+        // port and a decode task alive for a source nobody plays any more.
+        remoteHLSSubtitleProxy?.tearDown()
+        remoteHLSSubtitleProxy = nil
+        injectedSubtitleRenditionNames = [:]
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []

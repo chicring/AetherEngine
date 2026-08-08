@@ -230,7 +230,9 @@ enum HLSPlaylistParser {
     }
 
     /// Extract a KEY=VALUE attribute from a tag line, tolerating quoted values. Match is anchored to `:` or `,` before the key: bare substring search matched `BANDWIDTH=` inside `AVERAGE-BANDWIDTH=` and caused wrong variant selection.
-    private static func attribute(_ key: String, in line: String) -> String? {
+    /// Internal rather than private since #316: the master rewriter reads the same attributes off the
+    /// same tag lines, and a second parser would be a second place for the anchoring trap to reappear.
+    static func attribute(_ key: String, in line: String) -> String? {
         let needle = "\(key)="
         var searchStart = line.startIndex
         while let range = line.range(of: needle, range: searchStart..<line.endIndex) {

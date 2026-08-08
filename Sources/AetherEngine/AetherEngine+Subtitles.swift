@@ -43,6 +43,13 @@ extension AetherEngine {
         // Phase D: every selection change disarms the OCR worker first; the embedded bitmap
         // branch below re-arms it (cursors persist, so a reselect resumes coverage).
         cancelSubtitleOCRWorker()
+        // #316: an external track the remote-HLS proxy declared as a rendition is rendered by AVPlayer
+        // itself, so it must NOT also start a sidecar decode; the overlay would draw the same cues a
+        // second time, and only the rendition survives PiP / AirPlay / an external display.
+        if let renditionName = injectedSubtitleRenditionNames[index] {
+            selectInjectedSubtitleRendition(id: index, name: renditionName)
+            return
+        }
         // #88: external ids route onto the sidecar decode path; no side demuxer, no loadedURL needed.
         if let external = externalSubtitleRegistry[index] {
             selectExternalSubtitleTrack(id: index, track: external)
@@ -956,6 +963,25 @@ extension AetherEngine {
         return info
     }
 
+    /// #88: seat the load-declared external tracks in `subtitleTracks`. On the probe path this runs
+    /// BEFORE preferred-language selection and the native rendition table are built from the list.
+    ///
+    /// #170: a session-preserving reload seeds the previous session's registry verbatim instead:
+    /// mid-session adds survive with their ids (and, registered pre-table, become rendition-eligible on
+    /// the reloaded item); mid-session removals stay removed; the host's subtitle authority carries over
+    /// so the load-end auto-selection cannot override it.
+    ///
+    /// #316: the nativeRemoteHLS bypass and the AE#154 reroute return long before the probe path reaches
+    /// this point, so both call it themselves. Without that a host declaring sidecars on a remote-HLS
+    /// source got nothing back and no diagnostic: the option was read, then dropped at the branch.
+    func registerDeclaredExternalSubtitles(_ options: LoadOptions) {
+        if let carryover = options.subtitleSessionCarryover {
+            applySubtitleSessionCarryoverRegistrations(carryover)
+        } else {
+            for track in options.externalSubtitles { registerExternalSubtitleTrack(track) }
+        }
+    }
+
     /// Registration without the preference re-run; the load path runs its own selection at load end.
     @discardableResult
     func registerExternalSubtitleTrack(_ track: ExternalSubtitleTrack) -> TrackInfo {
@@ -1185,8 +1211,10 @@ extension AetherEngine {
         // AE#154: a remote-HLS legible selection lives in AVMediaSelection, not the overlay
         // pipeline; deselect it on the item (criteria pinned manual so system caption prefs
         // don't immediately re-select).
+        // #316: an injected external rendition is the same kind of selection, under an external id.
         if let active = activeSubtitleTrackIndex,
-           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil,
+           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil
+            || injectedSubtitleRenditionNames[active] != nil,
            let item = currentAVPlayer?.currentItem {
             Task { @MainActor in
                 self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
@@ -2002,18 +2030,26 @@ extension AetherEngine {
             guard let group, !group.options.isEmpty else { return }
             guard let self, !Task.isCancelled,
                   self.currentAVPlayer?.currentItem === item else { return }
-            let snapshots = group.options.map { option in
-                RemoteHLSMediaSelection.LegibleOption(
+            var snapshots: [RemoteHLSMediaSelection.LegibleOption] = []
+            for option in group.options {
+                snapshots.append(RemoteHLSMediaSelection.LegibleOption(
                     displayName: option.displayName,
                     extendedLanguageTag: option.extendedLanguageTag,
                     isDefault: group.defaultOption == option,
                     isForced: option.hasMediaCharacteristic(.containsOnlyForcedSubtitles),
                     isSDH: option.hasMediaCharacteristic(.transcribesSpokenDialogForAccessibility)
-                        && option.hasMediaCharacteristic(.describesMusicAndSoundForAccessibility))
+                        && option.hasMediaCharacteristic(.describesMusicAndSoundForAccessibility),
+                    playlistName: await RemoteHLSMediaSelection.playlistName(of: option)))
             }
-            self.subtitleTracks = RemoteHLSMediaSelection.subtitleTrackInfos(from: snapshots)
+            // #316: merge, don't assign; the host's load-declared external tracks must survive. The
+            // renditions the proxy injected for those same tracks are dropped here: they are already
+            // listed under their external ids, and a second entry would offer one file as two tracks.
+            let injected = Set(self.injectedSubtitleRenditionNames.values)
+            self.subtitleTracks = RemoteHLSMediaSelection.mergedSubtitleTracks(
+                existing: self.subtitleTracks, legible: snapshots, injectedNames: injected)
             EngineLog.emit(
-                "[AetherEngine] AE#154: remote-HLS legible group surfaced \(group.options.count) subtitle rendition(s)",
+                "[AetherEngine] AE#154: remote-HLS legible group surfaced \(group.options.count) subtitle "
+                + "rendition(s)\(injected.isEmpty ? "" : ", \(injected.count) of them engine-injected (#316)")",
                 category: .engine)
             // Selection mirror after readiness: AVKit / caption-pref auto-select runs at readyToPlay,
             // later than the group load above.
@@ -2022,12 +2058,59 @@ extension AetherEngine {
                   !self.hostExplicitSubtitleAction else { return }
             if let selected = item.currentMediaSelection.selectedMediaOption(in: group),
                let ordinal = group.options.firstIndex(of: selected) {
-                self.activeSubtitleTrackIndex = RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
+                // #316: an auto-selected injected rendition mirrors back as the EXTERNAL id it was
+                // declared under, not as a second identity in the legible id range.
+                let selectedName = await RemoteHLSMediaSelection.playlistName(of: selected)
+                    ?? selected.displayName
+                self.activeSubtitleTrackIndex = self.injectedSubtitleRenditionNames
+                    .first { $0.value == selectedName }?.key
+                    ?? RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
                 self.isSubtitleActive = true
                 EngineLog.emit(
                     "[AetherEngine] AE#154: mirrored auto-selected legible option ordinal=\(ordinal)",
                     category: .engine)
             }
+        }
+    }
+
+    /// #316: activate a sidecar the proxy declared in the served master. The track keeps the external id
+    /// the host registered it under, but the selection is an `AVMediaSelection` one, so AVPlayer renders
+    /// it and it survives leaving the view hierarchy.
+    ///
+    /// Matched by NAME: the rewriter guarantees uniqueness within the group (it disambiguates against the
+    /// origin's own names), and `AVMediaSelectionOption.displayName` is the rendition's NAME attribute.
+    /// A miss leaves the previous selection alone and says so rather than silently reporting success.
+    func selectInjectedSubtitleRendition(id: Int, name: String) {
+        guard let item = currentAVPlayer?.currentItem else { return }
+        cancelSidecarTask()
+        clearSubtitleDrainTarget(channel: .primary)
+        activeEmbeddedSubtitleStreamIndex = -1
+        // AVPlayer owns the drawing here; leaving overlay cues behind would double up.
+        subtitleCues = []
+        loadedSidecarURL = nil
+        isSubtitleActive = true
+        activeSubtitleTrackIndex = id
+        isLoadingSubtitles = false
+        Task { @MainActor in
+            self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+            guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
+            var match: AVMediaSelectionOption?
+            var seen: [String] = []
+            for option in group.options {
+                let playlistName = await RemoteHLSMediaSelection.playlistName(of: option)
+                seen.append(playlistName ?? option.displayName)
+                if match == nil, playlistName == name || option.displayName == name { match = option }
+            }
+            guard let option = match else {
+                EngineLog.emit(
+                    "[AetherEngine] #316: injected rendition \"\(name)\" is not in the item's legible "
+                    + "group (\(seen.joined(separator: ", ")))",
+                    category: .engine)
+                return
+            }
+            item.select(option, in: group)
+            EngineLog.emit("[AetherEngine] #316: selected injected rendition \"\(name)\" for external id=\(id)",
+                           category: .engine)
         }
     }
 

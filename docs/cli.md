@@ -78,7 +78,17 @@ swift run aetherctl play --subs teletext <url>                  # activate the f
 swift run aetherctl play --host-calls reloadlive,play,extractor,setrate <url>   # mimic a host's post-load call sequence
 swift run aetherctl play --live --dvr-window 1800 --audio-stats <url>           # decoded-PCM continuity + per-second audio lead
 swift run aetherctl play --live --native-hls <master.m3u8>      # nativeRemoteHLS bypass (carriage watchdog + #293 probe)
+swift run aetherctl play --sidecar de=/tmp/de.srt --subs de <master.m3u8>   # declare a sidecar at load (#316)
 ```
+
+`--sidecar <lang>=<path-or-url>[,<lang>=<path>...]` fills `LoadOptions.externalSubtitles`, the load-time
+declaration a host makes. On a remote `m3u8` this is what makes the engine stand up its rewritten master
+(#316), so it is the way to see the whole chain from the CLI: the served `master.m3u8` body is logged, the
+engine reports how many renditions it injected, and selecting the track (`--subs <lang>` matches the
+external track by language) shows the `subs_N.m3u8` and `subs_N_0.vtt` fetches arriving. The end-of-run
+`subtitle tracks` line is the settled list a host's picker would show, with `*` marking external ids; note
+that `cues=0` and "no cues arrived" are CORRECT there, because AVPlayer renders a rendition itself and the
+overlay pipeline stays empty (same as AE#154).
 
 `--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), and `overlapseek` (the #292 seek-window drills below); this is how the pre-arming `setRate` wedge was isolated.
 

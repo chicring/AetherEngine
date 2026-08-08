@@ -46,6 +46,12 @@ protocol HLSSegmentProvider: AnyObject {
     /// value so later cadence or visible-segment growth cannot mutate RFC 8216 playlist timing.
     func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int
 
+    /// #316: a master to serve VERBATIM instead of building one from the metadata below. The remote-HLS
+    /// subtitle proxy fills this with the origin's own master, rewritten to absolute URIs plus the
+    /// injected SUBTITLES renditions: its variants live at the origin, so there is nothing here to
+    /// describe them with. Nil on every producer-backed provider, which builds its master as before.
+    var staticMasterPlaylistBody: String? { get }
+
     /// Master-playlist metadata. When masterCodecs is non-nil the server publishes master.m3u8; nil means media-playlist-only.
     var masterCodecs: String? { get }
     var masterResolution: (width: Int, height: Int)? { get }
@@ -97,6 +103,7 @@ protocol HLSSegmentProvider: AnyObject {
 extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+    var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
     func initVersionID(forSegment index: Int) -> Int { 0 }
@@ -177,7 +184,10 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        let path = (provider?.masterCodecs != nil) ? "master.m3u8" : "media.m3u8"
+        // #316: a static master has no masterCodecs of its own (its variants live at the origin), but it
+        // is still the playlist AVPlayer must open, or the injected renditions never reach media selection.
+        let hasMaster = provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil
+        let path = hasMaster ? "master.m3u8" : "media.m3u8"
         return URL(string: "http://127.0.0.1:\(port)/\(path)")
     }
 
@@ -637,7 +647,7 @@ final class HLSLocalServer: @unchecked Sendable {
 
         switch normalizedPath {
         case "/master.m3u8":
-            if provider?.masterCodecs != nil {
+            if provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil {
                 let body = buildMasterPlaylist()
                 stateLock.lock()
                 let firstTime = !loggedMasterPlaylist
@@ -1058,6 +1068,8 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private func buildMasterPlaylist() -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
+        // #316: the remote-HLS proxy hands over a finished master; there is nothing to build.
+        if let staticBody = provider.staticMasterPlaylistBody { return staticBody }
         return Self.buildMasterPlaylistText(provider: provider,
                                              subResourceBaseURL: subResourceBaseURL)
     }

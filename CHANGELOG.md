@@ -12,6 +12,73 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.15.1] - 2026-08-08
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.15.1))
+
+### Fixed
+
+- **A `nativeRemoteHLS` session that never reached `readyToPlay` had no terminal state (#334).** An
+  origin that answers every request while AVFoundation can build no track from what it serves leaves
+  AVPlayer neither failing nor becoming ready, so `state` stayed `.loading` indefinitely: no error,
+  no timeout, and a host with nothing to retune on. The carriage machinery could not help, because
+  all of it is anchored at `readyToPlay`: the #293 probe settled `hevcInMPEGTS` and the verdict was
+  then only ever read by a loop that had not started, and the deferred segment-head probe waited 20 s
+  for a readiness that was not coming and gave up without reading. Three changes: a settled carriage
+  verdict now reroutes on its own (it is read off the source and needs no grace), the deferred probe
+  reads the segment head when the readiness ceiling expires instead of abandoning the case, and the
+  bypass has a 45 s ceiling on silence that publishes a real error when nothing became ready, nothing
+  rerouted and nothing failed. Readiness at any point, a reroute, or an AVPlayer failure all disarm
+  it, so slow origins and transcode spin-ups never meet it.
+
+## [6.15.0] - 2026-08-08
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.15.0))
+
+### Added
+
+- **`AetherEngine.videoRoute`: the pipeline actually serving the session (#321).** `LoadOptions
+  .nativeRemoteHLS` is the request, not the outcome. The #168 carriage watchdog reroutes onto the
+  ingest loopback mid-session, #199 takes it straight away for a remembered master, AE#268 does the
+  same for a HEVC-in-MPEG-TS VOD, and AE#154 / AE#246 move the other way onto the bypass; none of it
+  was observable, because `loadedOptions` is internal and `playbackBackend` is `.native` for both
+  native pipelines. The new `@Published` value publishes `.remoteBypass` / `.loopback` / `.software`
+  / `.audio` / `.none` and is derived from `playbackBackend` plus the session's effective options,
+  so it cannot desync from them. Hosts can now decide who draws subtitles, and react to a reroute
+  instead of inferring it. `aetherctl play` prints `route=` next to `backend=`.
+
+## [6.14.0] - 2026-08-07
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.14.0))
+
+### Fixed
+
+- **`LoadOptions.externalSubtitles` was dropped on the `nativeRemoteHLS` bypass (#316).** The branch
+  returns from `load()` before the probe path registers the declaration, so a host that declared
+  sidecars on a remote HLS source got an empty `subtitleTracks` back, with no error and no log line
+  to tell a dropped option from a source that has no subtitles. The AE#154 reroute onto the same
+  bypass dropped them too, and the legible-group discovery would have overwritten them anyway: it
+  assigned `subtitleTracks` wholesale instead of merging.
+
+### Added
+
+- **Sidecar subtitles become real renditions on the `nativeRemoteHLS` bypass (#316).** Media
+  selection on an HLS asset comes from the playlist and nowhere else, so `addExternalSubtitleTrack`
+  could only ever drive the host overlay, which is not drawn once the picture leaves the host's view
+  hierarchy: PiP, AirPlay and a wired external display lost the subtitle, and for a Plex or Jellyfin
+  transcode told `subtitles=none` the sidecar is the only copy there is. For a VOD source the engine
+  now fetches the origin master, absolutises every variant, audio and key URI against it, adds one
+  `EXT-X-MEDIA:TYPE=SUBTITLES` per text sidecar (joining the origin's own group when it has one) and
+  serves that master from the loopback origin. The media never moves: AVPlayer still fetches all A/V
+  bytes from the origin, which is the property the bypass exists for (E-AC-3 / Atmos passthrough).
+  The tracks keep the external ids they were registered under, and selecting one drives
+  `AVMediaSelection` rather than the overlay, so the two cannot draw at once. Live playlists, bitmap
+  sidecars, an unrewritable playlist and a slow origin all keep the origin URL and overlay-only
+  subtitles; the load is never failed over this.
+- **`aetherctl play --sidecar <lang>=<path>`** declares sidecars at load, so the whole chain is
+  observable from the CLI (served master body, injected count, the `subs_N.m3u8` / `.vtt` fetches).
+  The end-of-run summary now also prints the settled subtitle track list and the active selection.
+
 ## [6.13.0] - 2026-08-07
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.13.0))

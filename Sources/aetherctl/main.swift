@@ -474,6 +474,19 @@ if first == "play" {
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
     let frameTimes = takeFlag("--frame-times", from: &rest)
+    // #316: declare sidecar subtitles at load, the LoadOptions.externalSubtitles a host passes.
+    // Comma-separated `lang=path-or-url` entries, e.g. --sidecar en=/tmp/en.srt,de=/tmp/de.srt.
+    // On the nativeRemoteHLS bypass this is what makes the engine stand up its rewritten master.
+    let sidecars: [ExternalSubtitleTrack] = (takeStringFlag("--sidecar", from: &rest) ?? "")
+        .split(separator: ",").compactMap { entry in
+            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+            let (language, path) = parts.count == 2 ? (parts[0], parts[1]) : (nil, parts[0])
+            let url = parseSourceURL(path)
+            return ExternalSubtitleTrack(
+                url: url,
+                name: language.map { $0.uppercased() } ?? url.deletingPathExtension().lastPathComponent,
+                language: language)
+        }
     rejectStrayFlags(rest, subcommand: "play")
     if let playThrottleKbps {
         AetherEngine.setSourceThrottleKbpsForTesting(playThrottleKbps)
@@ -486,7 +499,7 @@ if first == "play" {
         exit(64)
     }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes))
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, sidecars: sidecars))
 }
 
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {

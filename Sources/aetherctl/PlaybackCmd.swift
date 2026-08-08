@@ -11,7 +11,8 @@ import AetherEngine
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
 func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
-                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false) -> Int32 {
+                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false,
+                    sidecars: [ExternalSubtitleTrack] = []) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
         AetherEngine.setLargeAllocationCensusEnabled(
@@ -25,7 +26,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, dvr
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, startPosition: startPosition, frameTimes: frameTimes)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, startPosition: startPosition, frameTimes: frameTimes, sidecars: sidecars)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -203,7 +204,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], startPosition: Double? = nil, frameTimes: Bool = false) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], startPosition: Double? = nil, frameTimes: Bool = false, sidecars: [ExternalSubtitleTrack] = []) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -257,7 +258,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
         suppressDisplayCriteria: true,
         isLive: live,
         dvrWindowSeconds: dvrWindow,
-        nativeRemoteHLS: nativeHLS
+        nativeRemoteHLS: nativeHLS,
+        externalSubtitles: sidecars
     )
     // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
     // which is the documented usage and the part a host would otherwise have to re-do per load.
@@ -282,6 +284,14 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
     } catch {
         print("LOAD FAILED: \(error)")
         return 1
+    }
+    if !sidecars.isEmpty {
+        // #316: what the declaration actually became. On the bypass an id in the external range means
+        // the track survived the branch at all; whether it is ALSO a rendition is in the engine's own
+        // "serving N external subtitle rendition(s)" line above.
+        print("  SIDECARS declared=\(sidecars.count) -> tracks: "
+              + engine.subtitleTracks.map { "#\($0.id) \($0.name)(\($0.language ?? "?"))" }
+                .joined(separator: ", "))
     }
     // Mimic host-app post-load calls (AetherPlayer openInternal order) to reproduce
     // host-triggered transport races the bare harness would miss.
@@ -318,7 +328,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
     }
 
     print("")
-    print("backend=\(engine.playbackBackend.rawValue) duration=\(String(format: "%.1f", engine.duration))s isLive=\(engine.isLive)")
+    // #321: route, not just backend. `.native` covers both the loopback and the remote bypass, and an
+    // internal reroute can have moved this run off the route the flags asked for.
+    print("backend=\(engine.playbackBackend.rawValue) route=\(engine.videoRoute.rawValue) "
+          + "duration=\(String(format: "%.1f", engine.duration))s isLive=\(engine.isLive)")
     if frameTimes {
         if let timebase = engine.softwarePresentationTimebase {
             print(String(format: "  timebase: present, time=%.3fs rate=%.2f", timebase.time.seconds, timebase.rate))
@@ -468,6 +481,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
 
     let finalTime = engine.currentTime
     let endState = engine.state
+    // #316: the settled list, after any late rendition discovery. Read it rather than the load-time
+    // one when the question is what a host's picker ends up showing.
+    let finalSubtitleTracks = engine.subtitleTracks
+    let finalActiveSubtitle = engine.activeSubtitleTrackIndex
     engine.stop()
     tapTask?.cancel()
     print("")
@@ -483,6 +500,13 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
     }
     if let frameProbe {
         print("frame times: \(frameProbe.summary())")
+    }
+    if !finalSubtitleTracks.isEmpty {
+        let listed = finalSubtitleTracks
+            .map { "#\($0.id) \($0.name)(\($0.language ?? "?"))\($0.isExternal ? "*" : "")" }
+            .joined(separator: ", ")
+        print("subtitle tracks (* = external): \(listed)")
+        print("active subtitle: \(finalActiveSubtitle.map(String.init) ?? "none")")
     }
     print("final t=\(String(format: "%.2f", finalTime))s state=\(String(describing: endState)) cues=\(cueCount)")
     if case .error(let message) = endState {
