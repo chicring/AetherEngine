@@ -127,8 +127,10 @@ extension AetherEngine {
                 }
 
                 // #220: the two readers of a subtitled VOD session, separately attributable.
-                // `ahead` far above winHighWater (16 MB) with `parked=0` is backpressure that
-                // never engaged; the pump's own window is the control.
+                // `ahead` far above winHighWater (16 MB VOD / 64 MB live) with `parked=0` is
+                // backpressure that never engaged; the pump's own window is the control. A live
+                // reader plateauing between the two marks is healthy: that is the join burst,
+                // absorbed once and held.
                 //
                 // Both paths, not just software. On a direct-play source the native path runs
                 // the HLS loopback, so `HLSVideoEngine` demuxes from the origin through an
@@ -268,7 +270,7 @@ extension AetherEngine {
 
     /// #220: one memprobe fragment per live `AVIOReader` window. `win` is the whole buffer,
     /// `ahead` the undrained forward extent that `appendPersistentData` gates the backpressure
-    /// end on. `ahead` far above winHighWater (16 MB) while `parked=0` means the backpressure
+    /// end on. `ahead` far above winHighWater (16 MB VOD / 64 MB live) while `parked=0` means the backpressure
     /// never engaged, which is a different defect from a transport overshoot past an end that
     /// fired (#310: the end replaced the suspend, so the overshoot is bounded by one
     /// delivery's in-flight amount rather than by whatever a suspended task lets through).

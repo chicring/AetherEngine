@@ -5,7 +5,7 @@ import Libavutil
 
 /// Custom AVIO context feeding FFmpeg via URLSession. Three modes:
 /// - **Persistent** (known size + prefetch=true, playback path): single long-lived
-///   `Range: bytes=<pos>-` GET into a sliding window; reconnects on drop/429/503.
+///   `Range: bytes=<pos>-` GET into a sliding window; reconnects on drop/429/503/509.
 ///   Fix for AetherEngine#25 (CDN stutter collapsing playback). See `readPersistent`.
 /// - **Seekable chunked** (known size + prefetch=false, still/frame-extraction):
 ///   discrete Range chunks for random access. See `readSeekable`.
@@ -108,12 +108,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return status == 401 || status == 403 || status == 404 || status == 410
     }
 
+    /// Rate-limit-shaped statuses: the origin is metering us, not failing. 429/503 carry
+    /// Retry-After (#71); 509 "Bandwidth Limit Exceeded" (nonstandard) is what a
+    /// connection-capped IPTV panel answers while its slot is still occupied by the
+    /// connection being replaced — the slot frees in seconds, the pinned redirect target
+    /// is fine, and re-resolving through the portal spends the one request there is no
+    /// room for (519ae26e, #307 follow-up).
+    static func isRateLimitStatus(_ status: Int) -> Bool {
+        return status == 429 || status == 503 || status == 509
+    }
+
     /// Hard server errors answered by a pinned post-redirect URL: the redirect target
-    /// may be dead or expired while the source URL would mint a fresh one. 503 is
-    /// excluded — it is rate limiting (#71), carries Retry-After, and the pin is not
-    /// the problem there.
+    /// may be dead or expired while the source URL would mint a fresh one. Rate-limit
+    /// statuses are excluded — the origin is metering us, and the pin is not the
+    /// problem there.
     static func isResolvedHardServerError(_ status: Int) -> Bool {
-        return status >= 500 && status != 503
+        return status >= 500 && !isRateLimitStatus(status)
     }
 
     // Cumulative bytes fetched since open; memory probe compares against RSS growth.
@@ -210,7 +220,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // window peak is now bounded by construction at highWater plus one delivery's in-flight
     // overshoot, which subsumes the former winHardCap escape hatch and the realloc-doubling
     // peak it had to be sized against.
-    private static let winHighWater = 16 * 1024 * 1024
+    //
+    // Live raises the high water instead of changing the mechanism. Live connections are
+    // open-ended by design (no ranges to bound them), so the high-water end is the ONLY
+    // thing that ever terminates a healthy live connection — and "re-request at the
+    // frontier" is a lie to a live origin: the bytes broadcast during the drain are gone,
+    // so every cycle rejoined the stream on a corrupt TS packet. Worse, IPTV panels serve
+    // their ring buffer as a join burst at line rate on EVERY (re)connect, so a 16 MB cap
+    // made each reconnect the cause of the next one: burst to high water, end, drain ~8 MB
+    // losing that much realtime, reconnect, absorb the next burst. The live threshold is
+    // sized to absorb the burst ONCE; steady state then plateaus at burst size (arrival
+    // rate == media rate once the burst is over) with the connection never voluntarily
+    // ended. The end-and-refill stays, unchanged, as the memory backstop for a "live"
+    // source that sustainedly outruns realtime (a misdeclared VOD). 64 MB matches
+    // streamHighWater, the forward bound the engine already accepts for the other reader
+    // that cannot bound by range request.
+    private static let winHighWaterDefault = 16 * 1024 * 1024
+    private static let liveWinHighWaterDefault = 64 * 1024 * 1024
     private static let winLowWater = 8 * 1024 * 1024
     // #220: how much the persistent reader asks for at a time. Bounds a single request's
     // exposure by construction (an origin cannot serve more than it was asked for, whatever
@@ -285,7 +311,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         min(detourFetchBudgetSeconds, chunkRequestTimeout)
     }
 
-    // Cap on CONSECUTIVE rate-limited (429/503) network attempts before giving up cleanly.
+    // Cap on CONSECUTIVE rate-limited (429/503/509) network attempts before giving up cleanly.
     // Distinct axis from unproductiveReconnects: NOT reset by seekReconnect, so parse-driven
     // seeks cannot mask a throttled origin into an infinite reconnect loop (AetherEngine#71).
     private static let rateLimitMaxStreak = 6
@@ -300,7 +326,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Connection state.
     private var connEnded = false
     private var connStatus = 0
-    // Retry-After seconds from 429/503, honoured before reconnect.
+    // Retry-After seconds from a rate-limit status, honoured before reconnect.
     private var connRetryAfter: TimeInterval = 0
     // Bumped on every (re)connect; stale delegate callbacks are ignored.
     private var connGeneration = 0
@@ -370,6 +396,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// did, and the checks that need the REQUESTED offset (a 200 that ignored Range, the size
     /// derived from a from-zero response) must not read the window's start instead. winCond-guarded.
     private var connRequestedOffset: Int64 = 0
+    /// #331: latched once a live origin answers 416 to a nonzero offset, i.e. proves it has no
+    /// byte addresses to resume at. From there every live request is the join shape (`bytes=0-`).
+    /// Latched rather than unconditional because the two live origin shapes want opposite things:
+    /// an IPTV panel serving a ring buffer cannot satisfy a frontier and rejects it outright,
+    /// while a live source that IS a growing file (a Jellyfin live stream file, a misdeclared VOD)
+    /// honours the frontier and resumes exactly where delivery stopped, and asking that one for
+    /// byte zero re-delivers the whole buffer on top of the window. One rejected request per reader
+    /// tells the two apart; guessing cannot. winCond-guarded.
+    private var liveOffsetsUnsatisfiable = false
 
     /// #220: winCond-guarded snapshot of the sliding window for the periodic memprobe.
     /// `ahead` is the undrained forward extent, the quantity `appendPersistentData` gates the
@@ -392,7 +427,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Consecutive unproductive reconnects (demux-thread-only).
     private var unproductiveReconnects = 0
     private var bytesAtLastReconnect: Int64 = 0
-    // Consecutive 429/503 attempts; survives seekReconnect, resets on real read progress (#71).
+    // Consecutive rate-limited attempts; survives seekReconnect, resets on real read progress (#71).
     private var rateLimitStreak = 0
 
     /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
@@ -493,6 +528,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// load. It is not a `LoadOptions` field either: #272 measured that a shorter threshold is worse
     /// under CPU starvation, and that conclusion is unchanged.
     private let connStallTimeout: TimeInterval
+    /// High-water mark this reader ends the connection at. Mode-dependent (live absorbs a
+    /// join burst the VOD value was never sized for — see the backpressure doc block) and
+    /// an init parameter for the same reason `connStallTimeout` is one: a process-wide
+    /// hook would leak into whatever suite runs concurrently. The shipped values are the
+    /// two statics above.
+    private let winHighWater: Int
     private var throttleVClockNs: UInt64 = 0
     private let throttleLock = NSLock()
 
@@ -500,7 +541,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// origin at once and the line used to name none of them.
     private let label: String
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil) {
         self.url = url
         self.label = label
         self.extraHeaders = extraHeaders
@@ -513,6 +554,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.throttleKbps = AetherEngine.sourceThrottleKbpsForTesting
         self.backoffScale = AetherEngine.reconnectBackoffScaleForTesting
         self.connStallTimeout = max(0.05, connStallTimeout)
+        self.winHighWater = max(1, windowHighWater
+            ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
     }
 
     /// Slow-CDN simulation: hold delivered bytes to `throttleKbps` by sleeping the demux thread before the
@@ -1275,7 +1318,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // RETRY the detour fetch; do NOT open a fresh connection (that re-enters
                         // the 429 churn the cache exists to remove). Give up cleanly at the cap.
                         if recordRateLimitAndShouldGiveUp() {
-                            EngineLog.emit("[AVIOReader] Detour rate-limit gave up at offset \(curPosition) (\(rateLimitStreak) consecutive 429/503)", category: .demux)
+                            EngineLog.emit("[AVIOReader] Detour rate-limit gave up at offset \(curPosition) (\(rateLimitStreak) consecutive rate-limited)", category: .demux)
                             return totalRead > 0 ? Int32(totalRead) : -1
                         }
                         let backoffStart = DispatchTime.now()
@@ -1422,7 +1465,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 continue
             }
 
-            // Connection ended before EOF; reconnect at frontier. Honour Retry-After for 429/503.
+            // Connection ended before EOF; reconnect at frontier. Honour Retry-After when rate-limited.
             winCond.unlock()
             // #220/#310: we ended it ourselves at high water and the consumer has now emptied
             // the window (the low-water refill normally fires first; this is the backstop for
@@ -1446,14 +1489,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 timedReconnect(seek: false, at: frontier)
                 continue
             }
-            // A 429/503 is rate limiting, not a dead source: drive give-up + backoff off the
+            // A 429/503/509 is rate limiting, not a dead source: drive give-up + backoff off the
             // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
             // that parse seeks fire, so a throttled origin fails cleanly instead of looping (#71).
-            let isRateLimited = (status == 429 || status == 503)
+            let isRateLimited = Self.isRateLimitStatus(status)
             let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp()
                                        : recordReconnectAndShouldGiveUp(status: status)
             if giveUp {
-                let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive 429/503" : "\(unproductiveReconnects) unproductive"
+                let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive rate-limited" : "\(unproductiveReconnects) unproductive"
                 EngineLog.emit("[AVIOReader] \(label) reconnect exhausted at offset \(frontier) status=\(status) (\(streakDesc))\(isLive ? " [live source lost]" : "")", category: .demux)
                 emitNetworkPhase(.flowing)   // reader is exiting; let state carry the terminal outcome (#85)
                 if isLive {
@@ -1470,7 +1513,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // not a transient: drop it so the retry re-resolves through the source URL
             // for a fresh redirect. No-op when nothing is pinned.
             //
-            // A rate-limit streak is deliberately NOT a reason to drop it: 429/503 says the
+            // A rate-limit streak is deliberately NOT a reason to drop it: 429/503/509 says the
             // origin is metering us, not that the target is dead (#71), and re-resolving
             // spends a second request on the very origin that is refusing them. On the
             // connection-capped panel behind #307 that is the request that cannot be spared.
@@ -1518,10 +1561,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             unproductiveReconnects += 1
         }
         bytesAtLastReconnect = now
-        // Hard 4xx/5xx (not 429/503 which carry Retry-After) on a source that has
-        // never delivered a byte = server-side failure (e.g. Jellyfin 500 after
+        // Hard 4xx/5xx (not the rate-limit statuses, which are metering) on a source that
+        // has never delivered a byte = server-side failure (e.g. Jellyfin 500 after
         // transcode-failure latency ~15-20s/attempt). One retry, then out.
-        let isHardError = status >= 400 && status != 429 && status != 503
+        let isHardError = status >= 400 && !Self.isRateLimitStatus(status)
         if now == 0 && isHardError {
             return unproductiveReconnects > 1
         }
@@ -1566,7 +1609,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// when playback genuinely starves. Demux-thread-only.
     private func chargeFaultedRunwayRefill(at frontier: Int64, ahead: Int,
                                            status: Int, retryAfter: TimeInterval) -> Bool {
-        let isRateLimited = (status == 429 || status == 503)
+        let isRateLimited = Self.isRateLimitStatus(status)
         let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp()
                                    : recordReconnectAndShouldGiveUp(status: status)
         if giveUp {
@@ -1609,7 +1652,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
-    /// Increments the consecutive 429/503 streak; returns true once the bounded cap is hit.
+    /// Increments the consecutive rate-limited streak; returns true once the bounded cap is hit.
     /// Demux-thread-only. Deliberately NOT reset by `seekReconnect` (parse seeks must not mask a
     /// throttled origin into an endless reconnect loop, #71); only real read progress clears it.
     /// Internal (not private) so the bounded give-up is unit-tested without a live origin.
@@ -1670,7 +1713,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return .served(n)
     }
 
-    /// Single Range fetch for a detour block over the pooled chunkSession. Surfaces 429/503 with
+    /// Single Range fetch for a detour block over the pooled chunkSession. Surfaces rate limiting with
     /// its Retry-After so the caller can back off in place rather than churn the connection (#71).
     private func detourFetchBlock(from offset: Int64, size: Int) -> DetourFetch {
         let rangeEnd = offset + Int64(size) - 1
@@ -1685,7 +1728,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let (data, response) = try syncRequest(request, budget: budget)
             if let http = response as? HTTPURLResponse {
                 let status = http.statusCode
-                if status == 429 || status == 503 {
+                if Self.isRateLimitStatus(status) {
                     return .rateLimited(Self.parseRetryAfter(http))
                 }
                 if status != 200 && status != 206 {
@@ -1901,8 +1944,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Persistent Connection (lifecycle + delegate callbacks)
 
-    /// Open a fresh Range: bytes=<offset>- connection. Bumps generation so
-    /// late callbacks from the old connection are ignored.
+    /// Open a fresh Range: bytes=<offset>- connection (live: always `bytes=0-`, see the
+    /// request construction below). Bumps generation so late callbacks from the old
+    /// connection are ignored.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil) {
         winCond.lock()
         connGeneration &+= 1
@@ -1943,6 +1987,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             window = Data()
         }
         connRequestedOffset = offset
+        let askAsJoin = isLive && liveOffsetsUnsatisfiable
         connEnded = false
         connEndedByBackpressure = false
         connEndedAtRangeEnd = false
@@ -1971,7 +2016,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if let resolvedBound {
             request.setValue("bytes=\(offset)-\(offset + resolvedBound - 1)", forHTTPHeaderField: "Range")
         } else {
-            request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+            // Live: `offset` is reader bookkeeping (the window frontier the delivered bytes are
+            // appended at), and whether it means anything server-side depends on the origin.
+            // Panels serving a ring buffer have no byte addresses at all: some ignore the offset
+            // and serve from now (which is why the frontier request ever worked), others answer
+            // 416 to every offset they cannot satisfy, which turned each reconnect into an
+            // unrecoverable rejection loop (#331). A live source that is a growing FILE resumes
+            // at the frontier correctly, and asking it for byte zero would re-deliver its whole
+            // buffer on top of the window. So keep the frontier until an origin rejects it, then
+            // ask the way a join does for the rest of the session; the append anchors the bytes
+            // at the frontier either way.
+            request.setValue("bytes=\(askAsJoin ? 0 : offset)-", forHTTPHeaderField: "Range")
         }
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
         applyExtraHeaders(&request)
@@ -2099,7 +2154,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var overshootToLog: Int64? = nil
         if connEndedByBackpressure {
             postEndDeliveryBytes += Int64(count)
-            if postEndDeliveryBytes > Int64(Self.winHighWater), !postEndOvershootLogged {
+            if postEndDeliveryBytes > Int64(winHighWater), !postEndOvershootLogged {
                 postEndOvershootLogged = true
                 overshootToLog = postEndDeliveryBytes
             }
@@ -2143,7 +2198,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // the frontier once the consumer drains below low water.
         var toCancel: URLSessionDataTask?
         let ahead = window.count - max(0, Int(position - winStart))
-        if ahead > Self.winHighWater, !connEnded, !isClosed, activeTask != nil {
+        if ahead > winHighWater, !connEnded, !isClosed, activeTask != nil {
             connEndedByBackpressure = true
             connEnded = true
             toCancel = activeTask
@@ -2189,7 +2244,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let status = http.statusCode
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
-        if status == 429 || status == 503 {
+        if Self.isRateLimitStatus(status) {
             retryAfter = Self.parseRetryAfter(http)
         }
         var headerMs: Double? = nil
@@ -2207,6 +2262,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
         let requestedOffset = (generation == connGeneration) ? connRequestedOffset : 0
+        // #331: the origin just told us its live stream has no byte address to resume at. Latch
+        // it, so every later request in this session is the join shape instead of repeating an
+        // offset that can only ever be rejected again. Nonzero offsets only: a 416 at zero is a
+        // different fault and must not silently change the request shape.
+        var latchedJoinShape = false
+        if generation == connGeneration, isLive, status == 416, requestedOffset > 0,
+           !liveOffsetsUnsatisfiable {
+            liveOffsetsUnsatisfiable = true
+            latchedJoinShape = true
+        }
         // Issue #70: the first from-0 data connection doubles as the size probe, so the
         // playback open skips probeFileSize() entirely. Derive the total from this
         // response (206 Content-Range, or Content-Length on a from-0 2xx). Write-once
@@ -2227,6 +2292,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if let headerMs, headerMs > 2000 {
             EngineLog.emit(
                 "[AVIOReader] gen=\(generation) response headers after \(Int(headerMs))ms status=\(status)",
+                category: .demux
+            )
+        }
+        // #331: name the latch once. A field capture that shows the reconnect shape change is the
+        // difference between "the origin has no byte addresses" and "the reconnect is broken".
+        if latchedJoinShape {
+            EngineLog.emit(
+                "[AVIOReader] \(label) live origin rejected offset \(requestedOffset) (416); "
+                + "requesting the stream as a join from here",
                 category: .demux
             )
         }

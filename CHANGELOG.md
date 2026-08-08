@@ -12,6 +12,51 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.15.2] - 2026-08-08
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.15.2))
+
+### Fixed
+
+- **A live source is no longer stuttered on a steady cycle by the reader's own backpressure.**
+  The 16 MB high-water end (#310) had no live branch, and live connections are open-ended by
+  design, so ending at high water was the only thing that ever terminated a healthy live
+  connection. Each end drained ~8 MB to low water and re-requested "at the frontier" — a byte
+  offset that means nothing to a live origin — so everything broadcast during the drain was lost
+  and the demuxer rejoined on a corrupt TS packet. And it never happened once: IPTV panels serve
+  their ring buffer as a join burst at line rate on every (re)connect, so the burst refilled the
+  window immediately and each reconnect caused the next one, forever (a field trace against an
+  Xtream panel cycled every ~9.5 MB with a `Packet corrupt` and an h264 decode error per cycle;
+  the loopback repro accepts 17 MB of a 24 MB burst, parks at 16.9 MB and holds no connection).
+  Live readers now run a 64 MB high water (matching `streamHighWater`, the bound the engine
+  already accepts for the other reader that cannot bound by range request): the join burst is
+  absorbed once, steady state plateaus at burst size with the connection never voluntarily
+  ended, and the end-and-refill survives unchanged as the memory backstop for a "live" source
+  that sustainedly outruns realtime.
+- **A live reconnect that the origin cannot satisfy asks for the stream the way a join does.**
+  The reconnect request carried `Range: bytes=<frontier>-`, but the frontier is reader
+  bookkeeping (the window position delivered bytes are appended at), and whether it means
+  anything server-side depends on the origin. Panels that ignore the offset and serve "from now"
+  masked this; a panel that answers 416 to every offset it cannot satisfy turned each reconnect
+  into an unrecoverable rejection loop (field trace: a panel that cleanly completes every
+  response after its ~14 MB ring burst then 416'd the same frontier 35 generations in a row,
+  ~1/s, while the runway drained from 8 MB to zero and the session starved). The rejection is
+  now the signal: the first 416 on a nonzero live offset latches the join shape (`bytes=0-`,
+  what every origin serves) for the rest of the session, so the loop costs one request and never
+  repeats. A live source that IS byte-addressable (a growing stream file, a misdeclared VOD)
+  keeps resuming at the frontier, which is what it answers correctly and where asking for byte
+  zero would re-deliver its whole buffer on top of the window.
+- **HTTP 509 from a pinned redirect target is treated as metering, not as a dead pin.**
+  509 "Bandwidth Limit Exceeded" is what a connection-capped IPTV panel answers while the slot
+  the reader is replacing has not been torn down server-side yet. It classified as a hard 5xx,
+  so every attempt dropped the pinned post-redirect URL and re-resolved through the portal —
+  latency per attempt, plus the second request against the very origin that has no room for it,
+  which is the 519ae26e reasoning left incomplete (a permanent 509 ground through 13 attempts
+  with 12 portal re-resolves at zero backoff, because ~8 MB of progress per cycle reset the
+  unproductive streak every time). 509 now keeps the pin and pays the rate-limit streak and
+  backoff alongside 429/503, honouring Retry-After when sent, with the same bounded give-up
+  (#307 follow-up).
+
 ## [6.15.1] - 2026-08-08
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.15.1))
