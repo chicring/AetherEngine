@@ -253,6 +253,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // CDN stall threshold: no bytes for this long triggers reconnect. Instance-captured (see
     // `connStallTimeout`) so tests can shorten it; the shipped value is this one.
     private static let connStallTimeoutDefault: TimeInterval = 20
+    /// 秒级「窗口持续无法服务」阈值。窗口连续 fastStallTimeout 秒无法服务当前读
+    /// → 判定连接被挂起，立即放弃并重建新连接（等价 FFmpeg http_read_stream 的
+    /// EAGAIN→willclose→http_open_cnx）。判据用「窗口无法服务的累计时长」，而非「距上次投递」，
+    /// 避免被假唤醒/微数据掩盖（实测 42s 卡顿只判出 3.5s）。健康连接窗口短暂不可用即恢复，
+    /// 1s 阈值误判风险低。
+    private static let fastStallTimeout: TimeInterval = 1.0
     // A reconnect that delivers at least this much counts as progress; resets streak.
     private static let minReconnectProgress: Int64 = 512 * 1024
     // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
@@ -1116,6 +1122,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // on completion when the whole call exceeded the threshold (see SlowReadDiagnostics).
         let readStart = DispatchTime.now()
         var diag = SlowReadDiagnostics()
+        // 窗口「持续无法服务」的起始时间（读循环线程专用）。用于秒级挂起检测：
+        // 一旦窗口能服务当前读就重置；持续无法服务超过 fastStallTimeout 即判定连接挂起。
+        var stallWaitStart: Date? = nil
         // #281 retest: fixed once per read, so a loop that wakes repeatedly cannot keep extending
         // its own patience for the speculative fetch.
         var tailWaitDeadline: Date?
@@ -1439,12 +1448,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // Wait for the live connection to fill forward. A false return
                 // means connStallTimeout elapsed with no data (socket stall).
                 let waitStart = DispatchTime.now()
+                let waitStartDate = Date()
                 let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
+                // 持锁评估：窗口能否服务当前读。
+                let dataLanded = position >= winStart && position < winStart + Int64(window.count)
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
                 // Check deadline before stall handling to avoid misrouting a
                 // deadline wake as a socket stall (which would reconnect).
                 if isPastReadDeadline { continue }
+                // 秒级挂起检测——用「窗口持续无法服务的时长」而非「距上次投递」：
+                // 后者会被假唤醒/微数据刷新，导致 42s 卡顿只判出 3.5s。窗口能服务即重置起点。
+                if dataLanded {
+                    stallWaitStart = nil
+                } else if stallWaitStart == nil {
+                    stallWaitStart = waitStartDate
+                }
+                if let start = stallWaitStart, Date().timeIntervalSince(start) >= Self.fastStallTimeout {
+                    let stalled = Date().timeIntervalSince(start)
+                    stallWaitStart = nil
+                    EngineLog.emit(
+                        "[AVIOReader] \(label) no servable data for \(String(format: "%.1f", stalled))s at offset \(frontier); rebuilding connection (fast-stall)",
+                        category: .demux)
+                    timedReconnect(seek: false, at: frontier)
+                    continue
+                }
                 if !signaled {
                     if recordReconnectAndShouldGiveUp() {
                         EngineLog.emit("[AVIOReader] \(label) stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
