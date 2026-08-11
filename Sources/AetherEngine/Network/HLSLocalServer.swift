@@ -93,6 +93,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// LL-HLS blocking reload: block until segment at absolute index exists. Holds AVPlayer's ?_HLS_msn= reload open so it receives the new segment the instant it is cut, not a poll-interval late.
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
 
+    /// Sequential append playlist: block until the startup segments are finalized (or timeout).
+    /// Same rationale as the live gate - AVPlayer treats an empty first playlist as a broken asset.
+    func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool
+
     /// Upper bound on how long a blocking reload may hold before the 503. Production providers derive
     /// it from the sealed TARGETDURATION (3 x TD, the HOLD-BACK depth) so a fastZap session (TD=2)
     /// times out in 6 s instead of 18 s — a hold that outlives AVPlayer's forward buffer guarantees
@@ -133,6 +137,7 @@ extension HLSSegmentProvider {
     }
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
+    func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool { true }
     var liveBlockingReloadHoldSeconds: TimeInterval { 18.0 }
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
         return (visibleCount: segmentCount, firstVisible: 0, refreshCounter: 0, endlistAdded: false, discontinuitySequence: 0)
@@ -700,6 +705,12 @@ final class HLSLocalServer: @unchecked Sendable {
                 } else {
                     _ = p.waitForFirstLiveSegment(timeout: 30.0)
                 }
+            } else if let p = provider, p.playlistType == .event {
+                // Sequential append playlist: hold until the startup segments exist. A fast
+                // archive origin cuts them within ~a second; the timeout only covers a source
+                // that dies before its first cut (the playlist then renders empty and AVPlayer
+                // surfaces the failure instead of hanging).
+                _ = p.waitForSequentialStartupSegments(timeout: 30.0)
             }
             let body = buildMediaPlaylist()
             stateLock.lock()
@@ -1343,6 +1354,13 @@ final class HLSLocalServer: @unchecked Sendable {
                 lastInitVersion = v
             }
             let dur = provider.segmentDuration(at: i)
+            // A zero-duration entry is a plan index the producer skipped outright (sequential
+            // sessions: a long GOP spanning two boundaries); no media file exists for it. Scoped
+            // to the append playlist on purpose: dropping a URI shifts every later segment's
+            // implicit media sequence number by one, which is exactly what a live blocking
+            // reload (?_HLS_msn=) resolves against, and a zero on live or plain VOD is a
+            // different bug that should stay visible rather than be rendered away.
+            if provider.playlistType == .event, dur <= 0 { continue }
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append(segURI(i))
         }

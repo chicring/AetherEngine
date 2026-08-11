@@ -25,6 +25,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// `afterBytes: 0` is the headers-but-no-body variant, i.e. a generation that never sees a
         /// first byte.
         case serveThenGoSilent(afterBytes: Int64)
+        /// Sequential-origin drop shape: answer the 206 header promising the full remaining body,
+        /// deliver `afterBytes`, then close the socket outright. The client sees a connection that
+        /// ended SHORT of its Content-Length - the observable behind the sequential reader's
+        /// EIO-not-EOF distinction (a lost source must not read as end-of-media).
+        case serveThenDrop(afterBytes: Int64)
     }
 
     let port: UInt16
@@ -40,6 +45,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private var _stopped = false
     private var _requestedRanges: [(start: Int64, end: Int64?)] = []
     private var _requestLog: [(path: String, start: Int64, end: Int64?)] = []
+    private var _rangeHeaderPresent: [Bool] = []
 
     var bytesWritten: Int64 {
         lock.lock(); defer { lock.unlock() }
@@ -63,6 +69,14 @@ final class ThrottledOriginServer: @unchecked Sendable {
     var requestLog: [(path: String, start: Int64, end: Int64?)] {
         lock.lock(); defer { lock.unlock() }
         return _requestLog
+    }
+
+    /// Whether each logged request carried a Range header at all. A range-less GET is logged in
+    /// `requestLog` as (start 0, end nil), indistinguishable from `bytes=0-`; the sequential-origin
+    /// reader's whole contract is that it never sends Range, so its tests assert on THIS.
+    var rangeHeaderPresence: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return _rangeHeaderPresent
     }
 
     private var stopped: Bool {
@@ -174,10 +188,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
         var offset: Int64 = 0
         var rangeEnd: Int64? = nil
         var isSuffix = false
+        var hadRangeHeader = false
         if let rangeLine = request.components(separatedBy: "\r\n")
             .first(where: { $0.lowercased().hasPrefix("range:") }),
            let eq = rangeLine.range(of: "bytes="),
            let dash = rangeLine.range(of: "-", range: eq.upperBound..<rangeLine.endIndex) {
+            hadRangeHeader = true
             let head = rangeLine[eq.upperBound..<dash.lowerBound].trimmingCharacters(in: .whitespaces)
             let tail = rangeLine[dash.upperBound...].trimmingCharacters(in: .whitespaces)
             if head.isEmpty, let suffixLength = Int64(tail) {
@@ -195,15 +211,19 @@ final class ThrottledOriginServer: @unchecked Sendable {
         lock.lock()
         _requestedRanges.append((offset, rangeEnd))
         _requestLog.append((path, offset, rangeEnd))
+        _rangeHeaderPresent.append(hadRangeHeader)
         let requestIndex = _requestLog.count - 1
         lock.unlock()
 
         var silentAfter: Int64? = nil
+        var dropAfter: Int64? = nil
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
         case .serveThenGoSilent(let afterBytes):
             silentAfter = max(0, afterBytes)
+        case .serveThenDrop(let afterBytes):
+            dropAfter = max(0, afterBytes)
         case .status(let code, let retryAfter):
             let header = "HTTP/1.1 \(code) Status\r\n"
                 + (retryAfter.map { "Retry-After: \($0)\r\n" } ?? "")
@@ -257,8 +277,19 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 while !stopped { usleep(200_000) }
                 return false
             }
+            // Sequential-drop point: a short body followed by a hard close, so the client's
+            // transport surfaces a lost connection against the promised Content-Length.
+            if let dropAfter, served >= dropAfter {
+                lock.lock()
+                _connFDs.removeAll { $0 == fd }
+                lock.unlock()
+                shutdown(fd, SHUT_RDWR)
+                close(fd)
+                return false
+            }
             var n = Int(min(Int64(chunkBytes), remaining - served))
             if let silentAfter { n = Int(min(Int64(n), silentAfter - served)) }
+            if let dropAfter { n = Int(min(Int64(n), dropAfter - served)) }
             guard writeBody(fd, Array(chunk[0..<n])) else { return false }
             served += Int64(n)
             if throttleUs > 0 { usleep(throttleUs) }

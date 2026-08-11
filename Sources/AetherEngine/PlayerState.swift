@@ -278,6 +278,27 @@ public struct LoadOptions: Sendable, Equatable {
     /// Preferred subtitle languages (ISO 639-1/2) used ONLY to choose which native WebVTT rendition is marked DEFAULT=YES in the master, so a host-selected legible track renders (AVKit hides a non-default legible selection as mute-only). Read back as `nativeSubtitleDefaultOrdinal`. Unlike `preferredSubtitleLanguages` this does NOT auto-activate the host-overlay subtitle path, so it won't double up with the native render. Default empty (Sodalite#32).
     public var nativeSubtitlePreferredLanguages: [String] = []
 
+    /// The origin fabricates range answers: any `Range: bytes=X-` gets a plausible-looking
+    /// `206 Content-Range: bytes X-.../total`, but the body is positioned on a coarse internal
+    /// chunk boundary rather than byte X (IPTV timeshift/catch-up archives are the motivating
+    /// case; a device trace showed ~1.9 s of content lost at every 32 MB range rotation, heard
+    /// as a once-a-minute audio desync). Headers cannot expose the lie, so this is a caller
+    /// declaration, not a probe. Only byte 0 is addressable: the reader runs its forward-only
+    /// streaming mode on one long-lived unranged GET - no bounded-range windowing, no
+    /// suffix/tail probes, no detour fills, no byte-offset reconnects - and the demuxer's pb is
+    /// non-seekable, so byte seeking is unavailable and a dropped connection surfaces as a read
+    /// error (EOF would read as end-of-media) for the host to re-request. FFmpeg's tail-read
+    /// duration estimate is skipped with the rest of the ranged reads; pair with
+    /// `declaredDurationSeconds` on VOD or the load fails with `zeroDuration`. Default `false`.
+    public var sequentialOrigin: Bool = false
+
+    /// Trusted media duration in seconds, overriding the container/estimate-derived value (same
+    /// trust family as the disc MPLS/IFO override, AE#105). Required alongside
+    /// `sequentialOrigin` for VOD sources: with the tail read gone the demuxer resolves no
+    /// duration, and the caller usually knows the real one (an IPTV catch-up request names its
+    /// window length outright). nil keeps the demuxer's own value. Default nil.
+    public var declaredDurationSeconds: Double? = nil
+
     /// Caller-bounded demux probe budget in bytes, mapped to `AVFormatContext.probesize` for the main playback open. nil keeps the engine default (50 MB). A smaller value speeds `find_stream_info` on slow remote sources whose sparse streams (PGS, mjpeg cover art) would otherwise read to the full budget. An over-tight budget fails OPEN, not closed: `find_stream_info` still returns success with a logged warning, so the session loads with late-resolving tracks silently missing rather than throwing a load error. The value is written to the context verbatim (FFmpeg's AVOption floor of 32 is bypassed), so validate track presence after load if you set this aggressively. The routing `probe(url:)` API and still extraction keep the full budget; the embedded subtitle side-demuxer caps its own probe (it only needs codec ids, not resolved sparse tracks) and tightens to this value when it is smaller (#76). Default nil (#68).
     public var probesize: Int64?
 
@@ -387,6 +408,8 @@ public struct LoadOptions: Sendable, Equatable {
         eagerNativeSubtitleReaders: Bool = false,
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
+        sequentialOrigin: Bool = false,
+        declaredDurationSeconds: Double? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         shortFirstSegmentSeconds: Double? = nil,
@@ -419,6 +442,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
+        self.sequentialOrigin = sequentialOrigin
+        self.declaredDurationSeconds = declaredDurationSeconds
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
         self.shortFirstSegmentSeconds = shortFirstSegmentSeconds

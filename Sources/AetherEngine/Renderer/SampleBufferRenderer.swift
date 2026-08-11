@@ -111,6 +111,33 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return _newestEnqueuedPtsSeconds
     }
 
+    /// #353: the size the picture presents at, which is the coded frame under the pixel aspect ratio
+    /// the decoder attached; nil before the first sample buffer is built. Read off the description
+    /// that is enqueued rather than recomputed from the SAR: the ratio is resolved per frame across
+    /// three sources (#177) and a ratio whose display aspect is impossible is dropped (#290), so a
+    /// second computation of the same answer is a second thing that can disagree with the screen.
+    /// Guarded by `reorderLock`.
+    private var _displaySize: CGSize?
+    var displaySize: CGSize? {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _displaySize
+    }
+
+    /// #353: fires when the settled display size CHANGES, on the decode thread, plus once on
+    /// installation if the picture already settled. Compared against the value and not against the
+    /// description, because `flush()` drops the cached description and every seek therefore rebuilds
+    /// one for a picture that never changed shape. The late-installation call is what a host relies
+    /// on: on a source with one format, the only report ever due has already happened.
+    private var _displaySizeObserver: (@Sendable (CGSize) -> Void)?
+    func setDisplaySizeObserver(_ observer: (@Sendable (CGSize) -> Void)?) {
+        reorderLock.lock()
+        _displaySizeObserver = observer
+        let settled = _displaySize
+        reorderLock.unlock()
+        if let settled { observer?(settled) }
+    }
+
     init() {
         displayLayer = Self.makeDisplayLayer(isHDR: false)
     }
@@ -135,9 +162,13 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
     /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
     /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    ///
+    /// #344: the version list gates the metrics accessor (tvOS/iOS 17.4, macOS 14.4, visionOS 1.1),
+    /// not the renderer, which exists from visionOS 1.0. tvOS/iOS 18 and macOS 15 stay as they are:
+    /// below them `queueTarget` is the display layer, so there is no renderer to ask.
     @MainActor
     func loadRenderMetrics() async -> RenderMetrics? {
-        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) else { return nil }
+        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, visionOS 1.1, *) else { return nil }
         let renderer = displayLayer.sampleBufferRenderer
         return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
             renderer.loadVideoPerformanceMetrics { m in
@@ -152,7 +183,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering.
+    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering. visionOS is not named because it has the renderer from 1.0, which is the package floor, so the `*` arm is the renderer arm there and naming it would be a check that is always true.
     var queueTarget: any AVQueuedSampleBufferRendering {
         if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
             return displayLayer.sampleBufferRenderer
@@ -378,6 +409,18 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
     }
 
+    /// [SWDiag] surface: current queue-target status for the 1 Hz diagnostic line. A mid-session
+    /// flip away from `rendering` is the layer-side stall the per-frame counters cannot show.
+    var diagStatusName: String { statusName }
+
+    /// #353: what the layer will draw the description at. Pixel aspect ratio and clean aperture are
+    /// extensions of the description itself, so this asks the description what it presents at
+    /// instead of repeating the decision that built it.
+    static func presentationSize(of desc: CMVideoFormatDescription) -> CGSize {
+        CMVideoFormatDescriptionGetPresentationDimensions(
+            desc, usePixelAspectRatio: true, useCleanAperture: true)
+    }
+
     /// Internal (not private) for #177 regression tests: the PAR-keyed cache behavior is the fix.
     func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
         // Cache hit avoids CMVideoFormatDescriptionCreateForImageBuffer allocation + CF refcount churn on every frame.
@@ -410,10 +453,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 formatDescriptionOut: &formatDesc
             )
             guard status == noErr, let new = formatDesc else { return nil }
+            // #353: a new description is the only moment the picture can change shape, so the
+            // settled size is taken here and reported outside the lock.
+            let settled = Self.presentationSize(of: new)
             reorderLock.lock()
             cachedFormatDesc = new
             cachedFormatKey = key
+            let changed = settled != _displaySize
+            if changed { _displaySize = settled }
+            let sizeObserver = changed ? _displaySizeObserver : nil
             reorderLock.unlock()
+            sizeObserver?(settled)
             desc = new
         }
 
