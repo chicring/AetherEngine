@@ -1493,7 +1493,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // means connStallTimeout elapsed with no data (socket stall).
                 let waitStart = DispatchTime.now()
                 let waitStartDate = Date()
-                let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
+                // Poll at fastStallTimeout granularity, not connStallTimeout: a completely silent
+                // connection (no bytes, hence no delivery signal to wake this wait) is then judged
+                // for a hang within ~1s instead of only when the connStallTimeout wait returns.
+                // A healthy flow broadcasts on every delivery (see appendPersistentData), so the
+                // shorter poll costs nothing on a live link. connStallTimeout still gates the
+                // #309 delivery-gap watchdog and the tail prefetch, which are intentionally slower.
+                let waitUntil = min(Date(timeIntervalSinceNow: min(Self.fastStallTimeout, connStallTimeout)),
+                                   readDeadline)
+                let signaled = winCond.wait(until: waitUntil)
                 // 持锁评估：窗口能否服务当前读。
                 let dataLanded = position >= winStart && position < winStart + Int64(window.count)
                 winCond.unlock()
@@ -1511,6 +1519,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if let start = stallWaitStart, Date().timeIntervalSince(start) >= Self.fastStallTimeout {
                     let stalled = Date().timeIntervalSince(start)
                     stallWaitStart = nil
+                    // The fast-stall reconnect now charges the same unproductive budget as the
+                    // conn-stall path. With the 1s poll above, a fully silent origin would otherwise
+                    // be reconnected every second forever: the old `continue` skipped the budgeted
+                    // branch, so a silent link could only give up by racing the #309 delivery-gap
+                    // watchdog. Progress (>= minReconnectProgress) resets the streak, so a link that
+                    // revives mid-stream is never charged.
+                    if recordReconnectAndShouldGiveUp() {
+                        EngineLog.emit(
+                            "[AVIOReader] \(label) fast-stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")",
+                            category: .demux)
+                        emitNetworkPhase(.flowing)   // reader is exiting; let state carry the terminal outcome (#85)
+                        if isLive {
+                            return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eio
+                        }
+                        return totalRead > 0 ? Int32(totalRead) : -1
+                    }
                     EngineLog.emit(
                         "[AVIOReader] \(label) no servable data for \(String(format: "%.1f", stalled))s at offset \(frontier); rebuilding connection (fast-stall)",
                         category: .demux)
