@@ -72,6 +72,7 @@ func printUsage() {
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--dvr-window N] [--subs <codec-or-lang>]
                  [--start-position S] [--switch-audio <index>[@ms]]
+                 [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--sequential-origin] [--declared-duration S]
                      [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback] <url>
                      (full load+play session smoke test; --subs activates the first
@@ -80,6 +81,9 @@ func printUsage() {
                       plus PTS-continuity gaps; seekback rewinds 20 s at t=15 and
                       returns to the live edge at t=30; --switch-audio replays a host
                       applying a language preference just after play, default +20 ms;
+                      --teletext-page fixes the caption page at load, while
+                      --switch-teletext-page changes it on the playing channel
+                      (default +20 s, i.e. after --subs has a track showing);
                       --sequential-origin declares a fake-range origin (one unranged
                       GET, no ranged probes) and needs --declared-duration on VOD
                       since the tail estimate is skipped)
@@ -91,13 +95,23 @@ func printUsage() {
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats)
-      aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
+      aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] <file>
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
                            [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
+      aetherctl hlslive --segments a.ts,b.ts,c.ts [--seconds N] [--segment-seconds N] [--disc i,j]
+                        (SSAI ad-pod replay through the live direct-play path)
+      aetherctl seektest [--seeks N] [--gap-ms N] [--settle N] [--throttle-kbps N] <url>
+                         (#35/#37/#38: rapid-seek burst, wedge report, seek-event ledger)
+      aetherctl pktdump [--at S] [--count N] [--profile playback|restartReopen|stillExtraction] <url>
+                        (raw demuxer packet timing, before dts repair and muxing)
+      aetherctl bgaudio [--fg N] [--bg N] <url>
+                        (SW-path background audio headless on macOS; DEBUG builds only)
+      aetherctl smbtest [--reads N] <smb-url>
+                        (SMB byte source: throughput pass + random-seek consistency; macOS)
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -458,6 +472,7 @@ if first == "play" {
     // AE#293: the nativeRemoteHLS bypass, the path the #168 carriage watchdog and the carriage probe
     // live on. Pair with --live; without it the m3u8 goes to the raw live path, which rejects it.
     let nativeHLS = takeFlag("--native-hls", from: &rest)
+    let liveIngest = takeFlag("--live-ingest", from: &rest)
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
@@ -466,6 +481,10 @@ if first == "play" {
     // #240: absolute far-seek targets, cycled one per --seek-every tick (e.g. 600,30,302,640).
     let seekPattern = takeStringFlag("--seek-pattern", from: &rest)
         .map { $0.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) } } ?? []
+    // #362: stop seeking after N seeks, so a run can be a BURST and then play. The reported
+    // shape needs both halves: the burst leaves the store in the state under test, and only the
+    // playing half shows what the overlay carries through it.
+    let seekCount = takeIntFlag("--seek-count", from: &rest)
     let mallocCensus = takeFlag("--malloc-census", from: &rest)
     let playForceSW = takeFlag("--sw", from: &rest)
     let censusThresholdMB = takeIntFlag("--census-threshold-mb", from: &rest)
@@ -509,6 +528,36 @@ if first == "play" {
         return AudioSwitchRequest(index: index,
                                   delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20) : 20)
     }
+    let teletextPage = takeIntFlag("--teletext-page", from: &rest)
+    // #364: `<page|auto>[@ms]`. The default delay is 20 s, not the audio switch's 20 ms: this one has
+    // to land on a channel that is already showing a teletext track, else the run proves nothing the
+    // load option did not already prove.
+    let teletextSwitch: TeletextPageSwitchRequest? = takeStringFlag("--switch-teletext-page", from: &rest).flatMap { spec in
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        let page: Int?
+        if parts[0].lowercased() == "auto" {
+            page = nil
+        } else if let parsed = Int(parts[0]) {
+            page = parsed
+        } else {
+            print("ERROR: --switch-teletext-page takes <page|auto>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        return TeletextPageSwitchRequest(page: page,
+                                        delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000)
+    }
+    // AE#363: LoadOptions.httpHeaders, repeatable as `--header "Name: Value"`. Header-enforcing
+    // origins (IPTV STB profiles, Referer-locked CDNs) had no CLI harness at all, so neither the
+    // AVPlayer bypass nor the ingest reader could be driven against one from here.
+    var playHeaders: [String: String] = [:]
+    while let spec = takeStringFlag("--header", from: &rest) {
+        guard let colon = spec.firstIndex(of: ":") else {
+            print("ERROR: --header expects \"Name: Value\", got '\(spec)'")
+            exit(64)
+        }
+        playHeaders[String(spec[..<colon]).trimmingCharacters(in: .whitespaces)] =
+            String(spec[spec.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+    }
     rejectStrayFlags(rest, subcommand: "play")
     if let playThrottleKbps {
         AetherEngine.setSourceThrottleKbpsForTesting(playThrottleKbps)
@@ -520,10 +569,12 @@ if first == "play" {
         printUsage()
         exit(64)
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, sidecars: sidecars,
                  audioSwitch: audioSwitch,
-                 sequentialOrigin: sequentialOrigin, declaredDuration: declaredDuration))
+                 teletextPage: teletextPage, teletextSwitch: teletextSwitch,
+                 sequentialOrigin: sequentialOrigin, declaredDuration: declaredDuration,
+                 httpHeaders: playHeaders))
 }
 
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {
@@ -536,6 +587,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let snapshotMode = takeFlag("--snapshot", from: &rest)
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)
+    let customAudioIndex = takeIntFlag("--audio-index", from: &rest).map(Int32.init)
     let audioOnlyFlag = takeFlag("--audio-only", from: &rest)
     let reloadFlag = takeFlag("--reload", from: &rest)
     let switchAudioFlag = takeFlag("--switch-audio", from: &rest)
@@ -582,7 +634,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     case "audio":
         exit(runAudio(url: url, seconds: audioSeconds))
     case "customio":
-        exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag))
+        exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex))
     default:
         printUsage()
         exit(64)

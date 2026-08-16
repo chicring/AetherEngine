@@ -293,6 +293,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
     }
 
+    /// #364: re-seed the tap decoders after a session decode option changed under them (the teletext
+    /// page). Same rebuild `attachNativeSubtitleStores` performs, minus the store swap, so the routes
+    /// keep their cue stores and only the decoders are new. Cues already harvested keep the page they
+    /// were decoded with: they are in the rendition the host is serving and are not ours to rewrite.
+    func refreshSubtitleTapDecoders() {
+        restartLock.lock()
+        let hasRoutes = !nativeSubtitleSourceStreamIndicesForSession.isEmpty
+        let prod = producer
+        restartLock.unlock()
+        guard hasRoutes else { return }
+        rebuildSubtitleTapRoutes()
+        armSubtitleTap(on: prod)
+    }
+
     /// Wire the tap onto a producer (initial + every restart).
     private func armSubtitleTap(on prod: HLSSegmentProducer?) {
         guard let prod else { return }
@@ -456,7 +470,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// #126: fires when a VOD pump dies on a read error having produced nothing (zero packets
     /// written, empty cache). The playlist exists but no segment will ever land, so AVPlayer
     /// would sit in waitingToPlay forever; the engine surfaces a fatal error instead.
-    var onVODSourceFailed: (@Sendable (Int32) -> Void)?
+    ///
+    /// Never call this directly; go through `surfaceVODSourceFailure` so the sequential startup
+    /// gate is released with it (#370 follow-up).
+    var onVODSourceFailed: (@Sendable (Int32, String) -> Void)?
+
+    /// The one way a VOD session surfaces a terminal source failure (#370 follow-up).
+    ///
+    /// #370 released a held startup-playlist GET at the two surfaces its own trace ran through, but
+    /// a sequential origin reaches three more: `.muxerFailed` revives into `requestRestart`, which a
+    /// sequential origin refuses, and the AE#366 moov-prime exhaustion and AE#169 read-error
+    /// exhaustion end on their own surfaces. Each of those can fire before the first duration is
+    /// published (an E-AC-3 archive whose first segment carries no audio packet is the field shape),
+    /// and the server thread then sat out the remaining ~30 s of a session that had already failed.
+    /// Pairing the release with the surface makes that structural instead of a call site to remember.
+    func surfaceVODSourceFailure(_ code: Int32, _ reason: String) {
+        provider?.abortSequentialStartupWait()
+        onVODSourceFailed?(code, reason)
+    }
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?
@@ -508,6 +539,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// arrives, which no probe can predict: movenc rejects an immediate moov for E-AC-3 regardless of
     /// extradata, so a pre-flight cannot tell a video-first interleave apart from a healthy source.
     var sessionAudioMoovPrimeFrame: [UInt8]?
+    /// AE#366: a producer searched the whole source for a frame that can build the audio sample
+    /// entry and found none. Structural (never set from a read failure), so the session stops paying
+    /// for the search on every later revive attempt.
+    var sessionAudioMoovPrimeUnobtainable = false
 
     /// AE#222 (under `restartLock`): bounded rebuild for a pump that deferred its first cut. One attempt is
     /// enough by construction (the prime is captured before the restart and reused for the session's whole
@@ -799,7 +834,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// the source body, so it is the one that produces the reader's HLS classification. Interpolating
     /// that typed error into `openFailed(reason:)` erased its domain and made a reroutable remote-HLS
     /// source terminal; the classification is rethrown verbatim so `load()` can still reach the AE#154
-    /// reroute (`hlsPlaylistOnVODPath`) or the AE#140 fail-closed rejection (`hlsPlaylistOnRawLivePath`).
+    /// reroute (`hlsPlaylistOnVODPath`) or the live-path classification (`hlsPlaylistOnRawLivePath`,
+    /// which AE#363 routes onto the live ingest for a URL source and rejects for a custom reader).
     /// Every other failure keeps the historical wrapped shape.
     static func openFailure(from error: Error) -> Error {
         if let readerError = error as? AVIOReaderError {
@@ -980,13 +1016,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // keyframe-gated cutter leaves every one of them without a segment while the playlist
                 // still offers it. Measure the spacing instead of assuming the target fits it.
                 let anchorSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
-                let spacing = measureKeyframeSpacing(
-                    demuxer: dem,
-                    videoStreamIndex: videoIndex,
-                    videoTimeBase: videoTimeBase,
-                    fromSeconds: anchorSeconds
-                )
-                let stride = Self.uniformStrideSeconds(spacing: spacing)
+                let spacing: KeyframeSpacing
+                let stride: Double
+                if sequentialOriginPinsProducerToZero {
+                    // #370: the spacing scan starts with a seek (a silent no-op on the non-seekable
+                    // sequential pb) and then consumes up to 30 s of the single byte-0-only
+                    // connection; those packets never reach the pump, so the session starts late and
+                    // silently drops the archive's first GOP(s). The #358 holes the scan exists to
+                    // soften don't bite this path: the append playlist gives zero-duration holes no
+                    // URI and its EXTINF is real by construction.
+                    spacing = .unknown
+                    stride = Self.targetSegmentDuration
+                } else {
+                    spacing = measureKeyframeSpacing(
+                        demuxer: dem,
+                        videoStreamIndex: videoIndex,
+                        videoTimeBase: videoTimeBase,
+                        fromSeconds: anchorSeconds
+                    )
+                    stride = Self.uniformStrideSeconds(spacing: spacing)
+                }
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds,
@@ -1016,11 +1065,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     ? "\(keyframes.count) IRAPs in index, need >=2"
                     : "index unusable (\(keyframes.count) IRAPs, coverage=\(String(format: "%.1f", coverageSeconds))s, largestGap=\(String(format: "%.1f", largestGapSeconds))s)"
                 let spacingText: String
-                switch spacing {
-                case .measured(let s): spacingText = "measured IRAP spacing \(String(format: "%.3f", s))s"
-                case .exceedsBudget(let s): spacingText = "IRAP spacing exceeds the \(String(format: "%.0f", s))s scan budget"
-                case .singleKeyframeInSource: spacingText = "source holds one IRAP, no second to space against"
-                case .unknown: spacingText = "IRAP spacing unknown (no keyframe scanned)"
+                if sequentialOriginPinsProducerToZero {
+                    spacingText = "spacing scan skipped (sequential origin: the scan would consume the non-replayable prefix)"
+                } else {
+                    switch spacing {
+                    case .measured(let s): spacingText = "measured IRAP spacing \(String(format: "%.3f", s))s"
+                    case .exceedsBudget(let s): spacingText = "IRAP spacing exceeds the \(String(format: "%.0f", s))s scan budget"
+                    case .singleKeyframeInSource: spacingText = "source holds one IRAP, no second to space against"
+                    case .unknown: spacingText = "IRAP spacing unknown (no keyframe scanned)"
+                    }
                 }
                 EngineLog.emit(
                     "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts), "
@@ -1059,8 +1112,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    b) numOfArrays>0 but carrying non-parameter-set arrays (libx265's user-data SEI_PREFIX, AE#187):
         //       strip everything but VPS/SPS/PPS. Apple TV hardware rejects an hvcC with an SEI array
         //       (tracks count=0 / -12848); macOS + the tvOS Simulator tolerate it, so it is device-only.
+        //    c) Annex-B extradata (#365): a Matroska remux whose CodecPrivate is Annex B, or one with
+        //       none at all where libavformat synthesised it from in-band parameter sets. The mp4
+        //       muxer reads that as "the bitstream is Annex B too" and rewrites every sample; when the
+        //       packets are in fact length-prefixed it empties them. Measured on packets, then the
+        //       record is converted so the muxer's own test comes out right.
+        let framingNormalization = normalizeVideoFraming(
+            demuxer: dem,
+            videoStreamIndex: videoIndex,
+            codecpar: codecpar,
+            isLive: isLiveSession
+        )
+        let measuredVideoNALFraming = framingNormalization.measuredFraming
+
         let hevcExtradataOverride: [UInt8]?
-        if let rebuilt = rebuildHEVCExtradataWithInBandParameterSets(
+        if let normalized = framingNormalization.extradataOverride {
+            hevcExtradataOverride = normalized
+        } else if let rebuilt = rebuildHEVCExtradataWithInBandParameterSets(
             demuxer: dem,
             videoStreamIndex: videoIndex,
             codecpar: codecpar,
@@ -1151,7 +1219,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             convertP7ToProfile81: convertP7ToProfile81,
             rewriteDoviConfigTo81: rewriteDoviConfigTo81,
             colorOverride: p5ColorOverride,
-            extradataOverride: hevcExtradataOverride
+            extradataOverride: hevcExtradataOverride,
+            nalFramingOverride: measuredVideoNALFraming
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
@@ -1486,7 +1555,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // from it, so the session ends with an error the host can act on instead of a picture
             // that never moves again while the engine still reports playing.
             unrecoverableGapHandler: isLiveSession ? nil : { [weak self] _ in
-                self?.onVODSourceFailed?(FFmpegErr.eio)
+                self?.surfaceVODSourceFailure(FFmpegErr.eio, "Source segment could not be produced")
             },
             restartActivity: isLiveSession ? nil : { [weak self] in
                 self?.restartInFlight ?? false
@@ -1994,6 +2063,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentBoundaries: segmentBoundaries,
             planAnchorVideoPts: firstKeyframePts,
             isLive: isLiveSession,
+            // #368: a forward-only chunked archive folds its chunk-seam PTS resets (incl. the
+            // libavformat 33-bit wrap correction) the way live folds program boundaries; without
+            // it the leap walks the cutter to the plan tail and the session deadlocks.
+            foldsSequentialTimeline: sequentialOriginPinsProducerToZero,
             packedSideAudioStartPts: packedSideAudioStartPts,
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
             bufferAheadSegments: forwardWindowSegments,
@@ -2001,6 +2074,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // AE#222: nil until a pump proved this source cuts its first segment before any audio packet
             // arrives; from then on every producer of the session muxes moov from this frame.
             audioMoovPrimeFrame: sessionAudioMoovPrimeFrame,
+            // AE#366: once one producer has searched the whole source for an audio frame and come
+            // back empty, later ones must not repeat the search per revive attempt.
+            audioMoovPrimeKnownUnobtainable: sessionAudioMoovPrimeUnobtainable,
             epoch: nextProducerEpoch()
         )
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
@@ -2086,6 +2162,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Live program-boundary rebase. Unlike `handleVideoShiftKnown`, does NOT fire `onPlaylistShiftChanged`:
     /// AVPlayer renders at ~buffer+holdback behind the producer edge, so the host must keep the OLD shift
     /// until playback crosses `seamOutputSeconds`. Internal `playlistShiftSeconds` tracks the edge immediately.
+    /// #368: sequential chunk-seam rebases arrive here too, deliberately; same deferred-shift contract.
     func handleLiveTimelineRebase(_ shiftPts: Int64, seamOutputSeconds: Double) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
         setPlaylistShiftSeconds(seconds)
@@ -2164,7 +2241,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 + "read from byte 0, so the reposition would mislabel content; surfacing source failure",
                 category: .session
             )
-            onVODSourceFailed?(FFmpegErr.eio)
+            surfaceVODSourceFailure(FFmpegErr.eio, "Source cannot be repositioned")
             return
         }
         restartLock.lock()

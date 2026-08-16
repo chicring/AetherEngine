@@ -12,6 +12,440 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.26.0] - 2026-08-15
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.26.0))
+
+### Added
+
+- `$errorInfo`, the machine-readable half of a `.error` state (#376). A `PlaybackErrorInfo`
+  carrying a stable `PlaybackErrorKind` token, the underlying `NSError` domain and code where a
+  Foundation / AVFoundation failure is involved, and the same message the state carries. The text
+  alone could not classify a failure: on the native paths it is
+  `AVPlayerItem.error.localizedDescription` forwarded verbatim, so it arrives in the device's
+  language and the domain and code behind it are gone, which put every non-English device into a
+  host's unknown bucket. `PlaybackErrorKind` is a string-backed struct rather than an enum, so a
+  kind added in a later minor release cannot break a host's switch, and its raw values are API.
+
+### Changed
+
+- Every failure now publishes through one funnel, so a `.error` state can no longer reach a host
+  without its classification. `errorInfo` is assigned before `state`, so a `$state` sink reads
+  this failure's own, and it is cleared by the state's move away from `.error`, so the two cannot
+  drift. A test fails the build if a new `state = .error(...)` appears outside the funnel.
+- `docs/api.md` had claimed the message inside `.error` is the engine's own sentence. True for the
+  half that names a cause, false for the half most failing sessions produce, and a downstream host
+  was building an analytics classifier on the strength of it.
+- The live-host sample and the README's API tour classify on `errorInfo` and keep the message for
+  the log.
+
+## [6.25.4] - 2026-08-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.4))
+
+### Fixed
+
+- A forwarded Annex-B config record no longer carries its prefix SEI into the `hvcC` the mp4
+  muxer builds (#365). When the record and the packets are both Annex B the record has to be
+  forwarded as it is, because movenc reads it to decide whether to convert the samples, and it
+  then builds the `hvcC` itself. `ff_isom_write_hvcc` collects five NAL types, not three (VPS,
+  SPS, PPS, SEI_PREFIX, SEI_SUFFIX), so a prefix SEI in a Matroska CodecPrivate becomes a fourth
+  array in the init sample description. That is the record Apple TV's HEVC track builder rejects
+  (AE#187: `asset.tracks count=0`, no format description), and the AE#187 defense cannot reach
+  this door: it guards on `configurationVersion == 1`, which an Annex-B buffer fails by
+  construction, and the muxer-built record never passes through the engine. The
+  non-parameter-set NALs are now dropped before the muxer runs and the record stays Annex B, so
+  the decision movenc makes about the samples is unchanged.
+
+### Changed
+
+- The `#365` forward branch logs what the config record is made of (`VPS×1 (28 B), SPS×1
+  (112 B), PPS×1 (10 B), SEI_PREFIX×1 (570 B)`) and what it dropped. A record's size alone does
+  not say whether the excess is a large SPS or an SEI, and only the latter reaches the `hvcC`.
+
+## [6.25.3] - 2026-08-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.3))
+
+### Fixed
+
+- A bitmap subtitle set no longer keeps an end it took from the far side of a stretch nobody
+  read (#362). A PGS set has no end of its own, so 6.23.1 gives an open one the PTS of the
+  next packet the store holds, which is the end the author put there. After a seek burst the
+  store also holds islands an earlier run harvested, and the first packet after a set can then
+  be a real packet that is not this set's successor (report: a set at 75.117 s closed at
+  144.978 s, its own clear at 78.579 s; a second one closed at the next SET, 78 s out). Two
+  changes. A bitmap cue's end is now re-derived on every drain tick and can only ever shorten,
+  so the clear that lands a second later trims the set even though the drain cursor has moved
+  past it and will never decode it; previously any end short of the open-ended placeholder was
+  final, and that was the whole permanence. And the derivation stops at the drain window plus
+  the forward prefetch's park margin, which is exactly as far as the harvest is designed to
+  lead, instead of reaching to whatever the store happens to hold beyond it.
+- Ends withheld for that reason are counted in the delivery statement (`endsWithheld=N`).
+  `harvestGapAt` reports where DELIVERY stopped and says nothing about an end derived from the
+  same store on a different horizon, so a window carrying a wrong end with no `gapAt` beside it
+  had no diagnostic at all.
+
+## [6.25.2] - 2026-08-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.2))
+
+### Fixed
+
+- A sequential-origin VOD session now folds a timeline discontinuity the way live folds a
+  program boundary (#368). IPTV timeshift archives are chunked recordings whose every chunk
+  restarts near PTS 0; libavformat's 33-bit wrap correction turns that backward seam into a
+  +2^33 leap (device: dts delta 8226410192 ticks, 363524400 + 8226410192 = 2^33 exactly),
+  which reached the keyframe-gated cutter unmodified and walked its monotonic index to the
+  plan tail. After that the session was structurally dead: the playlist froze, the
+  backpressure park waited on a segment the playlist can never advertise, and the wedge
+  recovery's reposition is exactly what a sequential origin refuses. The existing live
+  rebase (both streams, same thresholds) now also runs for sequential-origin VOD; cutter,
+  ledger and append playlist need no change because they already operate on post-shift
+  output time. No `EXT-X-DISCONTINUITY` is added at the seam: the archive is
+  content-continuous and the output timeline stays continuous after the rebase.
+- A sequential-origin session publishes the item axis, so the rebase above no longer moves
+  its playhead (#368 follow-up). The rebase keeps the item axis continuous by moving the
+  producer's shift, but `currentTime` was folded as `item + shift - origin` against an origin
+  latched once at session start, so the whole wrap landed on the scrubber: measured 250 s ->
+  63378 s on an archive whose declared duration is one hour, with `bufferedPosition` and
+  `sourceTime` following it. A sequential archive has no source axis to anchor a display
+  origin on (every chunk restarts near PTS 0), while its item axis starts at 0 by
+  construction and is exactly what `declaredDurationSeconds` measures. Every other source
+  keeps AE#270's latched origin and true source PTS.
+- A timestamp leap that escapes the timeline rebase no longer turns a VOD session into a
+  long-lived zombie (#369). Three containment gaps, one field trace: the look-behind sample
+  duration is now capped at the discontinuity threshold instead of handing movenc the wrap
+  itself as a duration (device: 8226410192 ticks, rejected as invalid, packet silently lost;
+  the write rc is now logged on first failure too); discontinuity-scale fold runs now reach
+  the fold counters instead of being discarded above 64 indices, so the #358 recovery arms
+  actually arm for exactly the folds most certain to trigger them; and the advance-path
+  backpressure park skips a release target beyond the sequential playlist's advertisable
+  frontier, which only this pump's own finalize reports can move, so parking on it was waiting
+  for oneself. Deliberately unchanged: `OutputTimestampSanitizer` keeps latching, because
+  movenc latches monotonicity on its own once a wrapped packet is accepted, and a sanitizer
+  reset would only convert garbage timestamps into rejected writes.
+- The duration cap above also covers the duration a container DECLARES, and the skipped park
+  hands its wedge detection on instead of dropping it (#369 follow-up). The cap only guarded
+  the inferred delta, but the branch that runs when no forward delta exists (the EOF tail of
+  exactly the wrapped stream the cap is for) passed the source's own number through untouched,
+  and movenc rejects a sample on the number, not on where it came from. The skipped park is
+  the more consequential one: the #207 disk park deliberately has no wedge breaker because the
+  advance park catches a frozen consumer first, so skipping the advance park left a pump that
+  races to the retention budget and then holds there forever on a consumer that will never
+  move again. It now carries the same #65 detector, whose one-second cadence this park already
+  polls at, and a trip ends the pump onto the existing re-anchor surface, which a sequential
+  origin refuses into `onVODSourceFailed` within seconds.
+- A sequential-origin session now serves its EVENT playlist from the first finalized
+  segment and no longer spends the origin's prefix on the keyframe-spacing scan (#370).
+  The startup gate reused a live sliding-window constant and demanded 2 published
+  durations, and because a duration is only final when the NEXT segment's ledger opens,
+  that meant 3 segment opens (~12-18 s of media) before AVPlayer's held playlist GET was
+  answered; on a stalling origin the GET sat out the full 30 s and the asset load died on
+  -12884 with ~12 s of media already on disk. A one-segment EVENT playlist is legal HLS
+  and the refresh counter already defeats the -12888 patience the live constant guards
+  against. The spacing scan's seek is a silent no-op on the non-seekable sequential pb, so
+  it consumed up to 30 s of the single byte-0-only connection without the pump ever seeing
+  those packets; sequential plans now go straight to the target stride (the #358 holes the
+  scan softens don't bite the append playlist, whose zero-duration holes get no URI), which
+  also stops the archive's first GOPs from being read past before the pump starts. A pump
+  that dies before publishing anything now also releases a held startup GET immediately
+  instead of letting it sit out the rest of its timeout.
+- The startup-GET release above is now tied to the failure surface rather than to two call sites,
+  and the gate counts what the playlist can advertise (#370 follow-up). A sequential origin reaches
+  three further terminal surfaces: `.muxerFailed` revives through `requestRestart`, which a
+  sequential origin refuses, and the AE#366 moov-prime and AE#169 read-error arms end on their own
+  exhaustion. Each of those can fire before the first duration is published (an E-AC-3 archive whose
+  first segment carries no audio packet is the field shape), and the held GET then still sat out its
+  full 30 s on a session that had already failed; every VOD failure now surfaces through one method
+  that releases the wait with it. The gate also counted raw appended entries, while the renderer
+  gives a zero-duration entry (a plan index a long GOP skipped) no URI, so it could have answered
+  the held GET with a playlist that renders empty, which is the -12888 the gate exists to prevent.
+  With the cushion down to one entry there is no second entry left to mask that, so the gate now
+  counts advertisable entries.
+
+## [6.25.1] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.1))
+
+### Fixed
+
+- A VOD source that produces nothing at all now reports it instead of leaving the
+  host on a playlist that will never gain a segment. The decision for that
+  (`isFatalVODPumpExit`, #126) is about what the pump produced, not about how it
+  died, but it only fired on a read error, so a source that runs to EOF without
+  ever writing a packet fell through every arm: measured on such a file, the host
+  sat at `state=playing phase=rebuffering` for the whole session while the
+  provider answered `404 init.mp4 empty`. It now also covers `.eof`, and the
+  gate-starvation re-anchor reports whether it actually re-anchored so a spent
+  arm reaches the same surface rather than ending on a bare return. An ordinary
+  EOF after real playback is untouched: what keeps this safe is the
+  produced-nothing condition, which such a session does not meet.
+
+## [6.25.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.0))
+
+### Added
+
+- `VideoNALFraming`, the framing of a packet payload (Annex B or length-prefixed).
+  `DoviRpuConverter.convertPacketToProfile81` and `enhancementLayerType` take it as a
+  defaulted parameter, so existing calls are unchanged; a caller that hands them Annex-B
+  packets now has a way to say so.
+
+### Fixed
+
+- A source whose selected audio track is sparsely interleaved no longer ends in
+  a permanent black screen (#366). The first segment of an AC-3 / E-AC-3 source
+  cannot be cut until one parsed audio packet has reached the muxer, and the
+  search for that packet read forward from where the pump stopped, bounded at
+  128 MiB. That bound is a byte bound, so what it buys shrinks as the bitrate
+  grows: five minutes of a 3 Mbps encode, ten seconds of a 97 Mbps UHD remux,
+  and a legacy dub track can have its first packet hundreds of MiB in. When the
+  forward scan comes back empty the engine now seeks to a handful of positions
+  and takes any frame the track yields there, which is enough because AC-3 and
+  E-AC-3 are one complete syncframe per packet and the prime frame's timestamp
+  is discarded anyway. Measured on a fixture whose first audio packet sits at
+  211 MiB: the forward scan and the midpoint probe find nothing, the 90 % probe
+  finds a frame after two packets, and the session plays with the audio landing
+  exactly at its source timestamp. Nothing in the container points at the track:
+  `AVStream.start_time` for that track reads 0.
+- A VOD session that exhausts its muxer-failure revive budget now reports the
+  failure to the host (#366). The arm was a bare `return`: no producer, no
+  restart and no error, so the provider answered `404 init.mp4 empty` forever
+  while AVPlayer sat in `waitingToPlay`, which reaches the viewer as a black
+  screen with nothing in it to act on. Its sibling arm for read errors has
+  surfaced its own exhaustion since AE#169. The terminal failure now carries a
+  reason as well as a code, so a source that could not be muxed no longer
+  reports itself as a failed read (three of the existing call sites, the #358
+  unproducible segment and the sequential-origin reposition among them, were
+  reporting the same wrong cause).
+
+- A HEVC source whose config record is Annex B while its packets are
+  length-prefixed no longer produces a session with no picture (#365). The mp4
+  muxer decides whether to convert samples by looking at the extradata
+  ("extradata is Annex B, assume the bitstream is too"), so on such a source it
+  ran its Annex-B converter over MP4-framed samples and emptied them: measured
+  on a 1080p fixture, a 2,158,448 B segment came out at 61,912 B while the
+  init.mp4 stayed perfectly valid and AVPlayer reached `readyToPlay` without
+  ever producing a frame. The engine now measures the framing on real packets at
+  open and converts the record to an hvcC when the two disagree, so the muxer's
+  own test comes out right. This is the shape a Matroska remux has when its
+  CodecPrivate is Annex B or missing entirely, in which case libavformat
+  synthesises Annex-B extradata from the first in-band parameter sets. The
+  predicate mirrors movenc for H.264 as well (there it reformats on anything
+  that is not an `avcC`), though an H.264 source of that shape usually fails
+  further upstream: its parser cannot split the packets either.
+- The DV Profile 7 to 8.1 rewrite is no longer a silent no-op on an Annex-B
+  source (#365). Its NAL walk assumed length prefixes, so on start-code framing
+  it read `00 00 01 40` as a 320-byte NAL, found no RPU, and shipped the P7 RPU
+  and the enhancement layer inside a container the muxer had already rewritten
+  to 8.1. It now takes the measured framing and emits the packet in the framing
+  it received.
+- The in-band parameter-set rebuild (#19) no longer runs on Annex-B extradata.
+  Bytes 21 and 22 of an Annex-B HEVC record pass its two checks by construction
+  rather than by luck (the `00 00 03` emulation-prevention pattern in a Main10
+  VPS sits exactly there), so it scanned a buffer that is not a config record at
+  all. `canonicalizeHEVCConfigRecord` has always had the `configurationVersion`
+  guard; this path never did.
+
+## [6.24.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.24.0))
+
+### Changed
+
+- A live `.m3u8` on the raw live path is now routed onto the live ingest
+  instead of failing closed (#363). The AE#140 detection stays (an `#EXTM3U`
+  body where a container's first byte belongs), only its destination changes:
+  the engine builds the `HLSLiveIngestReader` it used to name in the error, and
+  that reader puts `LoadOptions.httpHeaders` on the playlist, on every segment
+  and on every AES key, which is what a tokenized IPTV origin enforces per
+  request. `AetherEngineError.hlsPlaylistOnRawLivePath` still exists and still
+  throws for a custom `IOReader`, which has no playlist URL to ingest from.
+
+### Fixed
+
+- A live remote-HLS session that the origin refuses outright no longer dies at
+  the mount (#363). HTTP 401 and 403 reach the item as `NSURLError` -1013 and
+  -1102, and the engine now hands such a session to the live ingest, whose
+  fetcher is a different client at that origin: configured headers on every
+  request, at most four concurrent fetches, no AVFoundation user agent. Gated
+  by `LoadOptions.nativeRemoteHLSIngestFallback` like the #168 carriage
+  recovery, fires once per session, and is deliberately not remembered for the
+  next load, because a refusal can be an expired token or a full connection
+  cap rather than a property of the master.
+- `aetherctl` can drive a header-enforcing origin at last: `play --header
+  "Name: Value"` (repeatable) fills `LoadOptions.httpHeaders` and rides into
+  the ingest reader, and `hlsfixture` grew `--require-header`,
+  `--deny-status`, `--deny-user-agent`, `--deny-segments-only`,
+  `--redirect-entry` / `--redirect-host` / `--redirect-port`, `--media-origin`
+  and `--segments-dir`. The last one serves pre-cut, GOP-aligned segments, so a
+  live run can be asked whether it PLAYS rather than only whether it routed.
+
+## [6.23.1] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.23.1))
+
+### Fixed
+
+- A bitmap subtitle now ends where its author ended it, not where the next
+  landing happened to decode (#362). A PGS set has no end of its own; whatever
+  packet follows on the stream closes it. The drain decodes a window bounded at
+  the playhead plus its lead, and that forward edge falls wherever it falls:
+  where it landed between a set and its clear, the set was published open, the
+  cursor moved on, and the next thing to touch it was a composition at the next
+  seek landing, tens or hundreds of seconds later. The packet store already
+  held that clear, so an open set now takes its end from there, and the forward
+  prefetch parks a margin beyond the drain window so the answer is stored
+  before the set publishes.
+- A stretch of a title no longer loses its subtitles after a seek burst (#362).
+  A seek restarts the pump behind the landing while the store still holds an
+  island the previous run harvested further ahead, and the drain decoded across
+  that hole and carried its cursor past it, so the packets arriving a second
+  later were never read. A tick now stops where the harvest ORDER breaks rather
+  than where the gaps are widest, which is what separates a hole nobody has
+  read from a silence the author left. The wait ends when the harvest closes
+  the hole, when the playhead reaches it, or on a tick budget, so a silence can
+  never stall delivery, and a tick that waited states itself in the delivery
+  line.
+
+## [6.23.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.23.0))
+
+### Added
+
+- `startupProgress` publishes how far a load has come, for hosts drawing a
+  determinate loading bar instead of an indeterminate spinner (#361). It is a
+  fixed ladder of nine checkpoints, each recorded by the code that finishes the
+  work it names, so the number never runs on a timer and never advances on an
+  estimate: a slow stretch holds and a skipped one jumps. Two of those
+  checkpoints cover stretches a host previously had no visibility into at all,
+  and they are the two that dominate a slow start: the source open, split into
+  connection, container and stream analysis, and the display-criteria
+  handshake. The value is scoped to a startup generation that counts the waits
+  a user actually sat through rather than teardowns, so an engine-initiated
+  reroute (an HLS playlist discovered on the loopback path) continues the bar
+  instead of dropping it back to zero mid-load. Monotonic and deduped; a load
+  that fails or is stopped never reaches the last checkpoint.
+
+## [6.22.1] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.22.1))
+
+### Fixed
+
+- A seek no longer carries a pre-seek subtitle into the new position (#357).
+  A PGS composition has no end of its own: it is published with FFmpeg's
+  open-ended placeholder end and closed when its successor arrives. A jump
+  outruns that successor, and the retention prune filters on the end time,
+  which a placeholder can never age out of, so the old cue stayed in the
+  published window covering the new playhead and every host that asks which
+  cue is active rendered it. A reset tick now retires the unconfirmed end at
+  the start of its reconstruction window, on the store and on the #100 hold
+  alike. An authored duration is untouched.
+
+## [6.22.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.22.0))
+
+### Added
+
+- `systemCaptionRequest` publishes a caption request the system made on its
+  own (Sodalite#65). iOS 26 turns captions on by itself when playback is
+  muted, when the user skips back, or when the audio language differs from the
+  system language, and none of those three toggles has a read API. What the
+  system does have is an effect: it selects a legible option in the item. The
+  engine keeps deselecting that option, because its renditions exist for PiP,
+  AirPlay and external screens and rendering one in fullscreen draws a caption
+  box over a host's own subtitles, and it now reports the request instead of
+  swallowing it. The payload is the option's language tag rather than a track
+  id, because rendition ordinals are matched by language rank and not
+  positionally.
+- `setTeletextPage(_:)` changes the teletext caption page while a channel
+  plays (#364). The page used to reach `EmbeddedSubtitleDecoder` only at
+  construction, so it was fixed for the life of a selection and a channel
+  whose caption page libzvbi does not flag as a subtitle page could only be
+  corrected by leaving it, changing a setting and coming back. It now travels
+  with the decoder rebuild the drain path already performs, and only the
+  channels actually showing a teletext track are re-decoded. `teletextPage`
+  reads the page in force; the value lands in the session's load options, so
+  the internal reopens (audio switch, background reload) replay it.
+- `aetherctl play --teletext-page N` fixes the page at load and
+  `--switch-teletext-page <page|auto>[@ms]` changes it on the playing channel,
+  which is what makes the runtime path measurable from the CLI at all.
+
+### Fixed
+
+- The native legible rendition stays deselected for the whole session rather
+  than for its first two seconds (Sodalite#65). The pin covered AVKit's
+  ready-time auto-select and nothing after it, so iOS 26's automatic captions,
+  which fire minutes into a session, had nothing holding them back and AVKit
+  rendered the rendition over the frame as an empty caption box. A
+  media-selection observer now holds the deselect for the item's whole life,
+  bounded against a selection fight it cannot win: several re-asserts inside
+  one second stand down and log instead of spinning.
+
+## [6.21.1] - 2026-08-12
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.21.1))
+
+### Fixed
+
+- A live subtitle rendition re-anchors when the source axis moves under it
+  (#359). The placement pairs a segment's wall time with the session's shift,
+  and a producer seam republishes that shift, which left every cue already
+  placed referring to an axis that no longer existed. Unfixed this reads as
+  subtitles drifting further out the longer a channel runs, and it never
+  appears in a short session, which is exactly the shape that survives a
+  test.
+
+### Added
+
+- `[LiveSubs]` states its anchor once and its running relation about every
+  30 s: the lead of the newest cue over the picture, the cue count and the
+  current shift. A viewer reporting late subtitles cannot tell a misplaced
+  anchor from a stalled fetch, and those two numbers separate them.
+
+## [6.21.0] - 2026-08-11
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.21.0))
+
+### Added
+
+- Live HLS subtitle renditions reach the host (#359). The live ingest modelled
+  variants, the audio group and its renditions, and dropped
+  `EXT-X-MEDIA:TYPE=SUBTITLES` on the floor, so a channel offering WebVTT
+  subtitles had no subtitle track at all: `subtitleTracks` stayed empty, and a
+  host's Teletext preference had no decoder to apply to, because a decoder is
+  only built once a track is selected. The group's renditions now surface as
+  `TrackInfo` entries under `liveSubtitleRenditionTrackIDBase` (300_000), and
+  selecting one starts a poll of that rendition's playlist. Nothing is fetched
+  before that: a channel watched without subtitles pays no second HTTP loop.
+- `aetherctl play --live-ingest` loads a URL through `HLSLiveIngestReader` as a
+  custom source, the shape a host uses for a live channel it ingests itself.
+  The live ingest had no CLI harness against a real channel, which is why the
+  gap above went unnoticed.
+
+### Fixed
+
+- Cues of a live subtitle rendition are placed by playlist geometry rather than
+  by `X-TIMESTAMP-MAP` (#359). Measured against a public broadcaster the spec's
+  own anchor does not carry: the rendition writes one constant map whose MPEGTS
+  value sits two hours off the video rendition's PTS. What renditions of a
+  program do share is identical `EXT-X-MEDIA-SEQUENCE` and identical
+  `EXT-X-PROGRAM-DATE-TIME`, so a cue is placed by its segment's wall time plus
+  its offset inside that segment, against the wall time the video ingest joined
+  at. A segment carrying no map is refused rather than placed at face value.
+- `RemoteHLSMediaSelection.ordinal` no longer claims track ids above its own
+  space. The membership test was `id >= base` with no upper bound, so every id
+  range added above it was routed into the AVMediaSelection path, where the
+  symptom is not an error but a selection that silently does nothing.
+- Media playlists carry `EXT-X-PROGRAM-DATE-TIME` through the parser, including
+  the segments that inherit it from an earlier tag, and a segment rebuilt to
+  mark a discontinuity keeps it.
+
 ## [6.20.2] - 2026-08-11
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.20.2))

@@ -492,6 +492,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// can be worth. winCond-guarded (written by the delegate thread).
     private var lastFirstDataMs: Double = 0
 
+    /// Test seam: pins the wait budget, so a test that wants the fetch held in flight does not have
+    /// to keep an origin's simulated latencies on the right side of a bound derived from one of
+    /// them. That margin was 250 ms and a loaded CI runner spent it (#281 flake, 2026-08-11).
+    /// `Self.tailPrefetchWaitBudget(firstDataMs:)` is what guards the real bound.
+    var tailPrefetchWaitBudgetForTesting: TimeInterval?
+
     /// True from `open()` until the demuxer reports its header/stream-info pass done. The parse
     /// seeks this fix targets all happen inside that window; a far seek afterwards is a real scrub,
     /// where the old window is worthless and parking it would only cost memory.
@@ -657,7 +663,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // container never begins with '#' (TS syncs on 0x47; MP4/MKV open with binary box/EBML markers),
             // so an #EXTM3U prefix is an unambiguous misroute. The host is pointed at the HLS entry points.
             if isLive, gotData, Self.bodyBeginsWithHLSPlaylistTag(firstWindowPrefix()) {
-                EngineLog.emit("[AVIOReader] HLS playlist body on the raw live path (AE#140); failing closed. Use LoadOptions.nativeRemoteHLS or HLSLiveIngestReader for m3u8 sources.", category: .demux)
+                EngineLog.emit("[AVIOReader] HLS playlist body on the raw live path (AE#140); stopping here. A URL source is routed onto the live ingest by load() (AE#363); a custom reader keeps the typed rejection.", category: .demux)
                 markClosed()
                 close()
                 throw AVIOReaderError.hlsPlaylistOnRawLivePath
@@ -1973,7 +1979,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the first connection out of a warm cache; the cap keeps a hung fetch from owning the open.
     /// Caller holds `winCond`.
     private func tailPrefetchWaitBudget() -> TimeInterval {
-        min(5.0, max(0.25, (lastFirstDataMs / 1000) * 2))
+        tailPrefetchWaitBudgetForTesting ?? Self.tailPrefetchWaitBudget(firstDataMs: lastFirstDataMs)
+    }
+
+    /// The bound itself, free of the reader's state so it can be checked without a socket.
+    nonisolated static func tailPrefetchWaitBudget(firstDataMs: Double) -> TimeInterval {
+        min(5.0, max(0.25, (firstDataMs / 1000) * 2))
     }
 
     /// Start offset of the bytes a 206 actually carries, from `Content-Range: bytes a-b/total`.

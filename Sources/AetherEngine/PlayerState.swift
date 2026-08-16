@@ -15,6 +15,11 @@ public enum PlaybackState: Sendable, Equatable {
     /// AVPlayer directly, which is impossible on the software-decode path (#63). Cleared by the next
     /// `load(...)`. Transport calls (`seek`, `togglePlayPause`) are no-ops here; reload to replay.
     case ended
+    /// Terminal failure carrying a human-readable message. The text is a payload, not a classification key:
+    /// part of it is the engine's own sentence naming the cause, the rest is forwarded from the failure
+    /// underneath (on the native paths `AVPlayerItem.error.localizedDescription`, which AVFoundation
+    /// localizes into the device language). Bucket failures by `videoRoute`, `playbackPhase` and the
+    /// furthest `startupProgress` checkpoint, and keep the string for the log.
     case error(String)
 }
 

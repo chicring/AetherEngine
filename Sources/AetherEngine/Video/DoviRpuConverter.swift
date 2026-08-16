@@ -10,13 +10,33 @@ public enum DoviRpuConverter {
     private static let nalTypeEL: UInt8  = 63   // unspec63: enhancement layer
     private static let lengthPrefixSize = 4
 
+    /// Both framings this rewrite can emit use a 4-byte prefix, so the packet keeps its layout maths.
+    /// A 1/2/3-byte length prefix would need the hvcC's `lengthSizeMinusOne` to agree with whatever we
+    /// wrote; rather than write a framing the sample entry does not declare, leave the packet alone.
+    private static func canRebuild(_ framing: VideoNALFraming) -> Bool {
+        switch framing {
+        case .annexB: return true
+        case .lengthPrefixed(let size): return size == lengthPrefixSize
+        }
+    }
+
     /// Returns `false` when a libdovi conversion fails (or on an internal allocation failure).
     /// On a libdovi failure the offending RPU (and EL) are dropped so the frame degrades to the
     /// clean HDR10 base, rather than shipping a P7 RPU inside a container already declared 8.1
     /// (mixed-profile hazard, #135). Packets with no RPU/EL are left untouched and return `true`.
-    public static func convertPacketToProfile81(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+    ///
+    /// `framing` must be the framing of THIS packet, and the rewritten packet is emitted in the same
+    /// one: the mp4 muxer decides whether to convert samples from the extradata, so a packet that
+    /// changes framing under it is a second defect (#365). An Annex-B packet walked as length-
+    /// prefixed reads `00 00 01 40` as a 320-byte NAL and finds no RPU at all, which is how a P7
+    /// source shipped its RPU and EL untouched inside a container already rewritten to 8.1.
+    public static func convertPacketToProfile81(
+        _ packet: UnsafeMutablePointer<AVPacket>,
+        framing: VideoNALFraming = .lengthPrefixed(size: 4)
+    ) -> Bool {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return true }
         guard packet.pointee.size > 4 else { return true }
+        guard Self.canRebuild(framing) else { return true }
         let size = Int(packet.pointee.size)
 
         var outputNALs: [[UInt8]] = []
@@ -24,43 +44,35 @@ public enum DoviRpuConverter {
         var droppedEL = false
         var degraded = false
 
-        var off = 0
-        while off + lengthPrefixSize <= size {
-            var len = 0
-            for i in 0..<lengthPrefixSize {
-                len = (len << 8) | Int(data[off + i])
-            }
-            let nalStart = off + lengthPrefixSize
-            if len == 0 || nalStart + len > size { break }
-
+        A53SEIParser.forEachNAL(data, size, framing) { nal, len in
             // HEVC NAL type: bits 1..6 of byte 0.
-            let nalType = (data[nalStart] >> 1) & 0x3F
+            let nalType = (nal[0] >> 1) & 0x3F
 
             switch nalType {
             case nalTypeRPU:
                 // Any libdovi failure drops the RPU (degraded) instead of muxing a stale P7 RPU
                 // inside a container already declared 8.1 (mixed-profile hazard, #135).
-                guard let rpu = dovi_parse_unspec62_nalu(data + nalStart, len) else {
+                guard let rpu = dovi_parse_unspec62_nalu(nal, len) else {
                     degraded = true
-                    break
+                    return
                 }
                 let rc = dovi_convert_rpu_with_mode(rpu, 2)
                 if rc != 0 {
                     dovi_rpu_free(rpu)
                     degraded = true
-                    break
+                    return
                 }
                 guard let out = dovi_write_unspec62_nalu(rpu) else {
                     dovi_rpu_free(rpu)
                     degraded = true
-                    break
+                    return
                 }
                 let outLen = out.pointee.len
                 guard let outData = out.pointee.data, outLen > 0 else {
                     dovi_data_free(out)
                     dovi_rpu_free(rpu)
                     degraded = true
-                    break
+                    return
                 }
                 outputNALs.append([UInt8](UnsafeBufferPointer(start: outData, count: outLen)))
                 dovi_data_free(out)
@@ -71,10 +83,8 @@ public enum DoviRpuConverter {
                 droppedEL = true
 
             default:
-                outputNALs.append([UInt8](UnsafeBufferPointer(start: data + nalStart, count: len)))
+                outputNALs.append([UInt8](UnsafeBufferPointer(start: nal, count: len)))
             }
-
-            off = nalStart + len
         }
 
         if !converted && !droppedEL && !degraded {
@@ -98,13 +108,18 @@ public enum DoviRpuConverter {
             return false
         }
 
+        let emitsStartCodes = framing == .annexB
         var w = 0
         for nal in outputNALs {
             let n = nal.count
-            dst[w + 0] = UInt8((n >> 24) & 0xFF)
-            dst[w + 1] = UInt8((n >> 16) & 0xFF)
-            dst[w + 2] = UInt8((n >> 8) & 0xFF)
-            dst[w + 3] = UInt8(n & 0xFF)
+            if emitsStartCodes {
+                dst[w + 0] = 0; dst[w + 1] = 0; dst[w + 2] = 0; dst[w + 3] = 1
+            } else {
+                dst[w + 0] = UInt8((n >> 24) & 0xFF)
+                dst[w + 1] = UInt8((n >> 16) & 0xFF)
+                dst[w + 2] = UInt8((n >> 8) & 0xFF)
+                dst[w + 3] = UInt8(n & 0xFF)
+            }
             w += lengthPrefixSize
             nal.withUnsafeBufferPointer { src in
                 if let base = src.baseAddress, n > 0 {
@@ -127,30 +142,23 @@ public enum DoviRpuConverter {
     /// there is no RPU, the RPU is unparseable, or the source is not profile 7. One-shot diagnostic:
     /// a FEL source loses highlight/detail refinement in the P8.1 conversion (the EL is discarded),
     /// so callers can explain why a FEL disc looks flatter than on a native P7 player.
-    public static func enhancementLayerType(_ packet: UnsafePointer<AVPacket>) -> String? {
+    public static func enhancementLayerType(
+        _ packet: UnsafePointer<AVPacket>,
+        framing: VideoNALFraming = .lengthPrefixed(size: 4)
+    ) -> String? {
         guard let data = packet.pointee.data, packet.pointee.size > 4 else { return nil }
         let size = Int(packet.pointee.size)
 
-        var off = 0
-        while off + lengthPrefixSize <= size {
-            var len = 0
-            for i in 0..<lengthPrefixSize {
-                len = (len << 8) | Int(data[off + i])
-            }
-            let nalStart = off + lengthPrefixSize
-            if len == 0 || nalStart + len > size { break }
-
-            if (data[nalStart] >> 1) & 0x3F == nalTypeRPU {
-                guard let rpu = dovi_parse_unspec62_nalu(data + nalStart, len) else { return nil }
-                defer { dovi_rpu_free(rpu) }
-                guard let hdr = dovi_rpu_get_header(rpu) else { return nil }
-                defer { dovi_rpu_free_header(hdr) }
-                guard let el = hdr.pointee.el_type else { return nil }
-                return String(cString: el)
-            }
-
-            off = nalStart + len
+        var result: String?
+        A53SEIParser.forEachNAL(data, size, framing) { nal, len in
+            guard result == nil, (nal[0] >> 1) & 0x3F == nalTypeRPU else { return }
+            guard let rpu = dovi_parse_unspec62_nalu(nal, len) else { return }
+            defer { dovi_rpu_free(rpu) }
+            guard let hdr = dovi_rpu_get_header(rpu) else { return }
+            defer { dovi_rpu_free_header(hdr) }
+            guard let el = hdr.pointee.el_type else { return }
+            result = String(cString: el)
         }
-        return nil
+        return result
     }
 }

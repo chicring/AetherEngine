@@ -19,7 +19,8 @@ final class AudioAVPlayerHost {
     /// Siri Remote, AirPods) plays/pauses the AVPlayer directly. Without it `state` goes stale and the play/pause
     /// toggle is swallowed (looks like "only pause works").
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
-    @Published private(set) var failureMessage: String?
+    /// #376: carries the classification with the message, so the engine can publish both.
+    @Published private(set) var failure: PlaybackErrorInfo?
     @Published private(set) var didReachEnd: Bool = false
 
     // MARK: - Output
@@ -111,7 +112,7 @@ final class AudioAVPlayerHost {
         #endif
         playerItem = item
 
-        failureMessage = nil
+        failure = nil
         didReachEnd = false
         isReady = false
         currentTime = 0
@@ -163,8 +164,9 @@ final class AudioAVPlayerHost {
                 }
             case .failed:
                 let message = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                let info = PlaybackErrorInfo(kind: .audioSessionFailed, message: message, underlying: item.error)
                 Task { @MainActor [weak self] in
-                    self?.failureMessage = message
+                    self?.failure = info
                 }
             default:
                 break
@@ -219,8 +221,9 @@ final class AudioAVPlayerHost {
         ) { [weak self] notification in
             let err = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
             let message = err?.localizedDescription ?? "Playback failed to reach end"
+            let info = PlaybackErrorInfo(kind: .audioSessionFailed, message: message, underlying: err)
             Task { @MainActor [weak self] in
-                self?.failureMessage = message
+                self?.failure = info
             }
         }
 
@@ -309,9 +312,9 @@ final class AudioAVPlayerHost {
         #endif
         // Host is persistent across tracks; clear terminal flags so the next load's subscriptions (wired before
         // host.load) don't replay them: stale didReachEnd=true fired .idle mid-load (double-skip on auto-advance
-        // hosts), stale failureMessage flipped the new track to .error before it started.
+        // hosts), stale failure flipped the new track to .error before it started.
         didReachEnd = false
-        failureMessage = nil
+        failure = nil
     }
 
     var volume: Float {

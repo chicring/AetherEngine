@@ -281,6 +281,26 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var _seqDurations: [Double] = []
     /// Producer reached true source EOF: the next playlist build appends ENDLIST. Guarded by stateLock.
     private var _seqEnded = false
+    /// #370: the pump died before publishing anything; a held startup-playlist GET must not sit out
+    /// the rest of its timeout for a session that is already failing. Guarded by stateLock.
+    private var _seqStartupAborted = false
+    /// #370 follow-up: how many appended entries the playlist renderer will actually advertise. A
+    /// zero-duration entry is a plan index a long GOP skipped, and `buildMediaPlaylistText` gives it
+    /// no URI, so counting raw entries would let the startup gate release onto a playlist that
+    /// renders empty. That is the very thing the gate exists to prevent (-12888 on first read), and
+    /// with the cushion down to one entry there is no longer a second entry to mask it.
+    /// Guarded by stateLock.
+    private var _seqAdvertisableCount = 0
+
+    /// #370: never hold the first media playlist for more than ONE published duration. The live
+    /// constant this gate reused (`LiveEdgePolicy.minStartupSegments = 2`) guards a SLIDING window
+    /// whose live-edge holdback can't fit one segment; an EVENT playlist starts at media sequence 0,
+    /// grows append-only, and its refresh counter already defeats AVPlayer's unchanged-playlist
+    /// patience (-12888). The cost of demanding 2 was concrete: a published duration needs the NEXT
+    /// segment's ledger open, so "2 durations" = 3 segment opens ≈ 12-18 s of media through a
+    /// possibly-stalling origin. The field session held AVPlayer's playlist GET for the full 30 s
+    /// and the asset load timed out (-12884) with ~12 s of media already on disk.
+    static let sequentialStartupSegments = 1
 
     init(
         cache: SegmentCache,
@@ -402,7 +422,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
         // Zero marks a plan index a long GOP skipped entirely (no media file exists); the
         // playlist renderer omits those entries. Negative values are producer bugs, clamp them.
-        _seqDurations.append(max(0, durationSeconds))
+        let clamped = max(0, durationSeconds)
+        _seqDurations.append(clamped)
+        if clamped > 0 { _seqAdvertisableCount += 1 }
         stateLock.unlock()
         firstSegmentCondition.lock()
         firstSegmentCondition.broadcast()
@@ -421,7 +443,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         firstSegmentCondition.unlock()
     }
 
-    /// Hold the first media playlist until the startup segments exist (mirrors the live gate:
+    /// Hold the first media playlist until the startup segment exists (mirrors the live gate:
     /// an empty playlist is a broken asset to AVPlayer, which never re-polls it). A fast
     /// archive origin cuts the first segments within a second.
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool {
@@ -430,11 +452,25 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         defer { firstSegmentCondition.unlock() }
         while true {
             stateLock.lock()
-            let ready = _seqDurations.count >= LiveEdgePolicy.minStartupSegments || _seqEnded
+            let ready = _seqAdvertisableCount >= Self.sequentialStartupSegments || _seqEnded
+            let aborted = _seqStartupAborted
             stateLock.unlock()
             if ready { return true }
+            if aborted { return false }
             if !firstSegmentCondition.wait(until: deadline) { return false }
         }
+    }
+
+    /// #370: release a held startup-playlist GET when the pump dies before publishing anything.
+    /// The session is failing anyway; holding the server thread for the rest of the timeout only
+    /// delays the host's failure surface.
+    func abortSequentialStartupWait() {
+        stateLock.lock()
+        _seqStartupAborted = true
+        stateLock.unlock()
+        firstSegmentCondition.lock()
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
     }
 
     /// Called on each playlist build. For live: advances firstVisible to max(0, highWater - window),
@@ -938,7 +974,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     /// AE#141: whether the active producer's march can plausibly deliver `index` without a
-    /// re-anchor — at or behind its anchor-to-front span, or within the forward-wait window
+    /// re-anchor: at or behind its anchor-to-front span, or within the forward-wait window
     /// ahead of the front. The engine's seek-deadline backstop asks this before preserving a
     /// "progressing" producer whose march would never reach the pending seek target.
     func activeMarchCovers(_ index: Int) -> Bool {

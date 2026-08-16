@@ -34,6 +34,32 @@ final class AudioBridge: @unchecked Sendable {
 
     typealias Mode = AudioBridgeMode
 
+    // MARK: - Encoder shape
+
+    /// Channel ceiling per bridge mode. `.surroundCompat` sits at 6 because FFmpeg's EAC3 encoder
+    /// caps there until the dependent-substream patch lands upstream (a 7.1 source is folded to
+    /// 5.1); `.lossless` FLAC carries 7.1 whole, and 8 is also Apple's HDMI LPCM ceiling.
+    ///
+    /// Pure and named rather than inline, because docs/formats.md quotes both numbers and
+    /// `DocumentedConstantsTests` pins them: a cap that moves without the sentence moving with it
+    /// is a doc that lies in a paragraph that still reads perfectly.
+    static func maxEncodedChannels(for mode: Mode) -> Int32 {
+        switch mode {
+        case .surroundCompat: return 6
+        case .lossless:       return 8
+        }
+    }
+
+    /// EAC3 scales at 128 kbps per resolved channel (Dolby's transparent reference profile): 256
+    /// kbps stereo, 768 kbps 5.1, and 1024 kbps if the cap above ever reaches 8. FLAC is VBR, so
+    /// its rate is 0 (unlimited) rather than a number.
+    static func encoderBitRate(for mode: Mode, channels: Int32) -> Int64 {
+        switch mode {
+        case .surroundCompat: return Int64(channels) * 128_000
+        case .lossless:       return 0
+        }
+    }
+
     // MARK: - Errors
 
     enum AudioBridgeError: Error, CustomStringConvertible, LocalizedError {
@@ -219,16 +245,8 @@ final class AudioBridge: @unchecked Sendable {
         // 2. Bridge encoder by mode: .surroundCompat -> EAC3 128 kbps/ch max 6; .lossless -> FLAC VBR max 8.
         // bit_rate set below after channel count resolves (EAC3 scales 128 kbps x nChannels per DrHurt on
         // AetherEngine#4: 256 stereo, 768 5.1, scales if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
-        let encoderCodecID: AVCodecID
-        let maxEncodedChannels: Int32
-        switch mode {
-        case .surroundCompat:
-            encoderCodecID = AV_CODEC_ID_EAC3
-            maxEncodedChannels = 6
-        case .lossless:
-            encoderCodecID = AV_CODEC_ID_FLAC
-            maxEncodedChannels = 8
-        }
+        let encoderCodecID: AVCodecID = mode == .surroundCompat ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
+        let maxEncodedChannels = Self.maxEncodedChannels(for: mode)
         guard let encCodec = avcodec_find_encoder(encoderCodecID) else {
             cleanup()
             throw AudioBridgeError.encoderNotFound
@@ -288,13 +306,7 @@ final class AudioBridge: @unchecked Sendable {
         enc.pointee.sample_fmt = pcmSampleFmt
         enc.pointee.bits_per_raw_sample = pcmBitsPerRawSample
         // EAC3 per-channel bitrate 128 kbps (Dolby reference transparent profile); FLAC stays 0 = unlimited VBR.
-        let resolvedBitRate: Int64
-        switch mode {
-        case .surroundCompat:
-            resolvedBitRate = Int64(nChannels) * 128_000
-        case .lossless:
-            resolvedBitRate = 0
-        }
+        let resolvedBitRate = Self.encoderBitRate(for: mode, channels: nChannels)
         enc.pointee.bit_rate = resolvedBitRate
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
         var encLayout = AVChannelLayout()

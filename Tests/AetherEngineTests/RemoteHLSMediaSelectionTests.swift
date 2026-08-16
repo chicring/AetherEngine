@@ -18,7 +18,9 @@ struct RemoteHLSMediaSelectionTests {
             failure: AVIOReaderError.hlsPlaylistOnVODPath, isCustomSource: false))
     }
 
-    @Test("Live raw-path misroute keeps the AE#140 fail-closed behavior")
+    // AE#363: the live misroute has its own destination (the live ingest, `shouldRouteLiveOntoIngest`);
+    // what this pins is that it never takes the VOD side's route onto the AVPlayer bypass.
+    @Test("Live raw-path misroute never takes the native-bypass reroute")
     func noRerouteOnRawLiveMisroute() {
         #expect(!RemoteHLSMediaSelection.shouldReroute(
             failure: AVIOReaderError.hlsPlaylistOnRawLivePath, isCustomSource: false))
@@ -107,5 +109,21 @@ struct RemoteHLSMediaSelectionTests {
         #expect(RemoteHLSMediaSelection.ordinal(forTrackID: id) == 3)
         #expect(RemoteHLSMediaSelection.ordinal(forTrackID: 0) == nil)
         #expect(RemoteHLSMediaSelection.ordinal(forTrackID: AetherEngine.externalSubtitleTrackIDBase) == nil)
+    }
+
+    /// AE#359: the test used to be `id >= base`, which claimed every id space added above it. The live
+    /// subtitle renditions sit at 300_000 and were routed here, so selecting one silently drove the
+    /// AVMediaSelection path instead of their own and produced no cues at all.
+    @Test("An id above this space belongs to somebody else")
+    @MainActor
+    func idsAboveTheRangeAreNotClaimed() {
+        #expect(RemoteHLSMediaSelection.ordinal(forTrackID: AetherEngine.liveSubtitleRenditionTrackIDBase) == nil)
+        #expect(RemoteHLSMediaSelection.ordinal(
+            forTrackID: RemoteHLSMediaSelection.subtitleTrackIDBase
+                + RemoteHLSMediaSelection.subtitleTrackIDRangeCount) == nil)
+        // The last id inside the space still resolves.
+        #expect(RemoteHLSMediaSelection.ordinal(
+            forTrackID: RemoteHLSMediaSelection.subtitleTrackIDBase
+                + RemoteHLSMediaSelection.subtitleTrackIDRangeCount - 1) != nil)
     }
 }

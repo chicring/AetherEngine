@@ -1,5 +1,15 @@
 import Foundation
 
+/// NAL framing of a packet payload: Annex B start codes (MPEG-TS) or length-prefixed
+/// (avcC/hvcC extradata, e.g. Matroska/MP4 recordings).
+///
+/// Public because the DV P7 rewrite takes it (#365): a walker handed the wrong framing does not
+/// fail, it reads NAL boundaries at arbitrary offsets and reports that it found nothing.
+public enum VideoNALFraming: Equatable, Sendable {
+    case annexB
+    case lengthPrefixed(size: Int)
+}
+
 /// Extracts ATSC A/53 `cc_data` triplets from H.264 / HEVC video packet bitstreams (#131).
 ///
 /// US broadcast/cable-sourced streams carry closed captions inside the picture as
@@ -14,12 +24,7 @@ enum A53SEIParser {
         case hevc
     }
 
-    /// NAL framing of the packet payload: Annex B start codes (MPEG-TS) or length-prefixed
-    /// (avcC/hvcC extradata, e.g. Matroska/MP4 recordings).
-    enum NALFraming: Equatable {
-        case annexB
-        case lengthPrefixed(size: Int)
-    }
+    typealias NALFraming = VideoNALFraming
 
     /// "GA94" as raw bytes; static so the per-packet prefilter allocates nothing.
     private static let ga94Needle: [UInt8] = [0x47, 0x41, 0x39, 0x34]
@@ -73,7 +78,8 @@ enum A53SEIParser {
 
     // MARK: - NAL iteration
 
-    private static func forEachNAL(
+    /// Shared by the DV P7 RPU rewrite (#365), which has to walk the same NALs in the same framing.
+    static func forEachNAL(
         _ data: UnsafePointer<UInt8>, _ size: Int, _ framing: NALFraming,
         _ body: (UnsafePointer<UInt8>, Int) -> Void
     ) {

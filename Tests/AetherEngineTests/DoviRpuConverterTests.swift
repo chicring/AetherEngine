@@ -108,4 +108,80 @@ struct DoviRpuConverterTests {
         defer { free(pkt) }
         #expect(DoviRpuConverter.enhancementLayerType(pkt) == nil)
     }
+
+    // MARK: - #365: framing is given, not assumed
+
+    /// Pack NALs Annex B, the framing a Matroska remux with Annex-B CodecPrivate delivers.
+    private func annexBPacket(_ nals: [[UInt8]]) -> UnsafeMutablePointer<AVPacket> {
+        var bytes: [UInt8] = []
+        for nal in nals {
+            bytes += [0x00, 0x00, 0x00, 0x01]
+            bytes += nal
+        }
+        let pkt = av_packet_alloc()!
+        _ = av_new_packet(pkt, Int32(bytes.count))
+        bytes.withUnsafeBytes { src in
+            _ = memcpy(pkt.pointee.data, src.baseAddress, bytes.count)
+        }
+        return pkt
+    }
+
+    private func annexBNALTypes(_ pkt: UnsafeMutablePointer<AVPacket>) -> [UInt8] {
+        guard let data = pkt.pointee.data else { return [] }
+        var out: [UInt8] = []
+        A53SEIParser.forEachNAL(data, Int(pkt.pointee.size), .annexB) { nal, _ in
+            out.append((nal[0] >> 1) & 0x3F)
+        }
+        return out
+    }
+
+    /// Walked as length-prefixed, an Annex-B packet reads `00 00 00 01` as a 1-byte NAL and finds
+    /// nothing to convert, so the RPU and EL of a P7 source rode untouched into a container the
+    /// muxer had already rewritten to 8.1. The converter has to be told the framing.
+    @Test("An Annex-B packet walked with the wrong framing keeps its EL, walked with the right one loses it")
+    func annexBPacketNeedsItsFraming() {
+        let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
+        let el = hevcNAL(type: 63, payload: [0xCC])
+
+        let wrong = annexBPacket([bl, el])
+        defer { free(wrong) }
+        #expect(DoviRpuConverter.convertPacketToProfile81(wrong) == true)
+        #expect(annexBNALTypes(wrong) == [1, 63])   // untouched: the EL survived
+
+        let right = annexBPacket([bl, el])
+        defer { free(right) }
+        #expect(DoviRpuConverter.convertPacketToProfile81(right, framing: .annexB) == true)
+        #expect(annexBNALTypes(right) == [1])
+    }
+
+    @Test("A rewritten Annex-B packet stays Annex B")
+    func annexBPacketKeepsItsFraming() {
+        let pkt = annexBPacket([hevcNAL(type: 1, payload: [0xAA, 0xBB]),
+                                hevcNAL(type: 62, payload: [0x00]),
+                                hevcNAL(type: 63, payload: [0xCC])])
+        defer { free(pkt) }
+        #expect(DoviRpuConverter.convertPacketToProfile81(pkt, framing: .annexB) == false)
+        #expect(annexBNALTypes(pkt) == [1])
+        // Emitting length prefixes here would break the muxer's own Annex-B assumption downstream.
+        let head = [UInt8](UnsafeBufferPointer(start: pkt.pointee.data, count: 4))
+        #expect(head == [0x00, 0x00, 0x00, 0x01])
+    }
+
+    @Test("A length prefix size the sample entry cannot declare leaves the packet alone")
+    func refusesUnsupportedLengthSize() {
+        let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 63, payload: [0xCC])])
+        defer { free(pkt) }
+        #expect(DoviRpuConverter.convertPacketToProfile81(pkt, framing: .lengthPrefixed(size: 2)) == true)
+        #expect(nalTypes(pkt) == [1, 63])   // untouched rather than rewritten into a framing nobody declared
+    }
+
+    @Test("enhancementLayerType walks Annex-B packets when given the framing")
+    func elTypeWalksAnnexB() {
+        let pkt = annexBPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 62, payload: [0x00])])
+        defer { free(pkt) }
+        // A malformed RPU still returns nil, but it now REACHES the RPU: with the wrong framing the
+        // walk never sees NAL 62 at all, which is the failure this guards.
+        #expect(DoviRpuConverter.enhancementLayerType(pkt, framing: .annexB) == nil)
+        #expect(annexBNALTypes(pkt) == [1, 62])
+    }
 }

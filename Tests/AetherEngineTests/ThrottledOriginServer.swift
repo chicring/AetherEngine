@@ -277,14 +277,18 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 while !stopped { usleep(200_000) }
                 return false
             }
-            // Sequential-drop point: a short body followed by a hard close, so the client's
-            // transport surfaces a lost connection against the promised Content-Length.
+            // Sequential-drop point: the body ends short of the promised Content-Length, which is
+            // what the client's transport has to surface as a lost connection.
+            //
+            // Half-close, not close(). A full close tears down the receive direction too, and
+            // anything still in flight can then be answered with an RST, which discards whatever
+            // the peer has not handed to its application yet. The bytes this origin says it served
+            // would silently stop being the bytes the reader can see, and a test asserting on the
+            // amount delivered would be measuring the machine's scheduling (the 2026-08-11 CI
+            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable; `stop()`
+            // closes the descriptor, which is why it stays registered in `_connFDs`.
             if let dropAfter, served >= dropAfter {
-                lock.lock()
-                _connFDs.removeAll { $0 == fd }
-                lock.unlock()
-                shutdown(fd, SHUT_RDWR)
-                close(fd)
+                shutdown(fd, SHUT_WR)
                 return false
             }
             var n = Int(min(Int64(chunkBytes), remaining - served))
