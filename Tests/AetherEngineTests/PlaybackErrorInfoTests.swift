@@ -37,7 +37,7 @@ struct PlaybackErrorInfoTests {
     @Test("Kind raw values are the published tokens and are distinct")
     func rawValuesAreStableAndDistinct() {
         let kinds: [PlaybackErrorKind] = [
-            .sourceOpenFailed, .customSourceProbeFailed, .liveSourceUnavailable,
+            .sourceOpenFailed, .sourceRefused, .customSourceProbeFailed, .liveSourceUnavailable,
             .hlsPlaylistOnRawLivePath, .dolbyVisionRequiresHardware, .demuxedAudioLiveUnsupported,
             .nativeItemFailed, .noPlayableTrackWithinBudget, .masterPlaylistRejected,
             .vodSourceFailed, .softwarePipelineFailed, .audioSessionFailed,

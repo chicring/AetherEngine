@@ -70,10 +70,11 @@ func printUsage() {
       aetherctl serve [--no-dv] [--start-position S] <url>
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--seconds N] [--live] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--seconds N] [--live] [--fast-zap] [--dvr-window N] [--subs <codec-or-lang>]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--sequential-origin] [--declared-duration S]
+             [--max-concurrent-requests N]
                      [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback] <url>
                      (full load+play session smoke test; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
@@ -473,6 +474,12 @@ if first == "play" {
     // live on. Pair with --live; without it the m3u8 goes to the raw live path, which rejects it.
     let nativeHLS = takeFlag("--native-hls", from: &rest)
     let liveIngest = takeFlag("--live-ingest", from: &rest)
+    // AE#374: the join profile a host ships, against an origin of its own rather than the built-in
+    // fixture `live` carries. fastZap plus an external HLS origin is the shape a downstream player
+    // actually runs, and it could not be driven from here at all: the TARGETDURATION floor comes from
+    // the UPSTREAM's observed cadence, so what a fastZap start costs depends on an origin the raw-TS
+    // fixture does not have.
+    let playFastZap = takeFlag("--fast-zap", from: &rest)
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
@@ -499,6 +506,10 @@ if first == "play" {
     // unranged GET and no ranged probes; pair with --declared-duration on VOD because the tail
     // duration estimate is skipped along with the other ranged reads.
     let sequentialOrigin = takeFlag("--sequential-origin", from: &rest)
+    // #377: LoadOptions.maxConcurrentSourceRequests. Caps how many requests the reader may have
+    // open against the origin at once across every path it fetches on. `1` also switches off the
+    // speculative parallel paths. This is the knob for reproducing a connection-metered CDN.
+    let maxConcurrentRequests = takeIntFlag("--max-concurrent-requests", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -569,11 +580,12 @@ if first == "play" {
         printUsage()
         exit(64)
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
-                 sequentialOrigin: sequentialOrigin, declaredDuration: declaredDuration,
+                 sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
+                 declaredDuration: declaredDuration,
                  httpHeaders: playHeaders))
 }
 

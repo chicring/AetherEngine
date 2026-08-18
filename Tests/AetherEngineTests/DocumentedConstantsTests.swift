@@ -1,4 +1,5 @@
 import XCTest
+import Libavcodec
 @testable import AetherEngine
 
 /// The documentation quotes numbers. "32 entries", "six hours", "a quarter of the tmp volume's free
@@ -167,18 +168,19 @@ final class DocumentedConstantsTests: XCTestCase {
     /// 7.1-to-5.1 fold is a known limitation an adopter reads before choosing `.lossless`.
     func testAudioBridgeCapsAndRatesAreWhatTheDocsSay() throws {
         let docs = try documentation()
-        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: .surroundCompat), 6,
+        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_EAC3), 6,
                        "documented as capping 7.1 sources to 5.1")
-        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: .lossless), 8,
+        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_FLAC), 8,
                        "documented as FLAC up to 7.1")
-        XCTAssertEqual(AudioBridge.encoderBitRate(for: .surroundCompat, channels: 2), 256_000,
-                       "documented as 256 kbps stereo")
-        XCTAssertEqual(AudioBridge.encoderBitRate(for: .surroundCompat, channels: 6), 768_000,
+        XCTAssertEqual(AudioBridge.encoderBitRate(for: AV_CODEC_ID_EAC3, channels: 2), 256_000,
+                       "the stereo rate the #165 cascade still reaches on a build without FLAC")
+        XCTAssertEqual(AudioBridge.encoderBitRate(for: AV_CODEC_ID_EAC3, channels: 6), 768_000,
                        "documented as 768 kbps 5.1")
-        XCTAssertEqual(AudioBridge.encoderBitRate(for: .lossless, channels: 8), 0,
+        XCTAssertEqual(AudioBridge.encoderBitRate(for: AV_CODEC_ID_FLAC, channels: 8), 0,
                        "FLAC is VBR; a rate here would cap a lossless path")
-        assertDocumented("128 kbps per channel (256 kbps stereo, 768 kbps 5.1)", docs)
+        assertDocumented("128 kbps per channel (768 kbps 5.1)", docs)
         assertDocumented("caps 7.1 sources to 5.1", docs)
+        assertDocumented("Two channels or fewer have no surround to carry", docs)
     }
 
     // MARK: - External subtitle ids

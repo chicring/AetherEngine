@@ -473,7 +473,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     ///
     /// Never call this directly; go through `surfaceVODSourceFailure` so the sequential startup
     /// gate is released with it (#370 follow-up).
-    var onVODSourceFailed: (@Sendable (Int32, String) -> Void)?
+    /// #377: the third parameter classifies the failure. A source that is being metered is not a
+    /// source that is gone, and the reader's `-1` cannot say which, so the kind is decided here
+    /// and published rather than inferred from the code downstream.
+    var onVODSourceFailed: (@Sendable (Int32, String, PlaybackErrorKind) -> Void)?
 
     /// The one way a VOD session surfaces a terminal source failure (#370 follow-up).
     ///
@@ -484,9 +487,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// published (an E-AC-3 archive whose first segment carries no audio packet is the field shape),
     /// and the server thread then sat out the remaining ~30 s of a session that had already failed.
     /// Pairing the release with the surface makes that structural instead of a call site to remember.
-    func surfaceVODSourceFailure(_ code: Int32, _ reason: String) {
+    func surfaceVODSourceFailure(_ code: Int32, _ reason: String,
+                                 kind: PlaybackErrorKind = .vodSourceFailed) {
         provider?.abortSequentialStartupWait()
-        onVODSourceFailed?(code, reason)
+        onVODSourceFailed?(code, reason, kind)
     }
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
@@ -527,6 +531,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// producer's front reached neither (rrgomes: seg719 miss x11 into -12889), so the exit gets
     /// its own event-driven arm. Same gate shape as #99.
     var readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+    /// #377: a separate, larger budget for read errors caused by an origin METERING us rather than
+    /// failing. Separate because the two must not spend each other: two attempts is right for a
+    /// source that may be gone, and wrong for one that is merely busy, where each attempt is
+    /// spaced by a growing backoff and is expected to succeed eventually. Four attempts across the
+    /// ladder in `rateLimitReviveDelay` span over a minute of waiting before the session is called.
+    var rateLimitReviveGate = MuxerFailureReviveGate(maxAttempts: 4)
 
     /// AE#169 round 2 (under `restartLock`): the demuxer's last read threw, so the next
     /// performRestart replaces it via the #79 fresh-demuxer path instead of seeking a connection
@@ -836,11 +846,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// source terminal; the classification is rethrown verbatim so `load()` can still reach the AE#154
     /// reroute (`hlsPlaylistOnVODPath`) or the live-path classification (`hlsPlaylistOnRawLivePath`,
     /// which AE#363 routes onto the live ingest for a URL source and rejects for a custom reader).
-    /// Every other failure keeps the historical wrapped shape.
+    /// A refused source (`httpStatus`) keeps its status the same way, so `load()` can publish it as
+    /// `PlaybackErrorKind.sourceRefused` instead of a wrapped "invalid data". Every other failure
+    /// keeps the historical wrapped shape.
     static func openFailure(from error: Error) -> Error {
         if let readerError = error as? AVIOReaderError {
             switch readerError {
-            case .hlsPlaylistOnVODPath, .hlsPlaylistOnRawLivePath:
+            case .hlsPlaylistOnVODPath, .hlsPlaylistOnRawLivePath, .httpStatus:
                 return readerError
             default:
                 break
@@ -1211,6 +1223,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
         }
         ownedCodecParams.append(ownedVideoParams)
+        // movenc writes `pasp` from the output codecpar alone, and a container-declared ratio never
+        // reaches codecpar: Matroska's DisplayWidth quotient and MP4's own `pasp` land on AVStream
+        // (matroskadec.c / mov.c), which is where a DVD remuxed to MKV carries its anamorphic ratio.
+        // Without this the loopback item presented such a source at its coded shape, 720x576 for a
+        // 1024x576 picture, and every consumer downstream of AVPlayer inherited the wrong rectangle.
+        // Resolved through the same policy the two decoders run, so a ratio the software path
+        // disbelieves (#290) is not one the native path stretches to.
+        let declaredSAR = PixelAspectPolicy.declaredPixelAspect(
+            bitstream: codecpar.pointee.sample_aspect_ratio,
+            container: videoStream.pointee.sample_aspect_ratio,
+            width: codecpar.pointee.width,
+            height: codecpar.pointee.height
+        )
+        ownedVideoParams.ptr.pointee.sample_aspect_ratio = declaredSAR ?? AVRational(num: 0, den: 1)
+        if let declaredSAR {
+            EngineLog.emit(
+                "[HLSVideoEngine] SAR \(declaredSAR.num):\(declaredSAR.den) on "
+                + "\(codecpar.pointee.width)x\(codecpar.pointee.height) into the fMP4 sample entry "
+                + "(bitstream=\(codecpar.pointee.sample_aspect_ratio.num):"
+                + "\(codecpar.pointee.sample_aspect_ratio.den) "
+                + "container=\(videoStream.pointee.sample_aspect_ratio.num):"
+                + "\(videoStream.pointee.sample_aspect_ratio.den))",
+                category: .session
+            )
+        }
         let videoConfig = HLSSegmentProducer.StreamConfig(
             codecpar: UnsafePointer(ownedVideoParams.ptr),
             timeBase: videoTimeBase,
@@ -1408,7 +1445,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 EngineLog.emit(
                     isHEAAC
                         ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
-                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + \(audioBridgeMode == .surroundCompat ? "EAC3" : "FLAC") re-encode",
+                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
+                          + Self.encoderLabel(AudioBridge.bridgeEncoder(
+                                for: audioBridgeMode,
+                                sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased()
+                          + " re-encode",
                     category: .session
                 )
             } else if compat != .unsupported {

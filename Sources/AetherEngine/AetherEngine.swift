@@ -1054,6 +1054,12 @@ public final class AetherEngine: ObservableObject {
     /// ~13 exponential backoffs finish in test time instead of a minute of real sleeping.
     nonisolated(unsafe) static var reconnectBackoffScaleForTesting = 1.0
 
+    /// TEST-ONLY: how long a pinned redirect target may carry no bytes before its first refusal
+    /// drops it instead of riding out the keep-pin grace (#392). Read once by each `AVIOReader` at
+    /// init, so set it before `load`/`start`. nil keeps the shipped minute, which no test can wait
+    /// out. See `AVIOReader.pinIdleRepinSecondsDefault`.
+    nonisolated(unsafe) static var pinIdleSecondsForTesting: TimeInterval? = nil
+
     /// Reads `AVPlayer.eligibleForHDRPlayback` and `AVPlayer.availableHDRModes` at call time.
     /// Eligibility is display-configuration aware on all platforms (its change notification fires
     /// on display connection/disconnection), so per-load reads pick up monitor changes; the value
@@ -1468,6 +1474,12 @@ public final class AetherEngine: ObservableObject {
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
     public private(set) var sourceVideoWidth: Int32 = 0
     public private(set) var sourceVideoHeight: Int32 = 0
+    /// Display-width multiplier for non-square source pixels: `sourceVideoWidth * this` is the width
+    /// the picture presents at. 1 before load, on square-pixel sources, and whenever the declared
+    /// ratio is one the engine refuses to believe (#290), so it is never a number the picture
+    /// contradicts. Resolved once through `PixelAspectPolicy`, which is also the ratio the decoders
+    /// attach and the `pasp` the loopback fMP4 carries.
+    public private(set) var sourceVideoPixelAspectRatio: Double = 1
 
     /// MKV font attachments from the probe. Hosts write these to disk for ASS renderer font config (AetherEngine#30).
     /// Not @Published and not in SourceProbe: payloads are 10-30 MB and only playback hosts need them.
@@ -2722,6 +2734,12 @@ public final class AetherEngine: ObservableObject {
         }
         loadedURL = url
         loadedOptions = options
+        // #377: register the host's concurrency ceiling for this origin before anything fetches
+        // from it. Keyed on the origin rather than the load, so the subtitle side reader and any
+        // later reopen of the same source are bound by it too.
+        if !isCustomSource {
+            OriginRequestBudget.shared.setHostLimit(options.maxConcurrentSourceRequests, for: url)
+        }
         // #170: the carryover is consumed by THIS load only (registration site below, or never on
         // the branches that return before it); it must not persist into loadedOptions where a later
         // host-initiated reload would resurrect a stale session snapshot.
@@ -2795,6 +2813,7 @@ public final class AetherEngine: ObservableObject {
         sourceVideoBitrate = 0
         sourceVideoWidth = 0
         sourceVideoHeight = 0
+        sourceVideoPixelAspectRatio = 1
 
         // #114: guarantee the AVAudioSession category is declared (off-main, from init) before any branch
         // below can activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession()
@@ -2896,6 +2915,14 @@ public final class AetherEngine: ObservableObject {
                 detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height
+                if let sar = PixelAspectPolicy.declaredPixelAspect(
+                    bitstream: stream.pointee.codecpar.pointee.sample_aspect_ratio,
+                    container: stream.pointee.sample_aspect_ratio,
+                    width: sourceVideoWidth,
+                    height: sourceVideoHeight
+                ) {
+                    sourceVideoPixelAspectRatio = Double(sar.num) / Double(sar.den)
+                }
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 lastDetectedVideoCodec = detectedCodecID
             }
@@ -3130,7 +3157,7 @@ public final class AetherEngine: ObservableObject {
                 // Superseded: successor owns state.
                 throw CancellationError()
             } catch {
-                publishError(.sourceOpenFailed, "Failed to load: \(error.localizedDescription)", underlying: error)
+                publishLoadFailure(error)
                 throw error
             }
             startAtmosConfirmation()
@@ -3581,7 +3608,7 @@ public final class AetherEngine: ObservableObject {
                 _ = try await load(source: .url(hlsURL), startPosition: startPosition, options: rerouted)
                 return nil
             }
-            publishError(.sourceOpenFailed, "Failed to load: \(error.localizedDescription)", underlying: error)
+            publishLoadFailure(error)
             throw error
         }
         // Honor a saved subtitle-language preference on the first frame (#73). Runs only on the successful
@@ -4195,6 +4222,14 @@ public final class AetherEngine: ObservableObject {
         if let parked = Self.seekEndParkState(target: target, duration: duration, isLive: isLive) {
             state = parked
         }
+        // #394 follow-up: the audio host writes the buffering level only on its own rebuffer edges, and a
+        // starve that began inside the seek window carries no edge across the landing (on the way in the
+        // `.seeking` gate suppressed the level). Re-read it against the state this finalize just settled,
+        // or a seek into an unbuffered span lands as a frozen `.playing`, the very shape the axis exists
+        // to end. The native path already reconciles its own level in reconcileNativeSeekTransport.
+        if audioAVPlayerActive, let host = audioAVPlayerHost {
+            isBuffering = state == .playing && host.isRebuffering
+        }
         setProgrammaticSeek(inFlight: false, target: nil)
         // `sourceTime` is the on-screen frame (#49/#123): the honest landing position, which keyframe
         // granularity or a still-draining chase can put a little off the target. Folded onto the display
@@ -4386,6 +4421,7 @@ public final class AetherEngine: ObservableObject {
         sourceVideoBitrate = 0
         sourceVideoWidth = 0
         sourceVideoHeight = 0
+        sourceVideoPixelAspectRatio = 1
         pendingExternalMetadata = []
         #if os(tvOS) || os(iOS)
         // Same lifetime as pendingExternalMetadata: session identity the host staged, cleared when the

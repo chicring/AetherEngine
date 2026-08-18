@@ -196,6 +196,23 @@ extension HLSVideoEngine {
                 sessionAudioMoovPrimeUnobtainable = true
                 restartLock.unlock()
             }
+            // AE#396: a bridged session whose DECODER produced not one frame has nothing a revive can
+            // reach. The restart path rebuilds the muxer and re-opens the encoder (#99 failure mode B),
+            // and both sit downstream of the arm that failed: the same decoder is handed the same bytes
+            // and answers the same way, which is exactly what the reporter measured, three attempts with
+            // identical packet counts finishing in 12 to 23 ms. Spend the words instead of the budget.
+            // Frames decoded but nothing emitted is the ENCODER side, which a rebuild does heal, so that
+            // shape keeps its revive.
+            if !isLiveSession, let bridge = prod.audioBridgeFeedStats, bridge.decodedNothing {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#396 the audio bridge decoded nothing, so the mp4 sample entry "
+                    + "can never be built and a revive would re-read the same bytes: \(bridge.summary)",
+                    category: .session
+                )
+                surfaceVODSourceFailure(FFmpegErr.einval, "Audio track could not be decoded",
+                                        kind: .audioBridgeProducedNoOutput)
+                return
+            }
             if isLiveSession {
                 handleLiveMuxerFailure(prod)
             } else {
@@ -359,13 +376,38 @@ extension HLSVideoEngine {
     /// demuxer whose read just threw is marked suspect so performRestart replaces it via the #79
     /// fresh-demuxer path instead of seeking the failed connection.
     func handleVODReadErrorExit(_ code: Int32) {
+        // #377: the reader knows the difference between a source that is gone and one that is
+        // metering us, and loses it on the way here: the give-up arm returns a bare `-1`, FFmpeg
+        // renders that as "Operation not permitted", and this is what arrives. Ask the budget,
+        // which stamped the refusal when the status was read.
+        //
+        // The distinction is worth two different behaviours, because a 429 is a NOT-YET. Spending
+        // the ordinary two-attempt budget on it burns both attempts inside a minute, each one
+        // reopening from byte 0 against an origin that is refusing precisely that, and then
+        // declares the source "not readable in this session" while the same stream plays instantly
+        // if the user backs out and presses play. That verdict is not just unhelpful, it is false.
+        let metered = OriginRequestBudget.shared.refusedRecently(
+            sourceURL, within: Self.rateLimitVerdictWindowSeconds)
+
         restartLock.lock()
-        let admitted = readErrorReviveGate.admit()
-        let attempts = readErrorReviveGate.attempts
-        let cap = readErrorReviveGate.maxAttempts
+        let admitted = metered ? rateLimitReviveGate.admit() : readErrorReviveGate.admit()
+        let attempts = metered ? rateLimitReviveGate.attempts : readErrorReviveGate.attempts
+        let cap = metered ? rateLimitReviveGate.maxAttempts : readErrorReviveGate.maxAttempts
         if admitted { mainDemuxerSuspectDead = true }
         restartLock.unlock()
         guard admitted else {
+            if metered {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #377 VOD rate-limit revive cap reached "
+                    + "(\(attempts) refusals, cap \(cap)); giving up. The source is being METERED, "
+                    + "not lost: retrying this same request later is expected to work, and handing "
+                    + "off to another player will meet the same refusal",
+                    category: .session
+                )
+                surfaceVODSourceFailure(code, "Source is rate limiting this session",
+                                        kind: .sourceRateLimited)
+                return
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] #169 VOD readError revive cap reached "
                 + "(\(attempts) failures, cap \(cap)); giving up (source not readable in this session)",
@@ -382,14 +424,48 @@ extension HLSVideoEngine {
             frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
             currentRendered: frozen)
         let idx = segmentIndexForPlaylistTime(anchor)
+
+        guard metered else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #169 VOD pump died mid-session (readError \(code)); "
+                + "rebuilding producer on a fresh demuxer at "
+                + "\(String(format: "%.2f", anchor))s -> seg\(idx) "
+                + "(attempt \(attempts)/\(cap))",
+                category: .session
+            )
+            requestRestart(at: idx, authoritative: true)
+            return
+        }
+
+        // A metered origin gets time before the next ask. Reopening immediately is what turned the
+        // two ordinary attempts into two more refusals: the request that just failed is reissued
+        // against a limiter that has not moved. The delay grows per attempt so a session that is
+        // over its quota stops re-asking every few seconds without ending.
+        let delay = Self.rateLimitReviveDelay(attempt: attempts)
         EngineLog.emit(
-            "[HLSVideoEngine] #169 VOD pump died mid-session (readError \(code)); "
-            + "rebuilding producer on a fresh demuxer at "
-            + "\(String(format: "%.2f", anchor))s -> seg\(idx) "
-            + "(attempt \(attempts)/\(cap))",
+            "[HLSVideoEngine] #377 VOD pump died mid-session on a METERED origin (readError \(code)); "
+            + "waiting \(String(format: "%.0f", delay))s before rebuilding the producer at "
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx) (attempt \(attempts)/\(cap))",
             category: .session
         )
-        requestRestart(at: idx, authoritative: true)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self else { return }
+            self.requestRestart(at: idx, authoritative: true)
+        }
+    }
+
+    /// #377: how long a refusal keeps classifying a read error as metering. The reader's give-up
+    /// arm exits within seconds of the last refused status (its own backoff is spent before it
+    /// returns), so this only has to cover that gap, not a whole session.
+    static let rateLimitVerdictWindowSeconds: TimeInterval = 60
+
+    /// #377: backoff before re-asking a metered origin. Grows per attempt and is capped, so the
+    /// last attempts are spaced widely enough to outlast a per-minute quota window.
+    static func rateLimitReviveDelay(attempt: Int) -> TimeInterval {
+        let ladder: [TimeInterval] = [3, 8, 20, 45]
+        guard attempt >= 1 else { return ladder[0] }
+        return ladder[min(attempt - 1, ladder.count - 1)]
     }
 
     /// AE#169 round 3: re-anchor a VOD session whose pump starved its scan-forward gate to EOF.
@@ -531,6 +607,22 @@ extension HLSVideoEngine {
             // with nothing in it to act on. The readError arm above has surfaced its own exhaustion
             // since AE#169; this is the same shape and gets the same last word. -22 is what movenc
             // returns for the moov it cannot write, so the code carries the real cause.
+            //
+            // AE#396: which cause that is depends on whether the audio was bridged. A silent bridge is
+            // not a source that cannot be muxed, it is a source whose audio this engine could not
+            // TRANSCODE, and the two ask a host for opposite things: `vodSourceFailed` reads as "the
+            // source is gone" and ends a fallback ladder, while a second player that decodes the track
+            // itself plays this file. So name the bridge when the bridge is the one that stayed quiet.
+            if let bridge = audioBridge?.feedStats, bridge.packetsEmitted == 0 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#396 the moov was never buildable because the audio bridge "
+                    + "emitted nothing this session: \(bridge.summary)",
+                    category: .session
+                )
+                surfaceVODSourceFailure(FFmpegErr.einval, "Audio could not be transcoded for playback",
+                                        kind: .audioBridgeProducedNoOutput)
+                return
+            }
             surfaceVODSourceFailure(FFmpegErr.einval, "Source audio cannot be muxed")
             return
         }

@@ -71,20 +71,51 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 
 ## How it compares
 
-On Apple platforms the real choice is between AVPlayer, with deep OS integration but only the formats Apple ships, and a VLC- or mpv-derived engine, which plays almost anything but renders its own frames and bypasses the system's Dolby Vision, Atmos, and HDR handling. AetherEngine is built to give you both: FFmpeg's format breadth layered on top of VideoToolbox and AVPlayer, so Dolby Vision, Atmos, and Match Content keep working. KSPlayer is the closest analog, it reaches the same outcome through the same AVPlayer route, but it ships as a full player with its own UI and gates MKV, Dolby Vision, and Atmos behind a paid LGPL tier (the free build is GPL); AetherEngine is an embeddable engine you drive from your own SwiftUI, with that codec and HDR breadth in the open-source core.
+On Apple platforms the real choice is between AVPlayer, with deep OS integration but only the formats Apple ships, and a VLC- or mpv-derived engine, which plays almost anything but renders its own frames and bypasses the system's Dolby Vision, Atmos, and HDR handling. AetherEngine is built to give you both: FFmpeg's format breadth layered on top of VideoToolbox and AVPlayer, so Dolby Vision, Atmos, and Match Content keep working. KSPlayer is the closest analog, it reaches the same outcome through the same AVPlayer route, but it ships as a full player with its own UI, and its free build is GPL while a paid LGPL tier unlocks AV1 hardware decoding, the full demuxer and decoder set, and a list of playback features its own feature matrix enumerates; AetherEngine is an embeddable engine you drive from your own SwiftUI, with that codec and HDR breadth in the open-source core.
 
 | | AetherEngine | KSPlayer | AVPlayer | VLCKit | libmpv |
 | --- | --- | --- | --- | --- | --- |
 | **Approach** | Embeddable engine, Apple-only | Full player with bundled UI, FFmpeg + AVPlayer, Apple-only | Apple's built-in player | libVLC wrapped for Apple | libmpv, cross-platform |
 | **Container & codec breadth** | Wide, FFmpeg demux | Wide, FFmpeg demux | Narrow, Apple's set | Wide | Wide |
 | **Hardware decode** | VideoToolbox, dav1d SW fallback | VideoToolbox, FFmpeg SW fallback | VideoToolbox | VideoToolbox plus software | VideoToolbox plus software |
-| **Dolby Vision** | P5, P7 as 8.1, P8.1, P8.4, AV1 P10.x, real display switch | P5, P8 via AVPlayer, paid LGPL tier | P5 and P8.1 only | Tone-maps, no DV display | Tone-maps, no DV display |
-| **Dolby Atmos** | EAC3+JOC stream-copied (HDMI MAT, spatial) | EAC3+JOC via AVPlayer, paid LGPL tier | EAC3+JOC passthrough | Decodes to PCM, no object passthrough | No Atmos passthrough on Apple |
+| **Dolby Vision** | P5, P7 as 8.1, P8.1, P8.4, AV1 P10.x, real display switch | P5, P8 via AVPlayer; their matrix lists P5 HDR display without overheating as paid LGPL | P5 and P8.1 only | Tone-maps, no DV display | Tone-maps, no DV display |
+| **Dolby Atmos** | EAC3+JOC stream-copied (HDMI MAT, spatial) | EAC3+JOC via AVPlayer | EAC3+JOC passthrough | Decodes to PCM, no object passthrough | No Atmos passthrough on Apple |
 | **HDR on tvOS** | Native Match Content switch | Native Match Content on AVPlayer path, else Metal tone-map | Native Match Content | Software tone-mapping | Software tone-mapping |
 | **Rendering & UI** | OS-native, you ship SwiftUI | Own Metal renderer, bundled controls | OS-native, you ship UI | Own renderer, bundled controls | Own renderer, bundled OSC |
-| **Apple TV / App Store** | Yes, LGPL plus store exception | Free tier GPL, DV / Atmos / MKV need paid LGPL | Yes | Yes, LGPL | Not practical, GPL, no tvOS |
+| **Apple TV / App Store** | Yes, LGPL plus store exception | Free build GPL, paid LGPL tier for AV1 hardware decode and the full decoder set | Yes | Yes, LGPL | Not practical, GPL, no tvOS |
 
 The engine leans on the platform where the platform is best (hardware decode, Dolby Vision display, Atmos passthrough) and only falls back to its own software path (dav1d, libavcodec) for the formats VideoToolbox cannot handle.
+
+### Measured
+
+The table above is qualitative. The numbers below are measured, on a 4K HDR HEVC file in Matroska, the container media servers actually serve. They are produced by [aetherengine-bench](https://github.com/superuser404notfound/aetherengine-bench), which is run by this project's author, so its method, its raw data and the cases where AetherEngine does not win are all in that repository.
+
+Measured on Apple-M1 (MacBookAir10,1), macOS 26.5.2, hevc-4k-hdr10.mkv, windowed, 3840x2160 px rendered, 60 s, median of 2.
+MacBookAir10,1 is fanless: sustained decode can reach thermal pressure, which is why the protocol has cooldowns between runs and discards throttled windows.
+
+| | GPU power | CPU load | RSS | Plays |
+| --- | --- | --- | --- | --- |
+| **AetherEngine** | 63 mW | 5.2% of a core | 325 MB | Yes |
+| **KSPlayer** | 149 mW | 6.6% of a core | 331 MB | Yes |
+| **AVPlayer** | | | | n/a (refuses hevc-4k-hdr10.mkv: This media format is not supported.) |
+| **VLCKit** | 362 mW | 14.3% of a core | 102 MB | Yes |
+| **libmpv** | 887 mW | 18.1% of a core | 373 MB | Yes |
+
+Launch failures on hevc-4k-hdr10.mkv (crashes that were retried, not refusals, see the README): KSPlayer 1.
+
+Frame delivery and output (median; resolution, bit depth and HDR transfer are informational per engine only, shown as 'varies across repeats' when they disagree, see the README):
+- **AetherEngine**: 1440/1438 delivered/expected, dropped 0, 3840x1714, 10-bit, hdr10, rendered into 3840x2160.
+- **KSPlayer**: 1440/1440 delivered/expected, dropped 0, 3840x1714, 10-bit, SMPTE_ST_2084_PQ, rendered into 3840x2160. Served via **KSMEPlayer**.
+- **VLCKit**: 1442/1440 delivered/expected, dropped 0, 3840x1714, bit depth and color transfer not reported by this engine, rendered into 3840x2160.
+- **libmpv**: 1442/1440 delivered/expected, dropped 0, 3840x1714, 10-bit, pq, rendered into 3840x2160.
+
+Versions: AetherEngine 6.26.0, KSPlayer 2.3.4, AVPlayer macOS 26.5.2, VLCKit 4.0.0-alpha.21, libmpv mpv v0.41.0.
+
+Power figures are package power with an idle baseline subtracted, so they are attributable to the run and not to the machine.
+CPU package power was measured for every run but is not published above: the idle baseline drifts with load enough that one engine's own repeats can disagree more than the column would be used to show between engines. For example, on hevc-4k-hdr10.mkv libmpv measured 100 to 372 mW of CPU package power across its own repeats, a 3.7x range. Recorded for every run in Results/; see "Known gaps" in the README for the full reasoning.
+libmpv is measured with --hwdec=auto-safe (hardware decode), not mpv's own software-decode default, see "Fairness decisions" in the README.
+libmpv's rows come from a separate run of the same protocol on the same day and the same machine. Its rows in the main run were lost to a defect in the mpv report writer (a missing import), not to anything about mpv itself. The GPU idle baseline on this machine is under 1 mW, and CPU load and RSS are not baseline-subtracted at all, so a separate baseline does not move the three published columns.
+Method and raw results: https://github.com/superuser404notfound/aetherengine-bench
 
 ## Quick start
 
@@ -292,7 +323,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.26.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.32.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -487,10 +518,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.26.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.32.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.26.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.32.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

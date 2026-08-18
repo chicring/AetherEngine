@@ -376,6 +376,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
     /// Set by the host from a previous producer's verdict; skips the search entirely.
     private let audioMoovPrimeKnownUnobtainable: Bool
+
+    /// AE#396: the bridge's own account of what it did with the source, for the pump-finished handler.
+    /// Nil for a stream-copy session, which has no bridge and whose analogous verdict is
+    /// `audioMoovPrimeUnobtainable`.
+    var audioBridgeFeedStats: AudioBridge.FeedStats? { audioConfig?.bridge?.feedStats }
     private var currentMuxer: MP4SegmentMuxer?
     private var currentMuxerSegmentIndex: Int = .min
 
@@ -1739,11 +1744,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // order). Nothing was written, so the pump exits to let the host rebuild with a prime frame; the
             // scan for that frame happens on the way out.
             cutDeferredAwaitingAudioSampleEntry = true
-            EngineLog.emit(
-                "[HLSSegmentProducer] AE#222 seg-\(currentMuxerSegmentIndex).m4s cut deferred: audio sample "
-                + "entry needs a parsed packet and none has been muxed; scanning forward for a prime frame",
-                category: .session
-            )
+            // AE#396: the two ways to arrive here are not the same defect and must not read the same.
+            // Stream-copy audio is missing a SOURCE packet, which the prime scan goes looking for. A
+            // bridged session's muxed frames come from the encoder, so there is nothing in the source
+            // to scan for and `scanForAudioMoovPrimeFrame` returns without looking: announcing a scan
+            // there described an action that never happened, on the one path where the interesting
+            // question ("why has the bridge emitted nothing?") had no line at all.
+            if let bridge = audioConfig?.bridge {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#396 seg-\(currentMuxerSegmentIndex).m4s cut deferred: the "
+                    + "audio sample entry is built from a BRIDGED packet and the bridge has muxed none. "
+                    + "Bridge: \(bridge.feedStats.summary)",
+                    category: .session
+                )
+            } else {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 seg-\(currentMuxerSegmentIndex).m4s cut deferred: audio sample "
+                    + "entry needs a parsed packet and none has been muxed; scanning forward for a prime frame",
+                    category: .session
+                )
+            }
             return nil
         case .failed:
             // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal.

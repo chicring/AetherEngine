@@ -297,6 +297,23 @@ public struct LoadOptions: Sendable, Equatable {
     /// `declaredDurationSeconds` on VOD or the load fails with `zeroDuration`. Default `false`.
     public var sequentialOrigin: Bool = false
 
+    /// Most requests the reader may have open against this source's origin at once, across every
+    /// path it fetches on (the pump's ranges, detour blocks, size probes, the tail prefetch and the
+    /// subtitle side reader), AE#377.
+    ///
+    /// nil (default) means the engine counts but does not cap, and lowers the ceiling on its own if
+    /// the origin answers 429/503/509. Set it when the provider states a limit: some CDNs meter
+    /// concurrency per signed link and document it ("one connection for large downloads"), and
+    /// being told beats being refused a few times first. `1` serialises everything and additionally
+    /// switches off the speculative parallel paths, which exist only to overlap with the pump.
+    ///
+    /// Not a `URLSession` connection cap, deliberately. `httpMaximumConnectionsPerHost` bounds TCP
+    /// connections per session, and over HTTP/2 every request of a session is multiplexed onto one
+    /// of them, so such a cap bounds nothing while the origin still counts the requests. This
+    /// counts requests. The engine logs the negotiated protocol once per origin, so a report can
+    /// say which case an origin is.
+    public var maxConcurrentSourceRequests: Int? = nil
+
     /// Trusted media duration in seconds, overriding the container/estimate-derived value (same
     /// trust family as the disc MPLS/IFO override, AE#105). Required alongside
     /// `sequentialOrigin` for VOD sources: with the tail read gone the demuxer resolves no
@@ -414,6 +431,7 @@ public struct LoadOptions: Sendable, Equatable {
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
         sequentialOrigin: Bool = false,
+        maxConcurrentSourceRequests: Int? = nil,
         declaredDurationSeconds: Double? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
@@ -448,6 +466,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.sequentialOrigin = sequentialOrigin
+        self.maxConcurrentSourceRequests = maxConcurrentSourceRequests
         self.declaredDurationSeconds = declaredDurationSeconds
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
@@ -611,8 +630,11 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// True for host-registered external subtitle tracks (AetherEngine#88); their `id` is synthetic
     /// (`AetherEngine.externalSubtitleTrackIDBase` + ordinal), not an AVStream index.
     public let isExternal: Bool
+    /// True when the playback backend, rather than `subtitleCues`, renders this
+    /// track. Hosts can avoid presenting overlay controls that cannot affect it.
+    public let isNativelyRenderedSubtitle: Bool
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false) {
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false) {
         self.id = id
         self.name = name
         self.codec = codec
@@ -626,6 +648,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.isAtmos = isAtmos
         self.assHeader = assHeader
         self.isExternal = isExternal
+        self.isNativelyRenderedSubtitle = isNativelyRenderedSubtitle
     }
 }
 
