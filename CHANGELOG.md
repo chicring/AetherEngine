@@ -12,6 +12,87 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.34.0] - 2026-08-21
+
+### Fixed
+
+- **The software-path audio tap trapped on the FIRST buffer of every multichannel track (AE#400).**
+  `AudioTapPCMConverter` rebuilt its input format from the channel count alone and force-unwrapped the
+  result, but `AVAudioFormat(commonFormat:sampleRate:channels:interleaved:)` returns nil for every count
+  above 2 (measured 3 through 8; this is AVFAudio behaviour on every platform, not a macOS specialty).
+  `AudioDecoder` emits the source layout up to 7.1 without downmixing, so this was not a race: any
+  multichannel track on the software path with a tap installed trapped on its first audio buffer. The
+  layout the converter needed was already attached to the sample buffer's format description by the
+  decoder, so it is read back from there now instead of being re-derived, with the engine's own mapping
+  as a fallback for a description that carries none. Reported by dlev02 from a Prism TestFlight crash.
+- **Some channel layouts convert to digital silence without reporting an error, which the crash had been
+  hiding (AE#400).** Measured: 4-channel Quadraphonic and every DiscreteInOrder layout produce a buffer
+  of zeroes with no `NSError` set, which at a tap consumer is indistinguishable from a muted source. The
+  converter now pushes one full-scale buffer through each new converter and folds the channels itself
+  when the answer is silence. The check sits on the measured behaviour rather than on a table of the
+  layouts Apple currently mixes, because such a table goes stale without saying so.
+- **The channel layout stamped on software-path audio now names the order the resampler actually wrote
+  (AE#401).** `AudioDecoder` resamples into `av_channel_layout_default(channels)` and stamped a layout
+  from a second, independent table; the two agreed only for 5.0 and 5.1. Measured per channel through a
+  real downmix: on 7.1 every channel moved and the LFE, a bass-only channel, was placed hard left at full
+  gain; on 4.0 the centre, which carries dialogue, went hard left; on 2.1 the LFE was mixed into both
+  channels instead of being dropped. 5.1 being the common multichannel case is most likely why it went
+  unseen. 7.1 is also where the mistake came from: the old comment called `AAC_7_1` "MPEG_7_1_C,
+  Hollywood L R C LFE Ls Rs Lsr Rsr", but those are two different layouts. Fixed by naming what is
+  already in the buffer (`WAVE_2_1`, `MPEG_4_0_A`, `MPEG_7_1_C`) rather than by moving the audio; 6.1 is
+  the one count no CoreAudio tag matches, so there the resampler is pointed at `6.1(back)` instead.
+  Covered by `ChannelLayoutOrderTests`, which compares placement through a real downmix and not names.
+
+### Added
+
+- **`aetherctl audiotap --software`, a headless driver for the tap path that had none.** The two existing
+  modes drive their readers directly, so the software sink, which only exists inside a real session, could
+  not be run from the CLI at all. That is how AE#400 shipped and survived: every path around it had a
+  harness. The new mode loads the source through the whole engine, refuses it if it did not route to the
+  software host, installs the tap through the public `installAudioTap()` and plays. It reports `peak` next
+  to the buffer count, and exit 3 covers both no buffers and buffers of digital silence, because both look
+  like a healthy run otherwise. `AudioTapProbe.runSoftware` backs it.
+
+## [6.33.0] - 2026-08-20
+
+### Changed
+
+- **A source that is REFUSING a session gets a stated wall-clock budget per refusal window, instead of
+  a lifetime that emerged from two constants that did not know about each other (AE#377).** The reporter
+  measured his origin with curl and 35 KB of traffic: it serves for about six minutes, refuses every NEW
+  request for about four, and recovers on its own. Seven 1 KB requests a minute apart are enough to reach
+  it, so the trigger is time, not volume, concurrency or request count, and re-resolving through the
+  source does not clear it because the source hands back the same edge host. His recovery arrived at
+  243 s. The engine gave up at 212 s, and no constant said 212: it was four paced revive attempts
+  (3, 8, 20, 45 s) each followed by a reopen that walks the reader's own seven-rung reconnect ladder
+  against the refusing origin, roughly 34 s, unpaced and uncounted on that side. `RefusingSourceReviveBudget`
+  states the figure instead (600 s), and the attempt count now follows from the pacing rather than
+  deciding the outcome. Also removes the trap in the old shape: making the reopen cheaper would have
+  silently cut a session's life by two thirds. Covered by `Issue377RefusingSourceBudgetTests`.
+- **`playbackPhase` reports `.stalled(reconnecting:)` for as long as that budget runs.** The reader emits
+  `.flowing` as it EXITS, deliberately, so the terminal outcome carries the state; between that exit and
+  the rebuilt reader's first byte there is no reader at all, so the phase read `playing` through minutes
+  in which nothing was being delivered. A host no longer has to infer the stall from silence.
+
+### Fixed
+
+- **The refusing-source budget is reset per refusal window, so a session that recovers is not penalised
+  for having recovered (AE#377).** The gate it replaces was never reset, which made its four attempts a
+  SESSION budget: a session that survived one window began the next with part of it spent and the third
+  with none. On a long title against an origin with this shape, the later windows were given up on for
+  arithmetic reasons rather than measured ones. Windows are separated by a gap longer than any that can
+  occur inside one (a ladder rung plus a reopen).
+- **The record of which redirect targets a source has dropped lives on the origin's books rather than on
+  the reader, so a rebuilt reader is not blind to it (AE#377).** A metered revive builds a fresh demuxer,
+  so the reader that meets a re-minted target is routinely not the one that dropped it: no pin, no dropped
+  slot, empty ledger, and the verdict fell through to "a target the source resolved freshly", the single
+  answer that puts origin metering back on the table. In the reporter's capture that was 32 of the refusals
+  of one host in one window, against 8 correct ones from the reader that had done the dropping. The ledger
+  is now kept on the source's chain head, merged when a chain folds, and cleared when a target answers
+  again. The give-up line reports the books it can back up (peak requests in flight, refusals, dropped
+  targets) instead of asserting that the origin is metering us. Covered by `Issue377RefusingTargetTests`
+  and `OriginRequestBudgetTests`.
+
 ## [6.32.0] - 2026-08-18
 
 ### Changed

@@ -392,16 +392,24 @@ extension HLSVideoEngine {
         restartLock.lock()
         let admitted = metered ? rateLimitReviveGate.admit() : readErrorReviveGate.admit()
         let attempts = metered ? rateLimitReviveGate.attempts : readErrorReviveGate.attempts
-        let cap = metered ? rateLimitReviveGate.maxAttempts : readErrorReviveGate.maxAttempts
+        let cap = metered ? 0 : readErrorReviveGate.maxAttempts
+        let spent = metered ? rateLimitReviveGate.elapsedSeconds() : 0
+        let budget = rateLimitReviveGate.budgetSeconds
         if admitted { mainDemuxerSuspectDead = true }
         restartLock.unlock()
         guard admitted else {
             if metered {
+                // #377 round 5: the status code says "refused", it does not say what for, and the
+                // two answers need different fixes. The books do carry the difference, and this is
+                // the last line a session gets, so it says what they hold rather than asserting the
+                // shape the code has been guessing at since round 1.
                 EngineLog.emit(
-                    "[HLSVideoEngine] #377 VOD rate-limit revive cap reached "
-                    + "(\(attempts) refusals, cap \(cap)); giving up. The source is being METERED, "
+                    "[HLSVideoEngine] #377 VOD refusing-source budget spent "
+                    + "(\(String(format: "%.0f", spent))s of \(String(format: "%.0f", budget))s "
+                    + "across \(attempts) attempts); giving up. The source is REFUSING us, "
                     + "not lost: retrying this same request later is expected to work, and handing "
-                    + "off to another player will meet the same refusal",
+                    + "off to another player will meet the same refusal."
+                    + OriginRequestBudget.shared.refusalShapeNote(for: sourceURL),
                     category: .session
                 )
                 surfaceVODSourceFailure(code, "Source is rate limiting this session",
@@ -437,15 +445,23 @@ extension HLSVideoEngine {
             return
         }
 
-        // A metered origin gets time before the next ask. Reopening immediately is what turned the
+        // A refusing origin gets time before the next ask. Reopening immediately is what turned the
         // two ordinary attempts into two more refusals: the request that just failed is reissued
-        // against a limiter that has not moved. The delay grows per attempt so a session that is
-        // over its quota stops re-asking every few seconds without ending.
+        // against an origin that has not moved. The delay grows per attempt so a session that is
+        // inside a refusal window stops re-asking every few seconds without ending.
         let delay = Self.rateLimitReviveDelay(attempt: attempts)
+        // #377 round 6: hold the stall on the host's axis for as long as the budget runs. The
+        // reader emits `.flowing` as it EXITS, deliberately, so the terminal outcome carries the
+        // state; between that exit and the rebuilt reader's first byte there is no reader at all,
+        // and the phase said "playing" through minutes in which nothing was being delivered. The
+        // reporter's correction to this issue is exactly that window: it is a viewer watching a
+        // stalled picture, not accounting.
+        onNetworkPhaseChanged?(.reconnecting)
         EngineLog.emit(
-            "[HLSVideoEngine] #377 VOD pump died mid-session on a METERED origin (readError \(code)); "
+            "[HLSVideoEngine] #377 VOD pump died mid-session on a REFUSING origin (readError \(code)); "
             + "waiting \(String(format: "%.0f", delay))s before rebuilding the producer at "
-            + "\(String(format: "%.2f", anchor))s -> seg\(idx) (attempt \(attempts)/\(cap))",
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx) (attempt \(attempts), "
+            + "\(String(format: "%.0f", spent))s of \(String(format: "%.0f", budget))s spent)",
             category: .session
         )
         Task.detached(priority: .userInitiated) { [weak self] in

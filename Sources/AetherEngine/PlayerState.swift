@@ -896,18 +896,50 @@ public struct SubtitleImage: @unchecked Sendable {
 // MARK: - Audio Utilities
 
 import CoreAudio
+import Libavutil
 
-/// CoreAudio channel layout tag for a given channel count. 7.1 uses `AAC_7_1` (MPEG_7_1_C, "Hollywood" L R C LFE Ls Rs Lsr Rsr), NOT `MPEG_7_1_A` (ITU center-sides); the wrong tag causes tvOS to silently emit silence.
+/// #401: this tag has to describe the channel order the RESAMPLER writes, or the renderer places
+/// the audio somewhere the decoder never put it. It is one buffer with two descriptions of it,
+/// and the two must not drift, which is why `makeResamplerOutputLayout` sits directly below.
+///
+/// The old table agreed only for 5.0 and 5.1, which is most likely why it survived: 5.1 is the
+/// common multichannel case. Measured per channel against a layout built from the resampler's own
+/// order, on 7.1 EVERY channel moved and the LFE, a bass-only channel, was placed hard left at
+/// full gain; on 4.0 the centre, which carries dialogue, went hard left; on 2.1 the LFE was mixed
+/// into both channels at -3 dB instead of being dropped.
+///
+/// 7.1 is also where the mistake came from: the old comment here called `AAC_7_1` "MPEG_7_1_C,
+/// Hollywood L R C LFE Ls Rs Lsr Rsr", but those are two different layouts. The Hollywood order IS
+/// MPEG_7_1_C; `AAC_7_1` is FC FLc FRc FL FR BL BR LFE. The tag never matched the prose.
+///
+/// Every tag below was verified channel by channel against the resampler's order through a real
+/// downmix: all of them place all channels identically.
 func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     switch channels {
-    case 1:  return kAudioChannelLayoutTag_Mono
-    case 2:  return kAudioChannelLayoutTag_Stereo
-    case 3:  return kAudioChannelLayoutTag_MPEG_3_0_A
-    case 4:  return kAudioChannelLayoutTag_Quadraphonic
-    case 5:  return kAudioChannelLayoutTag_MPEG_5_0_A
-    case 6:  return kAudioChannelLayoutTag_MPEG_5_1_A
-    case 7:  return kAudioChannelLayoutTag_MPEG_6_1_A
-    case 8:  return kAudioChannelLayoutTag_AAC_7_1
+    case 1:  return kAudioChannelLayoutTag_Mono            // FC, and a mono track is not a centre
+    case 2:  return kAudioChannelLayoutTag_Stereo          // FL FR
+    case 3:  return kAudioChannelLayoutTag_WAVE_2_1        // FL FR LFE
+    case 4:  return kAudioChannelLayoutTag_MPEG_4_0_A      // FL FR FC BC
+    case 5:  return kAudioChannelLayoutTag_MPEG_5_0_A      // FL FR FC BL BR
+    case 6:  return kAudioChannelLayoutTag_MPEG_5_1_A      // FL FR FC LFE BL BR
+    case 7:  return kAudioChannelLayoutTag_MPEG_6_1_A      // FL FR FC LFE BL BR BC
+    case 8:  return kAudioChannelLayoutTag_MPEG_7_1_C      // FL FR FC LFE BL BR Ls Rs
     default: return kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
     }
+}
+
+/// The layout `AudioDecoder` resamples INTO, i.e. the order the bytes are actually in. The
+/// counterpart of `audioChannelLayoutTag` above; a test holds the two against each other.
+///
+/// Everything is FFmpeg's own default except 7 channels: 6.1's default order (FL FR FC LFE BC SL
+/// SR) is the one count no CoreAudio tag describes, so the resampler is pointed at 6.1(back)
+/// instead, which MPEG_6_1_A does describe. Cheaper and safer than a UseChannelDescriptions
+/// layout, which would leave the well-trodden tags behind on tvOS.
+func makeResamplerOutputLayout(_ channels: Int32, into layout: inout AVChannelLayout) {
+    if channels == 7, av_channel_layout_from_string(&layout, "6.1(back)") >= 0 { return }
+    if channels == 7 {
+        EngineLog.emit("[AudioDecoder] no 6.1(back) layout; 7ch falls back to the default order, "
+                       + "which no CoreAudio tag matches (#401)", category: .swPlayback)
+    }
+    av_channel_layout_default(&layout, channels)
 }

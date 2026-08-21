@@ -74,12 +74,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// refusing, which is the reading that puts metering back on the table. Two different causes,
     /// two different fixes, one log line to tell them apart.
     private var _droppedResolvedURL: URL?
-    /// Every target dropped BEFORE that one, by origin key. One slot describes one window, and the
-    /// reporter's session refused in three: by the second, a re-mint of the target the first window
-    /// dropped is no longer the slot's occupant and would read as a fresh lease, which is the one
-    /// verdict that puts metering back on the table. Bounded by construction rather than by a cap,
-    /// since a drop needs a 2xx-recorded pin to drop and therefore a working target in between.
-    private var _droppedResolvedKeys: Set<String> = []
 
     private func requestURL() -> URL {
         resolvedURLLock.lock()
@@ -125,6 +119,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // source's request budget. Idempotent, and stated here as well as at the redirect itself
         // because a pin is also how a resolve that no delegate of ours followed becomes visible.
         OriginRequestBudget.shared.noteRedirect(from: url, to: resolved)
+        // #377 round 5: this runs off an ACCEPTED response, so the target is answering. Clearing it
+        // from the dropped ledger is what keeps "dropped and minted again" meaning a target that is
+        // still refusing, instead of a label a host wears for the rest of the process.
+        OriginRequestBudget.shared.noteTargetHealthy(resolved)
         resolvedURLLock.lock()
         defer { resolvedURLLock.unlock() }
         if resolved != url && resolved != _resolvedURL {
@@ -139,12 +137,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private func invalidateResolvedURL(reason: String = "expiry status") {
         resolvedURLLock.lock()
-        defer { resolvedURLLock.unlock() }
+        var droppedNow: URL?
         if _resolvedURL != nil {
-            if let previous = _droppedResolvedURL,
-               let key = OriginRequestBudget.originKey(for: previous) {
-                _droppedResolvedKeys.insert(key)
-            }
+            droppedNow = _resolvedURL
             _droppedResolvedURL = _resolvedURL
             _resolvedURL = nil
             // The other half, and the one #380 turned into a decision: dropping the pin is now a
@@ -152,6 +147,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // expiry status. A rung the field cannot see is a rung the next trace cannot confirm.
             EngineLog.emit("[AVIOReader] Dropped resolved URL cache (\(reason))", category: .demux)
         }
+        resolvedURLLock.unlock()
+        // Outside the reader's lock, and outside the reader's lifetime: the ledger belongs to the
+        // origin because the next request against it may well come from a demuxer that does not
+        // exist yet (#377 round 5).
+        if let droppedNow { OriginRequestBudget.shared.noteTargetDropped(droppedNow, from: url) }
     }
 
     /// #377/#380: this attempt is going through the source because the ladder dropped a pin, i.e.
@@ -179,8 +179,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         resolvedURLLock.lock()
         let pinned = _resolvedURL
         let dropped = _droppedResolvedURL
-        let droppedEarlier = _droppedResolvedKeys
         resolvedURLLock.unlock()
+        let droppedEarlier = OriginRequestBudget.shared.droppedTargets(for: url)
         return Self.describeRespondingTarget(
             responded: responded, source: url, pinned: pinned, dropped: dropped,
             droppedEarlier: droppedEarlier)
@@ -189,6 +189,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Compared on the ORIGIN KEY, never on the whole URL: a source that re-mints a link for the
     /// same edge host with a fresh signature has handed back the same target, and reading that as a
     /// fresh one is exactly the mistake that puts metering back on the table.
+    ///
+    /// `droppedEarlier` comes from the origin's books rather than from this instance (#377 round 5).
+    /// A metered revive builds a fresh demuxer, so the reader asking here is routinely NOT the one
+    /// that dropped the target seconds ago, and an instance-scoped ledger answered `resolved
+    /// freshly` for exactly those attempts: one host, one refusal window, two verdicts depending on
+    /// which reader happened to ask, and the rebuilds are both the majority of the asks and the ones
+    /// with no history.
     static func describeRespondingTarget(
         responded: URL?, source: URL, pinned: URL?, dropped: URL?,
         droppedEarlier: Set<String> = []
@@ -206,6 +213,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         if droppedEarlier.contains(key) {
             return " from \(host), a target an earlier window dropped and the source minted again"
+                + (dropped == nil ? " (a drop this reader did not make)" : "")
         }
         return " from \(host), a target the source resolved freshly"
     }

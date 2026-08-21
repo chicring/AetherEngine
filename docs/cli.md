@@ -164,9 +164,11 @@ Plays a source through the audio-only pipeline (default ten seconds, `--seconds 
 
 ## audiotap
 
-    aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>
+    aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
 
 Brings up the loopback session headless, decodes the audio tap (#95) as fast as segments are produced, writes mono Float32 48 kHz WAV (default `/tmp/audiotap.wav`), and prints buffer count, PCM seconds, discontinuity count, and the covered `sourceTime` span. A clean run reports exactly one discontinuity (the install itself). `--remote` drives the remote-HLS delivery path instead (direct AVPlayer ingest of an HLS url, no loopback): rendition/variant resolution, segment fetch + decrypt, playhead-follow decode. Verification tool for the PCM audio tap across the stream-copy and bridge audio paths.
+
+`--software` drives the third delivery path, the SW sink (`AudioTapPCMConverter`), which the other two modes cannot reach: they drive their readers directly, while the sink only exists inside a real session. This mode therefore loads the source through the whole engine, fails if it did not route to the software host, installs the tap through the public `installAudioTap()` and plays, so the sink runs exactly as it does in a host. It is bound to wall clock (the SW host decodes in real time), and it reports `peak` next to the buffer count because the two ways this path fails look identical in a report otherwise: **exit 3 covers both no buffers at all and buffers of digital silence**, which at a consumer is indistinguishable from a muted source. That gap is not hypothetical. With no harness here, a force unwrap that trapped on the FIRST buffer of any multichannel track shipped in 6.1.3 and survived to main (#400), and the silent-downmix defect underneath it only became visible once the trap was gone. Software routing needs a source the native path declines, e.g. `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libvpx-vp9 -c:a aac -shortest clip.mkv`; add `-af "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0"` for the multichannel case and `-af "pan=quad|c0=c0|c1=c0|c2=c0|c3=c0"` for the layout AVAudioConverter refuses to mix.
 
 ## bgaudio
 

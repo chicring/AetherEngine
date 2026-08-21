@@ -37,7 +37,7 @@ struct RateLimitedSourceReviveTests {
         OriginRequestBudget.shared.noteRefusal(for: meteredURL, status: 429)
 
         let engine = makeEngine()
-        engine.rateLimitReviveGate = MuxerFailureReviveGate(maxAttempts: 0)
+        engine.rateLimitReviveGate = RefusingSourceReviveBudget(budgetSeconds: 0)
         let surfaced = Surfaced()
         engine.onVODSourceFailed = { code, reason, kind in surfaced.set(code, reason, kind) }
 
@@ -57,7 +57,7 @@ struct RateLimitedSourceReviveTests {
 
         let engine = makeEngine()
         engine.readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
-        engine.rateLimitReviveGate = MuxerFailureReviveGate(maxAttempts: 4)
+        engine.rateLimitReviveGate = RefusingSourceReviveBudget()
 
         engine.handleVODReadErrorExit(-1)
         engine.handleVODReadErrorExit(-1)

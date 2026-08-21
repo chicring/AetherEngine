@@ -94,8 +94,9 @@ func printUsage() {
       aetherctl dovitest <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>
-                         (#95: decode the loopback audio track to mono 48k WAV, print continuity stats)
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
+                         (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
+                          --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] <file>
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
@@ -404,14 +405,17 @@ if first == "audiotap" {
     let outPath = takeStringFlag("--out", from: &rest) ?? "/tmp/audiotap.wav"
     let remote = rest.contains("--remote")
     rest.removeAll { $0 == "--remote" }
+    let software = rest.contains("--software")
+    rest.removeAll { $0 == "--software" }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
-    exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath, remote: remote))
+    exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath,
+                 remote: remote, software: software))
 }
 
 if first == "hlsfixture" {

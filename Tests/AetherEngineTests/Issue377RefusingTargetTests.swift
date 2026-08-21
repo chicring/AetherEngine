@@ -64,6 +64,40 @@ final class Issue377RefusingTargetTests: XCTestCase {
         XCTAssertTrue(verdict.contains("an earlier window dropped"), verdict)
     }
 
+    /// Round 5, the shape an instance-scoped ledger cannot hold. A metered revive builds a fresh
+    /// demuxer, so the reader that meets the re-minted target is not the one that dropped it: it has
+    /// no pin, no dropped slot, and before the ledger moved to the origin it answered `resolved
+    /// freshly` for every one of those attempts. In the reporter's capture that was 32 of the 40
+    /// refusals of one host in one window, all from the rebuilds, against 8 correct ones from the
+    /// reader that had done the dropping.
+    func testARebuiltReaderWithNoHistoryOfItsOwnStillNamesTheReMint() {
+        let earlier = URL(string: "https://nexus-179.cdn.example.st/file.mkv?sig=old")!
+        let reMinted = URL(string: "https://nexus-179.cdn.example.st/file.mkv?sig=new")!
+        let verdict = AVIOReader.describeRespondingTarget(
+            responded: reMinted, source: source, pinned: nil, dropped: nil,
+            droppedEarlier: [OriginRequestBudget.originKey(for: earlier)!])
+        XCTAssertFalse(verdict.contains("resolved freshly"), verdict)
+        XCTAssertTrue(verdict.contains("the source minted again"), verdict)
+        XCTAssertTrue(verdict.contains("a drop this reader did not make"), verdict)
+    }
+
+    /// The ledger is the origin's, so it has to answer for a reader that never dropped anything and
+    /// never will: reading a target as re-minted requires a drop SOMEWHERE, not one here.
+    func testDroppedLedgerSurvivesTheReaderThatFilledIt() {
+        let budget = OriginRequestBudget()
+        budget.noteRedirect(from: source, to: pinned)
+        budget.noteTargetDropped(pinned, from: source)
+
+        XCTAssertEqual(budget.droppedTargets(for: source),
+                       [OriginRequestBudget.originKey(for: pinned)!],
+                       "a later reader asks from the source URL, the only one it was handed")
+
+        let reMinted = URL(string: "https://nexus-177.cdn.example.st/file.mkv?sig=fresh")!
+        budget.noteTargetHealthy(reMinted)
+        XCTAssertTrue(budget.droppedTargets(for: source).isEmpty,
+                      "a target that answers again is not a target still being refused")
+    }
+
     /// A port or scheme change is a different origin even on the same host, because that is what the
     /// budget keys on and the two lines have to agree about what one target is.
     func testPortIsPartOfTheIdentity() {

@@ -83,6 +83,16 @@ final class OriginRequestBudget: @unchecked Sendable {
         /// FIFO of waiters. Front is served first, so the pump cannot re-take the slot it just
         /// released ahead of a detour that has been waiting.
         var waiters: [DispatchSemaphore] = []
+        /// #377 round 5: targets this chain resolved to and then DROPPED for refusals, by origin
+        /// key, until one is seen answering again. Kept HERE rather than on the reader because the
+        /// reader is the one thing in this picture that does not survive: a metered revive builds a
+        /// fresh demuxer, and a fresh demuxer's reader starts with an empty history, so the target
+        /// the previous reader dropped seconds ago reads to it as one the source resolved freshly.
+        /// That is the single verdict that puts metering back on the table, and the readers that
+        /// most need the history were the only ones without it, because the rebuild is what creates
+        /// them (reporter's capture: the same host answered as `dropped and minted again` 8 times
+        /// from the reader that dropped it and as `resolved freshly` 32 times from the rebuilds).
+        var droppedTargets: Set<String> = []
     }
 
     private let lock = NSLock()
@@ -152,6 +162,7 @@ final class OriginRequestBudget: @unchecked Sendable {
             if let theirs = joining.lastRefusalAt {
                 merged.lastRefusalAt = merged.lastRefusalAt.map { max($0, theirs) } ?? theirs
             }
+            merged.droppedTargets.formUnion(joining.droppedTargets)
             // Their waiters are parked on semaphores this bucket now owns; dropping them would hang
             // every one of them for its full acquire budget.
             merged.waiters.append(contentsOf: joining.waiters)
@@ -356,6 +367,73 @@ final class OriginRequestBudget: @unchecked Sendable {
         guard let last = origins[headLocked(raw)]?.lastRefusalAt else { return false }
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds) / 1_000_000_000
         return elapsed <= window
+    }
+
+    // MARK: - Dropped redirect targets (#377 round 5)
+
+    /// The ladder dropped `target` because requests through it were being refused. Recorded on the
+    /// SOURCE's chain, so the next reader for the same source finds it whatever instance it is.
+    ///
+    /// A pin is only ever written down from a 2xx, deliberately: pinning a target that just refused
+    /// would key the whole session on it. The consequence is that a re-resolve landing back on a
+    /// refusing target is recorded nowhere, and off the responding host alone the three shapes that
+    /// need three different fixes are indistinguishable. The reader kept this ledger and the reader
+    /// is replaced by the very recovery that most needs it, so it lives here.
+    func noteTargetDropped(_ target: URL, from source: URL) {
+        guard let targetKey = Self.originKey(for: target),
+              let sourceKey = Self.originKey(for: source) else { return }
+        lock.lock(); defer { lock.unlock() }
+        // Keyed under the SOURCE's chain head, which is the only side a later reader can ask from:
+        // it knows the URL it was handed, not the target the last reader was redirected to.
+        let head = headLocked(sourceKey)
+        var state = origins[head] ?? OriginState()
+        state.droppedTargets.insert(targetKey)
+        origins[head] = state
+    }
+
+    /// `target` answered. It is no longer a dropped target, so a refusal from it later in the
+    /// session describes that later window rather than dragging an old one forward: "dropped and
+    /// minted again" has to mean dropped and NOT seen healthy since, or it becomes true for the
+    /// rest of the process and says nothing.
+    func noteTargetHealthy(_ target: URL) {
+        guard let targetKey = Self.originKey(for: target) else { return }
+        lock.lock(); defer { lock.unlock() }
+        let head = headLocked(targetKey)
+        guard var state = origins[head], state.droppedTargets.contains(targetKey) else { return }
+        state.droppedTargets.remove(targetKey)
+        origins[head] = state
+    }
+
+    /// Targets dropped for refusals on this source's chain and not seen answering since.
+    func droppedTargets(for url: URL) -> Set<String> {
+        guard let raw = Self.originKey(for: url) else { return [] }
+        lock.lock(); defer { lock.unlock() }
+        return origins[headLocked(raw)]?.droppedTargets ?? []
+    }
+
+    /// #377 round 5: what the books can say about WHY this origin refused, for the line that ends
+    /// a session. Empty when they have nothing to add.
+    ///
+    /// Two facts are held here and nowhere else, and they pick different fixes. A peak of one
+    /// request in flight cannot have exceeded a concurrency ceiling, whatever the status code says,
+    /// so a session refused throughout at peak 1 was not refused for asking too much at once. And a
+    /// target that was dropped and handed back by the source is one refusing target rather than an
+    /// origin metering us. Stated as counts, not as a conclusion about the far end: the engine sees
+    /// its own asks, not the quota behind them.
+    func refusalShapeNote(for url: URL) -> String {
+        guard let snapshot = snapshot(for: url), snapshot.refusals > 0 else { return "" }
+        let dropped = droppedTargets(for: url).sorted()
+        var parts = ["peak \(snapshot.peakInflight) in flight", "\(snapshot.refusals) refusals"]
+        if !dropped.isEmpty {
+            parts.append("\(dropped.count) target\(dropped.count == 1 ? "" : "s") dropped for "
+                         + "refusals and not seen answering since (\(dropped.joined(separator: ", ")))")
+        }
+        var note = " Books for this origin: " + parts.joined(separator: ", ") + "."
+        if snapshot.peakInflight <= 1 && !dropped.isEmpty {
+            note += " One request at a time cannot exceed a concurrency ceiling, so what refused is"
+                + " that target, not our concurrency."
+        }
+        return note
     }
 
     /// Host-declared ceiling for this origin. Takes precedence over anything learned, in both

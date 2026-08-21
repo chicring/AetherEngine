@@ -254,6 +254,97 @@ struct OriginRequestBudgetTests {
         #expect(!budget.refusedRecently(fileURL, within: 30))
         budget.release(nil)
     }
+
+    // MARK: - Dropped targets and the refusal shape (#377 round 5)
+
+    /// The books answer for a chain, so a target dropped while asking one end is known from the
+    /// other. Which matters because the two ends have different lifetimes: the source URL is what
+    /// the host loaded and what every later reader is built from, the target is a lease.
+    @Test("a dropped target is known from the source URL, and folds with the chain")
+    func droppedTargetIsChainScoped() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/file.mkv?sig=a")!
+        budget.noteRedirect(from: url, to: target)
+        budget.noteTargetDropped(target, from: url)
+
+        let targetKey = OriginRequestBudget.originKey(for: target)!
+        #expect(budget.droppedTargets(for: url) == [targetKey])
+        #expect(budget.droppedTargets(for: target) == [targetKey],
+                "either end of one chain has to give the same answer")
+        #expect(budget.droppedTargets(for: otherOrigin).isEmpty,
+                "another origin's refusals are not this one's history")
+    }
+
+    /// A second target dropped in a later window does not evict the first. One slot described one
+    /// window and the reporter's session refused in three.
+    @Test("every dropped target of a chain is kept, not just the last")
+    func everyDroppedTargetIsKept() {
+        let budget = freshBudget()
+        let first = URL(string: "https://nexus-042.cdn.example.st/f.mkv")!
+        let second = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        budget.noteRedirect(from: url, to: first)
+        budget.noteTargetDropped(first, from: url)
+        budget.noteRedirect(from: url, to: second)
+        budget.noteTargetDropped(second, from: url)
+
+        #expect(budget.droppedTargets(for: url).count == 2)
+    }
+
+    /// #377 round 5: peak concurrency is the one fact that can refute the reading the status code
+    /// invites. An origin that refused while we never had more than one request open did not refuse
+    /// us for asking too much at once, whatever a 429 suggests, and the fix for the two cases is
+    /// different.
+    @Test("the give-up note reports the books, and names peak 1 as not a concurrency ceiling")
+    func refusalShapeNoteSeparatesConcurrencyFromARefusingTarget() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        budget.noteRedirect(from: url, to: target)
+
+        #expect(budget.refusalShapeNote(for: url).isEmpty,
+                "an origin that never refused has nothing to say at a give-up")
+
+        let ticket = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        budget.noteRefusal(for: target, status: 429)
+        budget.release(ticket)
+        budget.noteTargetDropped(target, from: url)
+
+        let note = budget.refusalShapeNote(for: url)
+        #expect(note.contains("peak 1 in flight"), Comment(rawValue: note))
+        #expect(note.contains("1 refusals") || note.contains("1 refusal"), Comment(rawValue: note))
+        #expect(note.contains("nexus-179.cdn.example.st"), Comment(rawValue: note))
+        #expect(note.contains("cannot exceed a concurrency ceiling"), Comment(rawValue: note))
+    }
+
+    /// The other half of the same line: with two requests seen at once, a refusal MIGHT be about
+    /// concurrency, and the note must not claim otherwise.
+    @Test("a peak above one withholds the concurrency verdict")
+    func refusalShapeNoteIsSilentOnConcurrencyAbovePeakOne() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        budget.noteRedirect(from: url, to: target)
+        let a = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        let b = budget.acquire(for: url, label: "detour", timeout: 0.1)
+        budget.noteRefusal(for: target, status: 429)
+        budget.noteTargetDropped(target, from: url)
+        budget.release(a); budget.release(b)
+
+        let note = budget.refusalShapeNote(for: url)
+        #expect(note.contains("peak 2 in flight"), Comment(rawValue: note))
+        #expect(!note.contains("cannot exceed a concurrency ceiling"), Comment(rawValue: note))
+    }
+
+    /// A chain fold merges two sets of books, and the dropped targets are books.
+    @Test("folding a chain keeps both ends' dropped targets")
+    func foldMergesDroppedTargets() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        let stale = URL(string: "https://nexus-042.cdn.example.st/f.mkv")!
+        budget.noteTargetDropped(stale, from: target)
+        budget.noteRedirect(from: url, to: target)
+
+        #expect(budget.droppedTargets(for: url).contains(OriginRequestBudget.originKey(for: stale)!),
+                "the target's history joins the chain it is folded into")
+    }
 }
 
 /// Minimal cross-thread carriers; the suite runs actual concurrency, so the expectations need a

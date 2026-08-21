@@ -531,12 +531,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// producer's front reached neither (rrgomes: seg719 miss x11 into -12889), so the exit gets
     /// its own event-driven arm. Same gate shape as #99.
     var readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
-    /// #377: a separate, larger budget for read errors caused by an origin METERING us rather than
+    /// #377: a separate, larger budget for read errors caused by an origin REFUSING us rather than
     /// failing. Separate because the two must not spend each other: two attempts is right for a
-    /// source that may be gone, and wrong for one that is merely busy, where each attempt is
-    /// spaced by a growing backoff and is expected to succeed eventually. Four attempts across the
-    /// ladder in `rateLimitReviveDelay` span over a minute of waiting before the session is called.
-    var rateLimitReviveGate = MuxerFailureReviveGate(maxAttempts: 4)
+    /// source that may be gone, and wrong for one that is merely refusing for a while, where each
+    /// attempt is spaced by a growing backoff and is expected to succeed eventually.
+    ///
+    /// Round 6 made it a wall clock per refusal window rather than an attempt count per session.
+    /// See `RefusingSourceReviveBudget` for why: the old figure was the emergent product of two
+    /// constants that did not know about each other, and it was never reset.
+    var rateLimitReviveGate = RefusingSourceReviveBudget()
 
     /// AE#169 round 2 (under `restartLock`): the demuxer's last read threw, so the next
     /// performRestart replaces it via the #79 fresh-demuxer path instead of seeking a connection
