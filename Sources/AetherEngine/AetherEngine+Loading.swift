@@ -288,6 +288,7 @@ extension AetherEngine {
         // plays audio into a black view (#120). Mirrors loadNative's post-host call.
         presentCurrentLayer()
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         // No loopback producer; playhead is the raw AVPlayer clock. Shift stays 0.
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
@@ -1003,6 +1004,7 @@ extension AetherEngine {
         replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
         if currentAVPlayer !== host.avPlayer {
             self.currentAVPlayer = host.avPlayer
@@ -1452,6 +1454,10 @@ extension AetherEngine {
             }
         }
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
+        // 与 native 路径对齐：SW host 重建后重新应用用户选择的填充模式
+        //（防止切集/重开后 videoGravity 回到默认 resizeAspect）。
+        host.displayLayer.videoGravity = _videoGravity
         // #112 rework: SW-host subtitle tap feeds a session packet store; the shared
         // playhead-paced drainer reads it exactly like the HLS session's store.
         let packetStore = SubtitlePacketStore()
@@ -1546,6 +1552,7 @@ extension AetherEngine {
         let host = AudioPlaybackHost()
         self.audioHost = host
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
 
@@ -1613,6 +1620,7 @@ extension AetherEngine {
         let host = audioAVPlayerHost ?? AudioAVPlayerHost()
         self.audioAVPlayerHost = host
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         self.audioAVPlayerActive = true
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())

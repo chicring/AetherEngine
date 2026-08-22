@@ -1158,6 +1158,10 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
+        // AVPlayer.play() starts at `defaultRate`（默认 1.0），会覆盖已设置的 rate；
+        // 同步 defaultRate 后，所有 play()（含 readyToPlay 重发、replaceCurrentItem 后恢复）
+        // 都按用户选择的倍速启动，而不是被重置回 1.0（对齐 Audio/Software host 的 lastRate 保护）。
+        if value != 0 { avPlayer.defaultRate = value }
         avPlayer.rate = value
     }
 

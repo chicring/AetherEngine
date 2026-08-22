@@ -4858,6 +4858,15 @@ public final class AetherEngine: ObservableObject {
         if let v = desiredVolume { host.volume = v }
     }
 
+    /// Playback rate (1.0 default), remembered across host/pipeline rebuilds so a
+    /// load-to-load change (seamless, reopen, background rebuild) re-applies the
+    /// user's chosen speed instead of silently resetting to 1.0.
+    var desiredRate: Float = 1.0
+
+    func applyDesiredRate(to host: any TransportControllable) {
+        host.setRate(min(desiredRate, maxSupportedRate))
+    }
+
     /// Maximum reliable forward rate: 3x for audio-only sessions, 2x for video.
     /// Above the cap AVPlayer fast-forward becomes unstable (AetherEngine#39).
     /// Hosts should size their speed picker against this. Query after load; returns 2.0 while idle.
@@ -4873,6 +4882,7 @@ public final class AetherEngine: ObservableObject {
         if clamped != rate {
             EngineLog.emit("[AetherEngine] setRate(\(rate)) clamped to \(clamped) (max supported on this path)", category: .engine)
         }
+        desiredRate = clamped
         activeTransportHost?.setRate(clamped)
     }
 
