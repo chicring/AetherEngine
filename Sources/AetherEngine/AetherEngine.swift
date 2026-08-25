@@ -472,6 +472,19 @@ public final class AetherEngine: ObservableObject {
     /// container info for Stats-for-Nerds; the live per-second rate lives in `LiveTelemetry`.
     @Published public internal(set) var sourceVideoBitrate: Int64 = 0
 
+    /// Source video codec in the libavcodec vocabulary ("hevc", "h264", "av1", "mpeg2video"), nil before
+    /// load and when the source has no video track. On the probe-free native HLS bypass it is mapped back
+    /// from the item's video sample type, so one field means one thing on every path. Companion to
+    /// `sourceVideoFormat` for Stats-for-Nerds; `activeVideoDecoder` names what is decoding it, which is a
+    /// different question (a codec has more than one decoder, and the answer changes with hardware).
+    @Published public internal(set) var sourceVideoCodecName: String? = nil
+
+    /// Container libavformat opened ("matroska,webm", "mpegts", "mov,mp4,m4a,3gp,3g2,mj2"), nil before load
+    /// and on the native HLS bypass (AVFoundation opens that one, there is no libav context to ask). This is
+    /// the container that ARRIVED: on a remux or transcode session it differs from the one the host's library
+    /// holds, and that difference is the thing a stats panel exists to show.
+    @Published public internal(set) var sourceContainerFormat: String? = nil
+
     // MARK: - Disc titles / chapters (#67)
 
     /// Selectable titles on the loaded disc image (Blu-ray playlists / DVD titles), longest first so
@@ -1472,8 +1485,8 @@ public final class AetherEngine: ObservableObject {
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
-    public private(set) var sourceVideoWidth: Int32 = 0
-    public private(set) var sourceVideoHeight: Int32 = 0
+    @Published public private(set) var sourceVideoWidth: Int32 = 0
+    @Published public private(set) var sourceVideoHeight: Int32 = 0
     /// Display-width multiplier for non-square source pixels: `sourceVideoWidth * this` is the width
     /// the picture presents at. 1 before load, on square-pixel sources, and whenever the declared
     /// ratio is one the engine refuses to believe (#290), so it is never a number the picture
@@ -1657,6 +1670,24 @@ public final class AetherEngine: ObservableObject {
         progressEpsilon: Double = 0.5
     ) -> Bool {
         isLive && clockNow <= clockAtReload + progressEpsilon && isWaitingToPlay
+    }
+
+    /// #405: whether stage 2 has anything to fix. Replacing the consumer's item helps a consumer
+    /// that died under a HEALTHY producer; against a producer starved by its origin it refills the
+    /// same frozen tail, parks again, and the retune the host actually needs waits out two more
+    /// grace windows (field trace: 12 s and eleven replayed seconds on a one-slot Xtream host).
+    /// Consumer fetches cannot tell the two apart, they are zero in both. The finalized-segment
+    /// count can: it is the producer answering.
+    ///
+    /// `nil` on either side means there is no local producer to ask (a remote HLS session AVPlayer
+    /// fetches itself), and absence is not starvation: stage 2 keeps its old behaviour there.
+    nonisolated static func liveProducerIsStarved(
+        isLive: Bool,
+        segmentsAtStall: Int?,
+        segmentsNow: Int?
+    ) -> Bool {
+        guard isLive, let atStall = segmentsAtStall, let now = segmentsNow else { return false }
+        return now <= atStall
     }
 
     /// #93 round 3: item death (failedToPlayToEndTime after -12889 strikes) escalation.
@@ -2499,6 +2530,8 @@ public final class AetherEngine: ObservableObject {
     public init() throws {
         // Route av_log into EngineLog before any libav* entry point so probe/load diagnostics are captured.
         FFmpegLogBridge.install()
+        // Which FFmpeg answers is decided by the host's link, not by the package graph (AE#396).
+        FFmpegRuntimeCheck.logOnce()
         _ = DeinterlaceHardwareWarmup.shared
 
         // Declare category + multichannel support but do NOT activate the session here.
@@ -2811,6 +2844,8 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
+        sourceVideoCodecName = nil
+        sourceContainerFormat = nil
         sourceVideoWidth = 0
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1
@@ -3040,6 +3075,10 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = detectedDVProfileNum
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
+        sourceVideoCodecName = detectedCodecID == AV_CODEC_ID_NONE
+            ? nil
+            : avcodec_get_name(detectedCodecID).map { String(cString: $0) }
+        sourceContainerFormat = probeOpened ? probe.containerFormatName : nil
         audioTracks = probedAudioTracks
         applyConfirmedAtmos()
         subtitleTracks = probedSubtitleTracks
@@ -3830,6 +3869,7 @@ public final class AetherEngine: ObservableObject {
             // Live SW: drive the host's ring-backed DVR reseed directly; no AVPlayer-clock translation applies.
             if softwareHost != nil, nativeHost == nil {
                 EngineLog.emit("[AetherEngine] SW live seek target=\(target)", category: .engine)
+                softwareSubtitlePacketStore?.noteHarvestAnchor(.pump, at: target)   // #416
                 await softwareHost?.seek(to: target)
                 guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
                 clock.currentTime = target
@@ -3891,6 +3931,11 @@ public final class AetherEngine: ObservableObject {
         } else if let host = audioHost {
             hostReposition = await host.seek(to: clockTarget)
         } else if let host = softwareHost {
+            // #416: the software pump is this path's subtitle harvest, and it reads forwards from
+            // wherever this reposition puts it. Everything between where it had got to and here is
+            // ground nobody read; the drain must not read an empty store there as an authored
+            // silence. Stated before the seek: the demuxer lands at or before the target.
+            softwareSubtitlePacketStore?.noteHarvestAnchor(.pump, at: clockTarget)
             hostReposition = await host.seek(to: clockTarget)
         } else {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek
@@ -4419,6 +4464,8 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
+        sourceVideoCodecName = nil
+        sourceContainerFormat = nil
         sourceVideoWidth = 0
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1

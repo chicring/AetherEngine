@@ -725,11 +725,25 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
             // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
             if cache.peekURL(index: index) != nil {
+                let frontier = cache.contiguousForwardFrontier(from: index)
+                let front = activeMarchFront
+                if Self.residentBackwardTargetKeepsProducer(
+                    index: index, residentFrontier: frontier, activeMarchFront: front,
+                    prefetchDepth: Self.forwardWaitWindow
+                ) {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): "
+                        + "resident through seg\(frontier) (march front \(front)), no restart",
+                        category: .session
+                    )
+                    return
+                }
                 EngineLog.emit(
-                    "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): resident in cache, no restart",
+                    "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): resident "
+                    + "only through seg\(frontier), which is below the march front \(front), so the band "
+                    + "ends in a gap nothing is producing",
                     category: .session
                 )
-                return
             }
             EngineLog.emit(
                 "[HLSVideoEngine] declareTarget backward jump \(previousTarget) → \(index), proactively restarting producer",
@@ -988,6 +1002,33 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             )
         }
         return bytes
+    }
+
+    /// AE#408 pure decision: a backward target jump landed on a segment that is still resident. May the
+    /// producer stay anchored where it is?
+    ///
+    /// The residency gate exists for the Continuous-Audio handover refetch (~7-10 segments backward into
+    /// content the ACTIVE pump is still writing): restarting there re-arms the FLAC bridge and glitches
+    /// the audio. Residency of the target segment alone does not carry that, because a scrub band left by
+    /// an EARLIER pump is resident too, and it ends. Nothing else aims the producer at the new target, so
+    /// the band running out is what finally does it: the consumer asks for the first index above it, the
+    /// out-of-range restart fires, and the whole re-anchor is paid at the one moment the buffer is empty.
+    /// Measured on the `aetherctl play` repro (backward seek to seg38 into a 3-segment band, pump anchored
+    /// at seg99): the ask for seg41 arrived 4 s later with 5 s of buffer left. With a longer band the pump
+    /// instead sat parked for 24 s until the #65 backpressure wedge breaker moved it.
+    ///
+    /// Two shapes still keep the producer:
+    ///
+    /// - The resident run reaches the active march front. There is no gap to fall into: the band carries
+    ///   the consumer straight back into the pump's own output. This is the handover case.
+    /// - The run is at least a prefetch window deep. AVPlayer asks for a segment 5-7 ahead of what it is
+    ///   playing, so the existing out-of-range restart runs with a full cushion, and re-anchoring early
+    ///   would re-produce content that is already on disk.
+    static func residentBackwardTargetKeepsProducer(
+        index: Int, residentFrontier: Int, activeMarchFront: Int, prefetchDepth: Int
+    ) -> Bool {
+        if residentFrontier >= activeMarchFront { return true }
+        return residentFrontier - index >= prefetchDepth
     }
 
     private func activeProducerCovers(_ index: Int) -> Bool {

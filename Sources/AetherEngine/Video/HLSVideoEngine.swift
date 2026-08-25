@@ -497,6 +497,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var audioBridge: AudioBridge?
     var segmentPlan: [Segment] = []
 
+    /// AE#408: true only while `segmentPlan` is the keyframe-aligned plan, whose boundaries are
+    /// container index entries and therefore CLAIM to be random-access points. The producer re-aims
+    /// below a boundary that breaks that claim; it must not do so for the uniform grid (which never
+    /// claimed it) or a source-declared plan (which aims below its IRAP by design, AE#268).
+    var planBoundariesClaimRandomAccess = false
+
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
     let restartLock = NSLock()
@@ -946,6 +952,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
             sourceBitrate = dem.bitRate
 
+            // #409: settle the composition-offset repair while the demuxer still stands at the head.
+            // It reads a short sample and holds those packets, so nothing is consumed; doing it later
+            // would sample wherever the prewarm left the source, and hand the producer a head that is
+            // six seconds into the file. The segment plan below needs the verdict either way, because
+            // a repaired stream and the container's own index have to describe one ladder.
+            dem.decideCompositionOffsetRepair()
+
             // 2. Prewarm MKV Cues so libavformat's keyframe index is populated (1-2 byte-range reads).
             //    Bounded: a missing/out-of-bounds Cues index degrades into a multi-GB linear scan;
             //    abort past the deadline and fall back to the uniform-stride plan.
@@ -1007,6 +1020,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     sourceDurationSeconds: durationSeconds,
                     firstSegmentSeconds: shortFirstSegmentSeconds
                 )
+                planBoundariesClaimRandomAccess = true
                 let firstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = firstKeyframePts
                 let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
@@ -1661,6 +1675,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
             }
         }
+        // #416: the pump harvests every subtitle packet it demuxes, so where it OPENS is where its
+        // coverage of the source begins. The subtitle drain reads "nothing between this set and the
+        // playhead" out of the same store, and below this position that answer means nothing.
+        if !plan.isEmpty {
+            let openIndex = max(0, min(initialProducerBaseIndex, plan.count - 1))
+            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+            subtitlePacketStore.noteHarvestAnchor(
+                .pump, at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
+        }
         prod.start()
 
         // URL routing: master playlist (VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS=dvh1) only when
@@ -2099,6 +2122,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             videoFallbackDurationPts: videoFallbackDurationPts,
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoPts: videoTarget,
+            boundaryClaimsRandomAccess: planBoundariesClaimRandomAccess,
             closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework
@@ -2259,6 +2283,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.lock()
         defer { restartLock.unlock() }
         return provider?.mediaFetchCount ?? 0
+    }
+
+    /// #405: segments the producer has finalized this session, the counterpart to
+    /// `mediaFetchCountSnapshot`. One counts the consumer asking, this one counts the producer
+    /// delivering, and the stall ladder needs both to tell a dead consumer from a starved origin.
+    /// nil when there is no local producer at all (a remote HLS session AVPlayer fetches directly),
+    /// which is a different situation from a producer that stopped: callers must not read the
+    /// absence as zero progress. Monotonic: the live window slides by moving `firstVisible` and
+    /// evicting cache, never by dropping entries from the segment list.
+    var liveSegmentCountSnapshot: Int? {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return provider.map { $0.liveContinuationPoint().nextIndex }
     }
 
     /// #178: called by the engine when a NEW user seek is dispatched. A recovery re-anchor still
@@ -2511,6 +2548,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         let elapsedMs = msSince(restartStart)
         let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
+        // #416: the outgoing pump's run ends where it got to and the new one begins here. Whatever
+        // lies between the two was skipped, and a subtitle set stranded on the near side of that
+        // gap can no longer be read as the line still on screen at the landing.
+        subtitlePacketStore.noteHarvestAnchor(.pump, at: absoluteTargetSeconds)
         // build = everything after the seek (re-validation, muxer/producer construction, start).
         let buildMs = max(0, elapsedMs - stopWaitMs - (reopenMs ?? 0) - seekMs)
         EngineLog.emit(

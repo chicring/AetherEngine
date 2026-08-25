@@ -196,9 +196,30 @@ Runs the rewind matrix across the native and SW paths (`--path native|sw|both`).
 
 ## hlsfixture
 
-Slices a local `.ts` into a sliding live HLS playlist and serves it over loopback, with fault knobs (`--master` indirection, `--codecs`, `--resolution`, `--discontinuity-at`, `--slow-refresh`, `--drop-segment`, `--encrypted`, `--fmp4`, `--port`, `--segment-seconds`) and a `--self-test` mode that runs `HLSLiveIngestReader` against it end to end. Every request is logged as one `[HLSFixture] REQ <path>` line, so what a load actually costs the origin is countable rather than arguable.
+Slices a local `.ts` into a sliding live HLS playlist and serves it over loopback, with fault knobs (`--master` indirection, `--codecs`, `--resolution`, `--discontinuity-at`, `--slow-refresh`, `--drop-segment`, `--encrypted`, `--fmp4`, `--port`, `--segment-seconds`, `--target-duration`, `--window`) and a `--self-test` mode that runs `HLSLiveIngestReader` against it end to end. Every request is logged as one `[HLSFixture] REQ <path>` line, so what a load actually costs the origin is countable rather than arguable.
 
 `--segments-dir <dir>` serves pre-cut segments (`ffmpeg -i in.ts -c copy -f hls -hls_time 4 -hls_flags independent_segments -hls_segment_filename seg%d.ts out.m3u8`) instead of byte slices, sorted numerically. Byte slices start mid-GOP, which is fine for "did it route" and useless for "did it play": the run rebuffers forever because nothing decodes. Use the directory whenever the question is playthrough.
+
+### The advertised TARGETDURATION and the window depth (AE#374)
+
+`--target-duration N` advertises a `#EXT-X-TARGETDURATION` independent of the real cut size, and `--window N` sets how many segments the sliding window keeps visible (default 6, minimum 3). Packagers commonly pad the target duration (`segment + 1`) to widen a client's patience for an unchanged playlist, and a downstream host asked whether that padding was what its live joins were paying for. Neither shape could be expressed here, so the question could not be answered by measurement at all.
+
+Measured against pre-cut GOP-aligned segments, `play --live --fast-zap` entered on a saturated window, three passes per row, engine 6.34.1:
+
+| origin cut | advertised TD | window | served TD | first serve held |
+|---|---|---|---|---|
+| 2 s | 3 (padded) | 3 | 3 | 2.004 / 2.010 / 2.010 s |
+| 2 s | 2 (`ceil(max EXTINF)`) | 3 | **3** | 2.010 s, three times |
+| 2 s | 3 | 5 | 3 | 2.001 / 2.007 / 2.010 s |
+| 2 s | 5 (over-padded) | 3 | **5** | 2.010 s, three times |
+| 1 s | 2 (padded) | 3 | 2 | 1.001 / 1.010 / 1.010 s |
+| 1 s | 1 (`ceil(max EXTINF)`) | 3 | **2** | 1.005 / 1.007 / 1.010 s |
+| 1 s | 2 | 7 | 2 | 1.003 / 1.005 / 1.010 s |
+| 0.5 s GOP inside 1 s segments | 2 | 3 | 2 | **0.510 s, three times** |
+
+Removing the padding changes nothing. The served TARGETDURATION is `max(advertised, ceil(observed arrival cadence), ceil(max own EXTINF), ceil(1.5 x cut target))`, and a strict-realtime origin's real inter-arrival gap is always a hair above the nominal cut, so the `ceil` lands on `cut + 1` whether or not the origin advertises it. Deepening the window changes nothing either: the ingest joins exactly three segments behind the edge at window 3, 5 and 7, so a deeper upstream window never becomes a deeper cushion. What moves is the cut, because the fastZap grace is `min(2.0, max(0.5, own cut duration))` and the engine re-cuts at the source GOP.
+
+Over-padding costs somewhere else than the join. TD 5 on 2 s cuts still serves in 2.010 s, because the bounded fastZap exit fires on the grace either way, but the served playlist then carries a 15 s holdback, so AVPlayer targets that far behind the live edge for the rest of the session.
 
 ### The header-enforcing origin (AE#363)
 

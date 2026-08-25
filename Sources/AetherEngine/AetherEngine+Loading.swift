@@ -329,6 +329,9 @@ extension AetherEngine {
                 self.sourceVideoFormat = fmt
                 self.videoFormat = fmt
                 if let rate = self.nativeHost?.detectedVideoFrameRate { self.sourceVideoFrameRate = rate }
+                // Same reason as the rate: this bypass runs no libav probe, so without the read-back the
+                // codec row on a remote-HLS session stays empty for a source that is plainly playing.
+                if let codec = self.nativeHost?.detectedVideoCodecName { self.sourceVideoCodecName = codec }
                 self.applyRemoteHLSDisplayCriteria(format: fmt, options: options)
             }
             .store(in: &nativeCancellables)
@@ -1163,6 +1166,9 @@ extension AetherEngine {
                 self.stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
                 self.stallRecoveryReasserts = 0
                 let fetchesAtStall = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
+                // #405: what the producer had finalized when the stall began, so stage 2 can ask
+                // whether anything has been produced since. nil = no local producer to ask.
+                let segmentsAtStall = self.nativeVideoSession?.liveSegmentCountSnapshot
                 self.stallReengageTask?.cancel()
                 self.stallReengageTask = Task { @MainActor [weak self, weak host] in
                     // Level re-watch (#65): fetch activity inside the grace window used to disarm
@@ -1222,6 +1228,26 @@ extension AetherEngine {
                     // stall events: reloads at the same frozen position exhaust it, then the only
                     // remaining move is the host's (fresh session against the server route).
                     let reloadPosition = player2.currentTime().seconds
+                    // #405: stage 2 replaces the CONSUMER's item, which is the wrong tool when the
+                    // producer behind it has been starved by its origin: the fresh item refills the
+                    // same frozen tail, parks again, and costs two more grace windows before the
+                    // final rung asks for the retune. The finalized-segment count is the one fact
+                    // that separates a dead consumer from a starved producer, and the ladder had
+                    // never consulted it. Skip straight to the retune when nothing was produced
+                    // since the stall.
+                    let segmentsNow = self.nativeVideoSession?.liveSegmentCountSnapshot
+                    if Self.liveProducerIsStarved(isLive: self.isLive,
+                                                  segmentsAtStall: segmentsAtStall,
+                                                  segmentsNow: segmentsNow) {
+                        let seg = segmentsNow.map(String.init) ?? "?"
+                        EngineLog.emit(
+                            "[AetherEngine] #65 stage-2 skipped: no segment finalized since the "
+                            + "stall (producer still at seg\(seg)); the producer is starved, not "
+                            + "the consumer; publishing liveSourceReset to host",
+                            category: .engine)
+                        self.liveSourceReset.send()
+                        return
+                    }
                     if self.isLive, !self.stallReloadReviveGate.admit(position: reloadPosition) {
                         EngineLog.emit(
                             "[AetherEngine] #65 stage-2 reload budget exhausted at frozen "

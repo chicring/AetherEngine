@@ -349,6 +349,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
               + engine.subtitleTracks.map { "#\($0.id) \($0.name)(\($0.language ?? "?"))" }
                 .joined(separator: ", "))
     }
+    // The source identity a host stats panel reads, in one line. Printed from the session (not from a
+    // separate probe) because that is the state the panel binds to, and the two can disagree: the
+    // remote-HLS bypass runs no probe and fills these from the item's sample type instead.
+    print("  SOURCE codec=\(engine.sourceVideoCodecName ?? "nil") "
+          + "container=\(engine.sourceContainerFormat ?? "nil") "
+          + "\(engine.sourceVideoWidth)x\(engine.sourceVideoHeight) "
+          + "fps=\(engine.sourceVideoFrameRate.map { String(format: "%.3f", $0) } ?? "nil") "
+          + "bitrate=\(engine.sourceVideoBitrate) "
+          + "fmt=\(engine.sourceVideoFormat)"
+          + (engine.sourceDVProfile.map { " dvProfile=\($0)" } ?? ""))
+
     // Mimic host-app post-load calls (AetherPlayer openInternal order) to reproduce
     // host-triggered transport races the bare harness would miss.
     var frameExtractor: FrameExtractor?

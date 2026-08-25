@@ -22,6 +22,41 @@ That list is the supported set, not the compiled set. The FFmpeg build also carr
 
 Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent bwdif graph (yadif fallback) that engages on the first interlaced frame and costs nothing on progressive content. The dispatch decision lives in `AetherEngine.load` (`VideoRoutingPolicy`), gated per source on `VTCapabilityProbe`, codec id, declared field order, and on VOD the decode sample that verifies it.
 
+### MP4 without composition offsets
+
+Some writers emit a sample table with no `ctts` while the H.264 bitstream still reorders pictures.
+Every sample then reports `PTS == DTS`, and since the native route stream-copies those timestamps
+into fMP4, AVPlayer is handed decode order as presentation order: each future reference picture is
+shown before the B pictures that precede it. Measured through AVFoundation's own decoder on a twin
+pair (one encode muxed twice, composition offsets removed from one), 45 of 66 pictures landed at a
+time belonging to a different picture, with the content order stepping backwards 30 times (#409).
+
+The container lost the information, but the bitstream did not: every slice header carries a picture
+order count, which is display order, and libavcodec's H.264 parser reads it without decoding a pixel
+and takes MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
+(twelve pictures at most, held rather than re-read, so no rewind and no second fetch) and repairs a
+confirmed source at the demuxer boundary:
+
+    PTS = (decode time of the picture that opened this coded video sequence) + shift + rank * step
+    DTS = DTS + shift - reorderDelay * step
+
+Pulling decode time back by the reorder delay is what keeps `PTS >= DTS`; a healthy file carries the
+same negative head. `shift` is 0 or one reorder delay, depending on whether the writer left the
+sample ladder on the presentation axis or kept the edit list that trims the reorder head, and is
+clamped to that range so a malformed header cannot drag the picture off its audio. Because the
+rewrite happens once, in the demuxer, the fMP4 producer, the segment plan, the software decoder and
+the still extractor all read one axis, and the source keeps hardware decode: a missing table costs
+no route change. The container's own index is folded onto the same ladder, since the segment plan is
+built from index entries and then filled with these packets.
+
+Detection is fail-closed and costs a healthy file almost nothing: the first real PTS-DTS offset ends
+the sample (usually on the first packet, since a reordered file's head sample sits one delay below
+zero). A source is only repaired when every sampled pair is equal, the decode ladder is uniform, the
+picture order regresses, and the ranks it produces are distinct and fill the sampled window. Anything
+short of that (variable frame timing, a picture order that does not advance one rank per picture, a
+sample that starts nowhere it can be anchored) is delivered exactly as the container wrote it.
+Reported by @orut34iop.
+
 ## HDR routing
 
 | Source | Wrapper signaling |
@@ -125,6 +160,8 @@ A PGS composition carries no end of its own: it is published with FFmpeg's open-
 That close is the last resort, not the rule. The end a set is authored with is the PTS of the next packet on its stream, and the packet store holds that packet long before the drain window reaches it, so every tick closes each still-open cue at `SubtitlePacketStore.firstPTS(streamIndex:after:)` (#362). Without it the drain window's forward edge decides the end whenever it falls between a set and its clear: the set publishes open, the cursor moves past it, and the next thing to touch it is a composition at the next landing, tens or hundreds of seconds later (report: 3.55 s authored, 76.7 s delivered, and 817 s in the same session). For the store to be able to answer, the harvest has to lead the decode: the forward prefetcher parks a 15 s margin BEYOND the drain window (`subtitleForwardPrefetchLeadMarginSeconds`), because with both lines at 60 s the set at the edge is systematically the one whose clear is stored nowhere. Where the store genuinely has nothing after a set (its harvest frontier, a stream cut short) the cue stays open and #357's boundary close still owns it, since inventing an end there is the laundering this replaced.
 
 The same report has a second face, and it is the store's own bookkeeping rather than the cue's. After a seek the pump restarts behind the landing and fills forward while the store still holds an island the previous run harvested further ahead, so the drain window reads as "packets, hole, packets". Decoding across that hole carries the drain cursor to its far side, and the cursor only moves forward: the hole's packets land a second later and are never read, so a stretch of the film carries no subtitles at all until some later seek resets the window behind it, and the set before the hole is closed at the island rather than at its own clear (report: eleven authored sets delivered as two). The size of the gap cannot tell that apart from a silence the author left, and a threshold on it is actively harmful, since a set is separated from its own clear by its display duration. Harvest ORDER can: a run reads a stream forwards, so within one run PTS and sequence rise together, and a PTS-ascending pair whose sequence DESCENDS is two runs meeting over a span neither of them has read. A tick stops at that boundary and waits (`harvestGapCut`, #362), which costs nothing visible because the drain runs its lead ahead of the playhead; the wait ends when the filling run re-harvests across the boundary, when the playhead catches up to it, or after a bounded tick budget, so an authored silence can never stall delivery. A tick that waited says so, as `outcome=harvestHole gapAt=`.
+
+A hole behind the playhead has a third face, and it is the landing itself (#416). The gate that reconstructs the active line at a seek target seeds it from the newest set decoded behind the playhead, and that set is the active line only if nothing on its stream happened in between. The store's silence is read as that proof, and over a stretch nobody read it proves nothing: a run re-aimed just after it harvested a set leaves that set's own clear on the far side of the skipped ground, so it decodes at the landing looking unclosed and publishes over the new scene, ending at the next stored packet, which is the far side of the authored silence rather than its own successor (report: a two-second sound-effect caption standing ten seconds over the wrong scene, on both an Apple TV 4K and a Mac). #362 established that the packets alone cannot show this: a reader re-anchored FORWARD hangs its packets in ascending order behind the stretch it skipped, so the pair looks exactly like an authored silence, and only a reader restarted BEHIND leaves the descending sequence `harvestGapCut` reads. So the readers now say what they read. `SubtitleHarvestCoverage` in the packet store keeps one span per run, anchored where the reader positioned and extended as it goes: the forward prefetcher reports its own read position, the pump's run begins where the producer opens or restarts and reaches at least the playhead, since playback is rendering there. A set whose ground up to the playhead is not covered cannot claim the landing (`landingWithheld=` on the delivery line), and the pass ends on the next authored set as it would have anyway. A store nobody reports to answers every span with yes, so a path without coverage notes behaves exactly as it did. The cost is the landing line in the case where a set really is still up and the proof is missing, which needs an authored dwell long enough to span the whole unread stretch; the alternative was paying it for every normally authored set that ends inside one.
 
 Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock sits at `source_pts - producer.videoShiftPts` (the producer applies a per-session shift to align the first segment's tfdt with the playlist origin, and the shift can change on every restart). Render the overlay against `player.sourceTime` so cues match the spoken audio regardless of which producer session is active.
 

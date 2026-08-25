@@ -101,7 +101,7 @@ func printUsage() {
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
-      aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
+      aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N] [--target-duration N] [--window N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
                            [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
       aetherctl hlslive --segments a.ts,b.ts,c.ts [--seconds N] [--segment-seconds N] [--disc i,j]
