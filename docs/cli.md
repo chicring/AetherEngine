@@ -114,6 +114,19 @@ overlay pipeline stays empty (same as AE#154).
 
 `--sequential-origin` declares `LoadOptions.sequentialOrigin`, the IPTV timeshift / catch-up shape whose `206` answers are fabricated (#346): one long-lived unranged GET, no ranged probes, no tail read, so **seeking is unavailable** in the run. On VOD it needs `--declared-duration S`, which fills `LoadOptions.declaredDurationSeconds`, because the estimate that the tail read would have produced is gone with the tail read.
 
+`--picture-probe` attaches an `AVPlayerItemVideoOutput` to the running item and decodes the source
+time out of the picture itself, which is the one axis question nothing else here can answer: every
+other observable (`#260` frame times, `prodShift` / `hostShift`) describes what the engine WROTE, not
+where AVPlayer then PUT it. Per tick it appends `pic` (source seconds decoded from the frame),
+`picItem` (AVPlayer's own `itemTimeForDisplay` for that frame), `axisErr` (their difference, 0 on an
+honest axis) and `capErr` (the same error as a host placing a cue at `sourceTime` would make it).
+Needs a fixture whose picture states its own frame number, which `Scripts/timecode-fixture.sh`
+writes; against anything else it prints `pic=none` or nonsense. `pic=none` is also the normal read
+before the first frame and during a stall, so it is not reported as a zero. This is what settled
+AE#418: AVPlayer presents a segment at the position the PLAYLIST gives it, not at the tfdt it
+carries, and then plays continuously from there, so a gate that opened below its boundary shifts the
+whole run by the re-aim (`axisErr=-13.583` on a 13.583 s re-aim, constant for the run).
+
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 
 `--malloc-census` turns on the large-allocation census (`AetherEngine.setLargeAllocationCensusEnabled`) for the run, for tracing a footprint that grows where the segment budget says it should not. Besides the 30 s sample it arms a jump trigger, which exists because the 30 s memprobe cannot catch a failure that completes inside one sample (every kill on #220 was that shape): a counter polled at `--census-hz N` runs the zone walk once it climbs `--census-threshold-mb N` above its running high-water. Both flags are inert without `--malloc-census`.

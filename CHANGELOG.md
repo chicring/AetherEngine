@@ -12,6 +12,159 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.46.0] - 2026-08-26
+
+### Fixed
+
+- **A cold seek into a keyframe drought landed past its target and silently skipped content
+  (AE#412).** Audio routes packets into segments by plan boundary while video routes them
+  keyframe-gated, so where a plan boundary has no random-access point the audio still opens it and
+  the segment's video starts mid-GOP. AVPlayer reaches back a fixed span on a cold seek, measured at
+  6 to 8 s with `play --picture-probe`, and does not search for a random-access point, so a drought
+  wider than that reach left the picture starting at the next sync sample ABOVE the target. Measured
+  on a 12 s drought against a control cut on the source's real sync samples: a seek to 50.0 s played
+  from 55.0 s and one to 54.0 s from 54.96 s, where the control landed exactly on both. The producer
+  now records, per segment, where its first random-access point sits as an offset from the segment's
+  advertised start, and a cold seek re-cuts the landing segment from its covering point when neither
+  it nor the segments within reach below it can open a decode run at the target. After: 50.00 and
+  54.00, matching the control. Nothing changes for a sequential arrival, for live, or for a landing
+  a random-access point already covers.
+
+  The extra fetch AVPlayer makes below a seek target is not a repair for this and never was: the
+  same reach back happens on the control, where every segment is independent.
+
+## [6.45.0] - 2026-08-25
+
+### Fixed
+
+- **An axis offset composes, and 6.43.0 treated it as something a decode run owns, so a seek burst
+  put the clock back ahead of the picture (AE#418).** 6.43.0 published the offset a re-aimed gate
+  puts into AVPlayer's timeline and ended it when AVPlayer began a fresh decode run, reading that
+  from the fetch order: any request that did not follow its predecessor. The reporter's forward-seek
+  burst falsified it. AVPlayer asks for a segment below its target on a seek, and it asks out of
+  order while continuing the run it is already playing, so the axis was republished from under a
+  picture that had not moved and the captions ran 14 s ahead again. Measured with `play
+  --picture-probe` at re-aims of 0.5, 0.875, 1, 3, 5, 7, 9 and 11 s, what the axis turns on is
+  PLACEMENT, and it composes: AVPlayer puts a segment at its advertised start read through the
+  mapping its timeline already carries, so re-placing an overlong segment adds its offset again
+  (a run at `-9.000` reads `-18.000` after a seek that re-fetches that segment, and `-14.000` when
+  the seek's restart re-aims 5 s more; 6.43.0 published `0.000` for both). The axis now moves by
+  exactly what a placed segment carries below its advertised start, the seam sits at that advertised
+  start read through the axis in effect before it landed, and the record is keyed by index because
+  several epochs can leave such a segment in the cache at once. A gate no longer publishes on its
+  own: it records what its segment is worth and the placement publishes it, so an epoch AVPlayer
+  never fetches from cannot move the clock. One exception, also measured: AVPlayer discards a
+  sub-second axis at a seek and snaps back to the playlist, so the VOD seek path publishes that snap
+  from the landing forward. Thirteen arms of the fixture matrix, including the four that read
+  `capErr=-8.983` before, now read `+0.017`, one frame at 24 fps.
+
+## [6.44.0] - 2026-08-25
+
+### Fixed
+
+- **A picture that is not a whole number of ticks long left #409's repair with nothing to stand on,
+  so the reporting asset still juddered from the first frame (AE#409).** The repair reads a rank out
+  of the bitstream and puts it back on the ladder the container wrote, and it needed that ladder to
+  advance by one constant. A constant frame rate does not always produce one: at a 1200000 timescale
+  the retest asset's pictures are `200202/5` ticks apart, so its sample table can only alternate
+  between 40040 and 40041, and the classifier fell closed on a ladder it read as variable frame
+  timing. A two-valued ladder is now read as the quantization it is: the cycle it repeats names the
+  fraction (a cycle counts only when it is seen through twice), and the pattern it rounds to names
+  the phase of the lattice it was quantized from, which is the one thing a whole-tick ladder cannot
+  carry and this one can. Ranks are then placed on that lattice instead of on a step, so the repair
+  reproduces the muxer exactly rather than a tick beside it, and the whole-tick ladder stays the
+  special case it always was, untouched. The phase also makes the verdict independent of where the
+  sample was taken, so a session that starts inside the file describes the same axis as one that
+  starts at byte 0. Nothing else changed: how far the ladder runs ahead of presentation is still
+  read from the container header (the ladder fits every alignment equally well, so it cannot answer
+  that), the container index is still folded by one constant so an index entry can never disagree
+  with the packet it points at, and a picture the lattice cannot place still falls back to the
+  rounded step rather than being handed on in decode order. Genuine variable frame timing, a ladder
+  with a dropped picture, and a wobble that never repeats are all still left exactly as the container
+  delivered them. Verified against a fractional twin pair (33 packets, three coded video sequences,
+  both writer shapes, from the head and after a seek): every repaired packet carries the healthy
+  twin's PTS and DTS exactly. Reported and diagnosed by @orut34iop.
+
+### Changed
+
+- **The #409 verdict line names the cadence it measured.** On a fractional ladder the cadence and its
+  phase are the reading the whole verdict rests on, and a line that reports only a rounded step
+  cannot be told apart from one that measured the ladder wrong: `repair step=40040 lead=80081
+  shift=80081 pocStep=2 cadence=200202/5 phase=3 ladderAhead=2 samples=12`. A whole-tick ladder logs
+  exactly what it logged before.
+
+## [6.43.0] - 2026-08-25
+
+### Fixed
+
+- **After a restart whose gate re-aimed below its boundary, the clock ran ahead of the picture by
+  the re-aim (AE#418).** Captions early by the same amount, and a synced host's reported position
+  with them; lip sync survived because audio and video sit in the same segment. AE#408's
+  early-opening gate was built on the assumption that a segment keeping its own timestamps leaves
+  the item axis where the plan puts it, so it published no shift for that case. The assumption is
+  false, and nothing in the engine could see it: every axis observable here describes what the
+  engine WROTE, none said where AVPlayer PUT it. `aetherctl play --picture-probe` now reads the
+  source time out of AVPlayer's own video output, against a fixture whose picture states its own
+  frame number (`Scripts/timecode-fixture.sh`), and the reading is that **AVPlayer presents a
+  segment at the position the playlist gives it, not at the tfdt it carries, and then plays
+  continuously from there.** So the offset a consumer folds is measured against the segment's
+  ADVERTISED start (on a pinned late gate the two are identical, which is why publishing the
+  muxer's shift held until a gate that opens early existed), and that offset belongs to the decode
+  run rather than to the timeline: only an epoch's first segment can carry one, it holds across
+  every boundary the run plays through, and a seek that leaves the loaded region without provoking
+  a restart begins a fresh run on an axis-true segment where it stops applying. Publishing the
+  first half alone mirrors the defect instead of fixing it (measured `capErr +0.892` where it had
+  been `-0.875`). On a fixture carrying the reporting shape, a resume whose gate re-aimed 13.583 s
+  went from `-13.550` to `-0.009` seconds of error between the picture and `sourceTime`; the
+  control fixture, whose Cues are its sync samples, is untouched. The muxer's own shift is
+  unchanged, so no landing moves.
+
+- **A wedge whose target was already on disk spent six seconds re-anchoring the producer before
+  nudging the consumer that was actually stuck (AE#421).** The wedge itself is an AVPlayer state
+  (#65 / #93: zero GETs while the item never fails), and the ladder had one repair for it: move the
+  producer, then, if the consumer is still silent after the grace window, ask the host to nudge it.
+  Two field logs say the first half could not work in their case. On an Apple TV the pump had
+  marched to segment 15 and was sent back to segment 3, the consumer fetched nothing for the whole
+  six seconds, and the nudge that followed landed the seek in 240 ms; the Mac run has the same
+  shape with a 44 MB segment already served. A re-anchor is the repair for a consumer STARVED of
+  content nobody is producing, so it is now chosen on that question: if the segment the consumer is
+  silent about is already stored, the nudge goes first and the re-anchor stays as the fallback for
+  a nudge that does not take. The `WEDGE BROKEN` line carries `consumerTargetStored=` and
+  `highStored=` so a report can say which of the two a wedge called for, which previously had to be
+  inferred. The 5 s park detection is deliberately unchanged.
+
+- **Recovery and deadline paths read AVPlayer synchronously on the main actor, where a busy media
+  server blocks the whole app (AE#422).** These getters are sync XPC round trips to mediaserverd;
+  `AVFoundationOffMain` has said so since #134 ("past the watchdog threshold, a process kill") but
+  only the 30 s memory probe used it. The reporter measured `AVPlayerItem.currentTime()` from a
+  host's main actor not returning for 13.3 s during a consumer wedge, coming back 30 ms after the
+  re-engage watchdog fired, with the app frozen throughout. Every path that runs while the server is
+  the thing not answering now reads off-main or from a mirror: the seek-deadline loop took four
+  round trips per pass (one island, three `bufferedEnd`) and now takes one batched
+  `seekBufferSnapshot`; the stall nudge and the item reload read the rendered-position mirror; the
+  VOD shift-publish line awaits its buffer figure; and the #287 premature-end recovery batches its
+  three witnesses. For the recovery anchors the mirror is also the correct VALUE rather than merely
+  the cheap one: `recoveryAnchorPosition(currentRendered:)` exists to keep the anchor off a frame
+  the viewer has already passed (#115), and `currentTime()` is the clock, which diverges from the
+  rendered frame during exactly the landing those paths run in (#123). The wedge path was already
+  passing the mirror; the stall watchdog next to it was not. Reads inside `load` and the seek
+  completion are deliberately left synchronous: both run at a moment where AVPlayer has just
+  answered.
+
+- **A re-aimed gate stepped over the sync sample that would have covered its boundary, so a resume
+  into a keyframe drought landed further back than the source required (AE#423).** Each attempt
+  opens on the first sync sample at or above where it aimed, and everything above the previous aim
+  is already proven empty, so the DISTANCE between two attempts is the worst case by which the gate
+  can overshoot the best covering sample. The backoff doubled (4, 8, 16, 32), which spends that
+  error where it is largest: on the AE#408 fixture the 8 -> 16 jump aimed at 36.0, opened at 38.417,
+  and never saw the 43.0 sitting between it and the boundary at 52.0. The steps are now even
+  (4, 8, 12, ... 32), same reach, same three attempts on that fixture, and the gate opens at 43.0.
+  Even steps cost no more to walk because `gateProvenEmptyFromPts` stops each scan at the previous
+  aim rather than at the boundary, so an attempt reads its own window and not the whole drought.
+  Measured: `presentedShift` -13.583 s to -9.000 s on the resume, and `seektest` settles from the
+  seek side at 3.80 s of error against 8.38 s before, same burst and same throttle. The control
+  fixture, whose Cues are its sync samples, re-aims zero times on both arms.
+
 ## [6.42.0] - 2026-08-25
 
 ### Fixed

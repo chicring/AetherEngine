@@ -10,6 +10,21 @@ import MediaPlayer
 /// tvOS exposes the HDMI DV/HDR handshake only through AVPlayer-rooted playback, not AVSampleBufferDisplayLayer.
 /// Covers HEVC, H.264, and HW-AV1; SW fallback (AV1/VP9) lives in SoftwarePlaybackHost.
 /// DisplayCriteriaController writes preferredDisplayCriteria before item load so the handshake is in flight first.
+/// AE#422: what the seek-deadline loop needs from AVPlayer, as one off-main reading.
+/// AE#422 / AE#287: what the premature-end recovery needs from AVPlayer, as one off-main reading.
+struct PrematureEndReading: Sendable {
+    let playhead: Double
+    let seekableEnd: Double?
+    let loadedEnd: Double?
+}
+
+struct SeekBufferSnapshot: Sendable {
+    /// End of the contiguous buffered span covering the playhead.
+    let bufferedEnd: Double
+    /// Loaded seconds measured AT the pending seek target, not at the playhead.
+    let targetIsland: Double
+}
+
 @MainActor
 final class NativeAVPlayerHost {
 
@@ -843,22 +858,46 @@ final class NativeAVPlayerHost {
         return end.isFinite ? end : 0
     }
 
-    /// End of the contiguous buffered span covering the playhead (AetherEngine#54); disjoint ranges ahead of a gap are ignored.
-    var bufferedEnd: Double {
-        guard let item = avPlayer.currentItem else { return 0 }
-        let now = item.currentTime().seconds
+    /// End of the contiguous buffered span covering the playhead (AetherEngine#54); disjoint ranges
+    /// ahead of a gap are ignored. Pure, so the reading can be taken off the main actor (AE#422).
+    nonisolated static func contiguousBufferedEnd(ranges: [(Double, Double)], now: Double) -> Double {
         guard now.isFinite else { return 0 }
         var end = now
-        for value in item.loadedTimeRanges {
-            let r = value.timeRangeValue
-            let s = r.start.seconds
-            let e = (r.start + r.duration).seconds
-            guard s.isFinite, e.isFinite else { continue }
+        for (start, endpoint) in ranges {
+            guard start.isFinite, endpoint.isFinite else { continue }
             // Contiguous with the playhead (small tolerance for the gap
             // between the rendered frame and the range's reported start).
-            if s <= now + 1.0 && e >= now { end = max(end, e) }
+            if start <= now + 1.0 && endpoint >= now { end = max(end, endpoint) }
         }
         return end
+    }
+
+    /// AE#422: the queue every figplayer-backed read hops onto. A stalled reply parks a GCD thread
+    /// rather than the main thread, which past the watchdog threshold is a process kill.
+    nonisolated static let offMainReadQueue = DispatchQueue(
+        label: "engine.avplayerhost.avfread", qos: .userInitiated)
+
+    /// AE#422: everything the seek-deadline loop measures, read ONCE and off the main actor.
+    ///
+    /// That loop runs precisely while a seek is not landing, which is the state in which the media
+    /// server is least likely to answer, and it was taking four synchronous XPC round trips per pass
+    /// on the main actor (one island, three `bufferedEnd`). The reporter measured 13.3 s of fully
+    /// blocked app on one such read, returning 30 ms after the re-engage watchdog fired. Batching
+    /// also makes the two figures one consistent reading rather than four moments.
+    func seekBufferSnapshot(target: Double, excludeAtOrAbove: Double?) async -> SeekBufferSnapshot {
+        guard let item = avPlayer.currentItem else { return SeekBufferSnapshot(bufferedEnd: 0, targetIsland: 0) }
+        return await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
+            let now = item.currentTime().seconds
+            let ranges = item.loadedTimeRanges.map { value -> (Double, Double) in
+                let r = value.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            }
+            return SeekBufferSnapshot(
+                bufferedEnd: NativeAVPlayerHost.contiguousBufferedEnd(ranges: ranges, now: now),
+                targetIsland: NativeAVPlayerHost.bufferedSecondsInWindow(
+                    ranges: ranges, target: target, tolerance: 1.0, window: 30.0,
+                    excludeAtOrAbove: excludeAtOrAbove))
+        }
     }
 
     /// Seconds of media buffered *at the pending seek target*, i.e. how much the producer has actually
@@ -880,23 +919,8 @@ final class NativeAVPlayerHost {
     /// measurement origin: the reason this function ignores the playhead is that a figure measured *from*
     /// one is meaningless while `currentTime()` and `renderedTime` diverge, and clamping a range does not
     /// reintroduce that.
-    func bufferedSecondsAtTarget(
-        _ target: Double,
-        tolerance: Double = 1.0,
-        window: Double = 30.0,
-        excludeAtOrAbove: Double? = nil
-    ) -> Double {
-        guard let item = avPlayer.currentItem else { return 0 }
-        return Self.bufferedSecondsInWindow(
-            ranges: item.loadedTimeRanges.map {
-                let r = $0.timeRangeValue
-                return (r.start.seconds, (r.start + r.duration).seconds)
-            },
-            target: target,
-            tolerance: tolerance,
-            window: window,
-            excludeAtOrAbove: excludeAtOrAbove)
-    }
+    // AE#422: the main-actor reader that used to sit here is gone; `seekBufferSnapshot` is the only
+    // way in, so a stall-adjacent caller cannot accidentally take the blocking route again.
 
     /// Pure part of `bufferedSecondsAtTarget(_:tolerance:window:excludeAtOrAbove:)`: total loaded seconds
     /// intersecting the target window, with the optional exclusion bound applied.
@@ -978,8 +1002,13 @@ final class NativeAVPlayerHost {
         // Only resume what the viewer was playing: an item that ends while the transport is parked
         // must stay parked.
         guard playIntent, !didReachEnd else { return false }
-        let playhead = avPlayer.currentTime().seconds
-        let seekEnd = seekableRangeEndSeconds
+        // AE#422: one batched off-main reading. A premature end IS a state where the media server is
+        // misreporting, so "one read at a rare event" (the note that used to stand on
+        // `seekableRangeEndSeconds`) is not the cheap thing it looks like: the reporter measured a
+        // single such read holding the main thread for 13.3 s.
+        let reading = await prematureEndReading()
+        let playhead = reading.playhead
+        let seekEnd = reading.seekableEnd
         guard AetherEngine.prematureEndRecoveryQualifies(
             isLive: isLiveSession,
             duration: duration,
@@ -996,7 +1025,7 @@ final class NativeAVPlayerHost {
             "[NativeAVPlayerHost] #\(sessionID) AE#287 premature end: playhead="
             + "\(String(format: "%.3f", playhead))s duration=\(String(format: "%.3f", duration))s "
             + "seekableEnd=\(String(format: "%.3f", seekEnd ?? -1))s "
-            + "loadedEnd=\(String(format: "%.3f", loadedRangeEndSeconds ?? -1))s; "
+            + "loadedEnd=\(String(format: "%.3f", reading.loadedEnd ?? -1))s; "
             + "\(String(format: "%.1f", duration - playhead))s of the presentation lies past the end "
             + "AVPlayer reported, re-seeking in place (attempt \(prematureEndRecoveryAttempts))",
             category: .engine)
@@ -1004,30 +1033,37 @@ final class NativeAVPlayerHost {
         avPlayer.play()
         prematureEndRecoveryInFlight = false
         timeControlStatus = avPlayer.timeControlStatus
+        let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sessionID) AE#287 resumed: rate=\(avPlayer.rate) "
-            + "t=\(String(format: "%.3f", avPlayer.currentTime().seconds))s",
+            + "t=\(String(format: "%.3f", resumedAt))s",
             category: .engine)
         return true
     }
 
-    /// End of AVPlayer's last seekable time range, in item seconds: the extent of the presentation it
-    /// parsed from the playlist. Read from the item rather than the `seekableEnd` KVO mirror, which
-    /// exists to keep the LIVE edge off a tick-cadence read (#134); this is one read at a rare event.
-    private var seekableRangeEndSeconds: Double? {
-        guard let last = playerItem?.seekableTimeRanges.last?.timeRangeValue else { return nil }
-        let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
-        return end.isFinite ? end : nil
+    /// AE#422: the three figures the #287 recovery needs, read once and off the main actor.
+    private func prematureEndReading() async -> PrematureEndReading {
+        guard let item = playerItem else {
+            return PrematureEndReading(playhead: 0, seekableEnd: nil, loadedEnd: nil)
+        }
+        return await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
+            func endOf(_ ranges: [NSValue]) -> Double? {
+                guard let last = ranges.last?.timeRangeValue else { return nil }
+                let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
+                return end.isFinite ? end : nil
+            }
+            return PrematureEndReading(
+                playhead: item.currentTime().seconds,
+                seekableEnd: endOf(item.seekableTimeRanges),
+                loadedEnd: endOf(item.loadedTimeRanges))
+        }
     }
 
-    /// Raw end of AVPlayer's last loaded time range, in item seconds; diagnostics only. It is NOT the
-    /// #287 witness: measured at a premature end, AVPlayer has already trimmed this range back to the
-    /// exhaustion point, so it corroborates the mistake instead of refuting it.
-    private var loadedRangeEndSeconds: Double? {
-        guard let last = playerItem?.loadedTimeRanges.last?.timeRangeValue else { return nil }
-        let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
-        return end.isFinite ? end : nil
-    }
+    /// AE#287 witnesses, now read through `prematureEndReading()`. `seekableEnd` is the extent of the
+    /// presentation AVPlayer parsed from the playlist, read from the item rather than the KVO mirror
+    /// (which exists to keep the LIVE edge off a tick-cadence read, #134). `loadedEnd` is diagnostics
+    /// only and is NOT the witness: measured at a premature end, AVPlayer has already trimmed that
+    /// range back to the exhaustion point, so it corroborates the mistake instead of refuting it.
 
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
     /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.

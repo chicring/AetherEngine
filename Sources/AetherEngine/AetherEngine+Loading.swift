@@ -659,6 +659,8 @@ extension AetherEngine {
                 // is still on screen those differ, and the picture is what the clock has to describe.
                 let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
                 self.playlistShiftSeconds = activeShift
+                // AE#422: read off-main before building the line (see `avPlayerBufferAheadSeconds`).
+                let avBufAhead = await self.avPlayerBufferAheadSeconds()
                 // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
                 self.clock.currentTime = PresentationAxis.display(
                     sourcePTS: self.nativeClockSeconds + activeShift,
@@ -673,7 +675,7 @@ extension AetherEngine {
                     + "foldShift=\(String(format: "%.3f", activeShift))s "
                     + "presentationOrigin=\(String(format: "%.3f", self.sourcePresentationOrigin))s "
                     + "rawClock=\(String(format: "%.2f", self.nativeClockSeconds))s "
-                    + "avBufAhead=\(String(format: "%.2f", self.avPlayerBufferAheadSeconds()))s",
+                    + "avBufAhead=\(String(format: "%.2f", avBufAhead))s",
                     category: .session
                 )
             }
@@ -734,7 +736,8 @@ extension AetherEngine {
                           player.currentItem?.status != .failed else { return }
                     // #115: read the position at reload time, same as the stall watchdog's
                     // stage 2; the wedge-trip capture is two grace windows stale by now.
-                    self.reloadStalledConsumerItem(position: player.currentTime().seconds)
+                    // AE#422: the mirror, not a sync XPC read on the main actor from inside a stall.
+                    self.reloadStalledConsumerItem(position: self.renderedPositionMirror.get())
                 }
             }
         }
@@ -1208,8 +1211,10 @@ extension AetherEngine {
                           let player = self.currentAVPlayer else { return }
                     // Stage 1: nudge seek. Device-proven to reach AVPlayer (rate re-asserts)
                     // but NOT always to revive its loader; stage 2 covers that.
+                    // AE#422: same read the wedge path already takes from the mirror. This one was
+                    // the sync XPC round trip the reporter caught blocking the app for 13.3 s.
                     self.reengageStalledConsumer(
-                        position: player.currentTime().seconds,
+                        position: self.renderedPositionMirror.get(),
                         trigger: "stall + \(Int(Self.stallReengageGraceSeconds))s without fetches")
                     // Stage 2: the -15628 loader poison ignores seeks; only a fresh item resets
                     // it. Escalate when the consumer stays silent through a second grace window.

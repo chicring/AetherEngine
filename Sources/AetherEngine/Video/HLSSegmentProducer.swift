@@ -416,6 +416,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Live segment index captured when pending packet was examined; the live cutter advances at keyframes.
     private var pendingVideoSegIndex: Int = 0
+    /// AE#412: item-axis timestamp of the FIRST random-access point routed into each segment this
+    /// epoch has open, consumed at adopt. Keyed by the muxer's index, not the cutter's: audio can
+    /// have advanced the muxer past a boundary the keyframe-gated cutter folded, and a fetch asks
+    /// for the segment the bytes ended up in. Pump thread only, like every other routing field.
+    private var firstSyncItemPtsBySegment: [Int: Int64] = [:]
     private var pendingAudioSegIndex: Int = 0
 
     /// VOD keyframe-gated cutter: opens each segment at the IRAP that reaches its plan boundary (#92).
@@ -750,7 +755,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// The first step is deliberately short: the point at-or-before the boundary is what the segment
     /// needs, and aiming one segment back finds it whenever the source has any random access there at
     /// all. Wider steps exist for a real drought, and the list is the whole budget.
-    static let gateBackoffStepsSeconds: [Double] = [4, 8, 16, 32]
+    ///
+    /// AE#423: the steps are EVEN, not doubling. Each attempt opens on the first sync sample at or
+    /// above where it aimed, so the distance between two steps is the worst case by which the gate can
+    /// overshoot the last sample that would have covered the boundary, and a doubling step spends that
+    /// error where it is largest. On the AE#408 fixture the 8 -> 16 jump aimed at 36.0, took 38.417,
+    /// and never saw the 43.0 sitting between it and the boundary at 52.0: 4.6 s of landing accuracy
+    /// given away for nothing. Even steps cost no more to walk, because `gateProvenEmptyFromPts` stops
+    /// each scan at the previous aim rather than at the boundary, so an attempt reads its own window
+    /// and not the whole drought. Same 32 s of reach as the doubling list.
+    static let gateBackoffStepsSeconds: [Double] = [4, 8, 12, 16, 20, 24, 28, 32]
 
     /// Floor for the tolerance below; the reorder depth of the stream widens it (see
     /// `boundaryOpenToleranceTicks`).
@@ -831,6 +845,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
         guard actualFirstDts != Int64.min else { return desiredTfdtPts }
         let actualItemPts = actualFirstDts &- planAnchorPts
         return actualItemPts < desiredTfdtPts ? actualItemPts : desiredTfdtPts
+    }
+
+    /// AE#418: the offset the HOST folds, which is not the offset the MUXER applies.
+    ///
+    /// Measured with `aetherctl play --picture-probe` against a fixture whose picture states its own
+    /// source time: AVPlayer presents a segment at the position the PLAYLIST gives it, not at the
+    /// tfdt the segment carries. So the axis a consumer reads is the distance between the first
+    /// frame's source time and the segment's ADVERTISED start, whatever the muxer wrote. On a pinned
+    /// (late) gate the pin makes the two identical, which is why publishing the mux shift held until
+    /// the early-opening gate of AE#408 landed; on a re-aimed gate they differ by the whole re-aim,
+    /// and the clock then ran that far ahead of the picture (captions early by the same amount).
+    static func presentedShiftPts(actualFirstDts: Int64, desiredTfdtPts: Int64) -> Int64 {
+        guard actualFirstDts != Int64.min, desiredTfdtPts != Int64.min else { return 0 }
+        return actualFirstDts &- desiredTfdtPts
     }
 
     /// AE#408: aim the gate below a boundary that cannot be opened on, so the segment covers its own
@@ -1537,7 +1565,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 markBackpressureWedgeBroken()
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure WEDGE BROKEN (\(context)) head=\(head) "
-                    + "target=\(target) cacheTarget=\(cacheTarget) parked=\(parked)s"
+                    + "target=\(target) cacheTarget=\(cacheTarget) parked=\(parked)s "
+                    // AE#421: the line has to say which repair the wedge calls for, and that is
+                    // decided by whether the consumer's own target is already on disk. Without it a
+                    // report can show the wedge and the recovery but not whether re-anchoring the
+                    // producer could have helped at all, which is exactly what had to be inferred
+                    // from two field logs.
+                    + "consumerTargetStored=\(cache.peekURL(index: cacheTarget) != nil ? "y" : "n") "
+                    + "highStored=\(cache.highestStoredIndex) cached=\(cache.count)"
                     + (wedgeDetector.lastTripFast ? " (fast path: fetch target + rendered clock both frozen)" : "")
                     + "; exiting pump for host re-anchor on AVPlayer position",
                     category: .session
@@ -1992,7 +2027,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
             cache.adopt(index: currentMuxerSegmentIndex,
                         stagingPath: path,
-                        byteCount: bytesWritten)
+                        byteCount: bytesWritten,
+                        videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
@@ -2171,6 +2207,41 @@ final class HLSSegmentProducer: @unchecked Sendable {
         onLiveSegmentFinalized?(index, duration, startSeconds, discontinuous)
     }
 
+    /// AE#412: what the segment finalized at `index` offers a cold arrival, as an offset from its
+    /// ADVERTISED start, so the answer carries no axis with it. Consumes the recording.
+    ///
+    /// nil means "no claim", which is exactly today's behaviour: live (its playlist only ever offers
+    /// what was finalized), an unresolved video time base, or an index outside this epoch's plan.
+    /// `.none` is a claim, and a load-bearing one: audio opened a boundary the cutter folded, so the
+    /// segment carries no random-access point at all and nothing in it can start a decode run.
+    private func takeVideoReach(forSegmentIndex index: Int) -> SegmentCache.VideoReach? {
+        let syncPts = firstSyncItemPtsBySegment.removeValue(forKey: index)
+        firstSyncItemPtsBySegment = firstSyncItemPtsBySegment.filter { $0.key > index }
+        guard !isLive, sourceVideoTbSeconds > 0 else { return nil }
+        let localI = index - baseIndex
+        guard localI >= 0, localI < segmentBoundaries.count else { return nil }
+        guard let syncPts, syncPts != Int64.min else {
+            EngineLog.emit(
+                "[HLSSegmentProducer] #412 seg-\(index) carries no random-access point "
+                + "(advertised \(String(format: "%.3f", Double(segmentBoundaries[localI]) * sourceVideoTbSeconds))s); "
+                + "a cold arrival cannot start a decode run in it",
+                category: .session
+            )
+            return SegmentCache.VideoReach.none
+        }
+        let shiftTicks = videoShiftPts == Int64.min ? 0 : videoShiftPts
+        let syncSourcePts = syncPts &+ shiftTicks
+        let offset = Double(syncSourcePts &- segmentBoundaries[localI]) * sourceVideoTbSeconds
+        if offset > 0 {
+            EngineLog.emit(
+                "[HLSSegmentProducer] #412 seg-\(index) opens \(String(format: "%.3f", offset))s "
+                + "below its first random-access point; a cold arrival below that lands late",
+                category: .session, level: .verbose
+            )
+        }
+        return .syncAt(offsetSeconds: offset)
+    }
+
     private func finalizeSessionMuxerAndAdopt() {
         guard let muxer = currentMuxer else { return }
         let idx = currentMuxerSegmentIndex
@@ -2180,7 +2251,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 category: .session, level: .verbose
             )
             cache.adopt(index: idx, stagingPath: result.path,
-                        byteCount: result.bytesWritten)
+                        byteCount: result.bytesWritten,
+                        videoReach: takeVideoReach(forSegmentIndex: idx))
             if isLive {
                 reportLiveSegmentFinalized(index: idx, nextIndex: nil)
             } else if onSequentialSegmentFinalized != nil {
@@ -3153,13 +3225,31 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + (pinnedTfdtPts != desiredFirstVideoTfdtPts
                                 ? "pinnedTo=\(pinnedTfdtPts) " : "")
                             + "shift=\(videoShiftPts) "
+                            + (Self.presentedShiftPts(actualFirstDts: firstActualVideoDts,
+                                                      desiredTfdtPts: desiredFirstVideoTfdtPts) != videoShiftPts
+                                ? "presentedShift=\(Self.presentedShiftPts(actualFirstDts: firstActualVideoDts, desiredTfdtPts: desiredFirstVideoTfdtPts)) " : "")
                             // #133 follow-up diag: PID + reconstruct state per epoch, so retest logs separate a
                             // same-PID mid-stream parameter-set change from a reopen storm (each reopen is a fresh
                             // gate-open here; a same-PID change is NOT, it stays in one epoch and rotates in place).
                             + "videoPID=\(videoStreamIndex) reconstructed=\(pendingJoinVideoConfig != nil)",
                             category: .session
                         )
-                        onVideoShiftKnown?(videoShiftPts, pinnedTfdtPts)
+                        // AE#418: what the HOST folds is not the muxer's shift. Measured with
+                        // `play --picture-probe` against a picture that states its own source time:
+                        // AVPlayer presents a segment at the position the PLAYLIST gives it, not at
+                        // the tfdt the segment carries, so a gate that opened below its boundary has
+                        // its content presented that far late whatever it wrote. The muxer's shift
+                        // stays what it is (it is the source-to-item offset for the bytes), and the
+                        // axis the clock folds with is measured against the ADVERTISED start, which
+                        // is where AVPlayer will put the frame. The two coincide on a pinned (late)
+                        // gate, which is why publishing the mux shift held until the early-opening
+                        // gate landed in 6.40.0. Same reason the seam activates at the advertised
+                        // start: the stretch below it still belongs to the previous epoch on screen.
+                        onVideoShiftKnown?(
+                            Self.presentedShiftPts(
+                                actualFirstDts: firstActualVideoDts,
+                                desiredTfdtPts: desiredFirstVideoTfdtPts),
+                            desiredFirstVideoTfdtPts)
                         // #133 follow-up: the gating IDR's in-band SPS/PPS back this epoch's muxer avcC. Establish
                         // the baseline so a later same-PID parameter-set change (encoder restart / regional splice)
                         // is detected against it. joinConfig is non-nil only in the liveH264AnnexBJoin scope.
@@ -3495,6 +3585,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                         }
                         if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
+                            // AE#412: a cold arrival can only start a decode run on a random-access
+                            // point, so what a segment is worth to one is where its first sync sample
+                            // sits. Recorded here, against the muxer's own index, because that is the
+                            // segment these bytes are actually in.
+                            if !isLive, (prev.pointee.flags & AV_PKT_FLAG_KEY) != 0 {
+                                let openIdx = muxer.currentSegmentIndex
+                                if firstSyncItemPtsBySegment[openIdx] == nil {
+                                    firstSyncItemPtsBySegment[openIdx] =
+                                        prev.pointee.dts != Int64.min ? prev.pointee.dts : prev.pointee.pts
+                                }
+                            }
                             finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
                             bumpPacketsWritten()
                         } else {
