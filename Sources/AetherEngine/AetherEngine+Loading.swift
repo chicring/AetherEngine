@@ -1653,6 +1653,9 @@ extension AetherEngine {
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         self.audioAVPlayerActive = true
+        // After the active flag: `maxSupportedRate` is 3.0 only once this session counts as audio-only,
+        // and applyDesiredRate clamps against it (#436).
+        applyDesiredRate(to: host)
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
         // Reclaim Now-Playing ownership for this session on each track start,

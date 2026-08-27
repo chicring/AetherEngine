@@ -2828,6 +2828,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // concurrent teardown can't race a resurrected demuxer into a torn-down session.
         if let freshDemuxer {
             demuxer = freshDemuxer
+            // #433: the network axis belongs to the reader that is SERVING. The aborted one owned the
+            // `.reconnecting` the host is still reading, and its pump can outlive this swap, so it is
+            // unwired here rather than left able to speak for a session it no longer feeds. The incoming
+            // reader takes the sink, and (new-listener rule in `NetworkPhaseGate`) announces its own first
+            // delivery even though it already served this session's `find_stream_info` into a nil sink.
+            dem.onNetworkPhaseChanged = nil
             freshDemuxer.onNetworkPhaseChanged = onNetworkPhaseChanged   // re-wire stall signal onto the reopened demuxer (#85)
         }
         do {

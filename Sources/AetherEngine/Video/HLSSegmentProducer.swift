@@ -391,6 +391,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var lastVideoSourceDts: Int64 = Int64.min
     private var lastAudioSourceDts: Int64 = Int64.min
 
+    /// AE#432: last GENUINE source dts per stream and the frame stride learned from it. A repaired
+    /// timestamp says nothing about the source's cadence, so it is deliberately not fed back here.
+    private var lastGenuineVideoSourceDts: Int64 = Int64.min
+    private var lastGenuineAudioSourceDts: Int64 = Int64.min
+    private var videoSourceStrideTicks: Int64 = 0
+    private var audioSourceStrideTicks: Int64 = 0
+    private var loggedFirstSynthesizedTimestamp = false
+
     /// First dts ever seen per stream; replay detection: backward rebase landing near this + recent reconnect = server replay.
     private var firstSeenVideoSourceDts: Int64 = Int64.min
     private var firstSeenAudioSourceDts: Int64 = Int64.min
@@ -577,6 +585,56 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         return .exitForRetune
     }
+
+    // MARK: - AE#432: a source that stops carrying timestamps
+
+    /// Widest inter-packet delta still read as a frame interval. Anything past a second is a
+    /// program boundary or a renumbered clock, not a cadence.
+    static let maxSynthesizedStrideSeconds: Double = 1.0
+
+    /// How far a repaired timestamp advances when the source carried neither dts nor pts.
+    ///
+    /// It used to advance one tick, which satisfies the muxer's monotonic invariant and nothing
+    /// else: on the 90 kHz MPEG-TS axis that is 11 microseconds for a whole 20 ms frame. The live
+    /// cutter's clock IS this timestamp (`liveShouldCut` below reads the pts a keyframe carries),
+    /// so a run of timestamp-less packets froze the clock and the cutter could not cut again for as
+    /// long as the run lasted: 1792 packets and 30 keyframes went into one 85 MB segment advertised
+    /// as 0.5 s (AE#432).
+    ///
+    /// Cascade, most specific first: the demuxer's own claim for this packet, then the last genuine
+    /// delta this stream showed, then the frame duration the producer already carries for the last
+    /// trun sample, then the historical single tick for a stream that has never carried a usable
+    /// timestamp at all.
+    static func repairStrideTicks(packetDuration: Int64, observedStride: Int64,
+                                  fallbackDuration: Int64) -> Int64 {
+        if packetDuration > 0 { return packetDuration }
+        if observedStride > 0 { return observedStride }
+        if fallbackDuration > 0 { return fallbackDuration }
+        return 1
+    }
+
+    /// Adopts `dts - previousDts` as the stream's stride when it is forward and inside
+    /// `maxStrideTicks`. A backward, standing or multi-second delta is a boundary or a replay, so
+    /// the stride learned before it survives.
+    static func updatedStrideTicks(current: Int64, previousDts: Int64, dts: Int64,
+                                   maxStrideTicks: Int64) -> Int64 {
+        guard previousDts != Int64.min, dts != Int64.min, maxStrideTicks > 0 else { return current }
+        let delta = dts &- previousDts
+        guard delta > 0, delta <= maxStrideTicks else { return current }
+        return delta
+    }
+
+    /// The live cut rule, pure: a keyframe opens a new segment once its presentation time has moved
+    /// `targetSeconds` past the open segment's start, or immediately when a program boundary forced
+    /// a cut. Extracted so AE#432's wedge is testable against the rule the pump actually runs.
+    static func liveShouldCut(ptsSeconds: Double, segmentStartSeconds: Double,
+                              targetSeconds: Double, isKeyframe: Bool, forceCut: Bool) -> Bool {
+        guard isKeyframe else { return false }
+        return forceCut || ptsSeconds - segmentStartSeconds >= targetSeconds
+    }
+
+    // MARK: -
+
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
     private static let pregateLogInterval = 200
@@ -1341,9 +1399,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         // pendingForceCutFlag cuts at the next keyframe regardless of the 4 s minimum,
         // so #EXT-X-DISCONTINUITY lands on the first IRAP of the new program (not one segment late).
-        if isKeyframe,
-           pendingForceCutFlag
-            || ptsSeconds - liveSegmentStartPtsSeconds >= targetSegmentDurationSeconds {
+        if Self.liveShouldCut(ptsSeconds: ptsSeconds,
+                              segmentStartSeconds: liveSegmentStartPtsSeconds,
+                              targetSeconds: targetSegmentDurationSeconds,
+                              isKeyframe: isKeyframe,
+                              forceCut: pendingForceCutFlag) {
             liveCurrentSegmentIndex += 1
             liveSegmentStartPtsSeconds = ptsSeconds
             liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
@@ -1365,6 +1425,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var sourceVideoTbSeconds: Double {
         guard sourceVideoTimeBase.num > 0, sourceVideoTimeBase.den > 0 else { return 0 }
         return Double(sourceVideoTimeBase.num) / Double(sourceVideoTimeBase.den)
+    }
+
+    /// Source audio time base in seconds; 0 when there is no audio or it is degenerate.
+    private var audioSourceTbSeconds: Double {
+        guard let tb = audioConfig?.sourceTimeBase, tb.num > 0, tb.den > 0 else { return 0 }
+        return Double(tb.num) / Double(tb.den)
+    }
+
+    /// AE#432: says once per pump that the source stopped carrying timestamps and what the engine
+    /// put in their place. Silent before this, which is why the field trace could only show the
+    /// consequence (a frozen cut clock) and not the cause.
+    private func noteSynthesizedTimestamp(strideTicks: Int64, isVideo: Bool) {
+        guard !loggedFirstSynthesizedTimestamp else { return }
+        loggedFirstSynthesizedTimestamp = true
+        let tb = isVideo ? sourceVideoTbSeconds : audioSourceTbSeconds
+        EngineLog.emit(
+            "[HLSSegmentProducer] source stopped carrying timestamps on the "
+            + "\(isVideo ? "video" : "audio") stream; synthesizing at \(strideTicks) ticks/packet"
+            + (tb > 0 ? " (\(String(format: "%.4f", Double(strideTicks) * tb))s)" : "")
+            + ". The live cutter reads this timestamp, so its segments are paced by it from here on",
+            category: .session
+        )
     }
 
     /// Map post-shift (item-axis) pts to absolute segment index.
@@ -2532,6 +2614,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 + "\(w.isWedge ? "cutter wedge" : "source starvation")); "
                 + "window video=\(w.videoPackets) key=\(w.videoKeyframes) "
                 + "audio=\(w.audioPackets) foreign=\(w.foreignPackets)"
+                + (w.synthesizedVideoPackets > 0
+                    ? " synthesizedTs=\(w.synthesizedVideoPackets)" : "")
                 + (w.lastForeignStreamIndex >= 0
                     ? " lastForeignIdx=\(w.lastForeignStreamIndex)" : "")
                 + (w.videoPtsAdvanceSeconds >= 0
@@ -2715,6 +2799,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
                          subtitleTapTimeBases[pktStreamIdx] ?? AVRational(num: 1, den: 1000))
                 }
 
+                // AE#432: learn each stream's frame stride from its GENUINE timestamps, so a run
+                // that arrives without any can be advanced by a plausible interval instead of a
+                // single tick. Recorded before the repair below, and never from a repaired value.
+                if packet.pointee.dts != Int64.min, isVideoPkt || isAudioPkt {
+                    let tb = isVideoPkt ? sourceVideoTbSeconds : audioSourceTbSeconds
+                    let cap = tb > 0 ? Int64(Self.maxSynthesizedStrideSeconds / tb) : 0
+                    if isVideoPkt {
+                        videoSourceStrideTicks = Self.updatedStrideTicks(
+                            current: videoSourceStrideTicks, previousDts: lastGenuineVideoSourceDts,
+                            dts: packet.pointee.dts, maxStrideTicks: cap)
+                        lastGenuineVideoSourceDts = packet.pointee.dts
+                    } else {
+                        audioSourceStrideTicks = Self.updatedStrideTicks(
+                            current: audioSourceStrideTicks, previousDts: lastGenuineAudioSourceDts,
+                            dts: packet.pointee.dts, maxStrideTicks: cap)
+                        lastGenuineAudioSourceDts = packet.pointee.dts
+                    }
+                }
+
+                // AE#432: true when this packet reached the loop with no timestamp of its own, so
+                // everything downstream that measures time is reading a value the engine invented.
+                var timestampsSynthesized = false
                 if packet.pointee.dts == Int64.min {
                     let anchor: Int64 = isVideoPkt ? lastVideoSourceDts
                                       : isAudioPkt ? lastAudioSourceDts
@@ -2728,11 +2834,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             continue
                         }
                         packet.pointee.dts = packet.pointee.pts
+                    } else if packet.pointee.pts != Int64.min {
+                        // dts alone is missing (matroska reconstructs it from ReferenceBlock relations
+                        // and fails on some B-frames). pts is the real presentation time and must not
+                        // be crossed, so the bump stays minimal.
+                        packet.pointee.dts = anchor &+ 1
                     } else {
-                        packet.pointee.dts = anchor + 1
-                        if packet.pointee.pts == Int64.min {
-                            packet.pointee.pts = packet.pointee.dts
-                        }
+                        // Neither timestamp survived. One tick per packet is not a presentation time,
+                        // it is a frozen clock; advance by this stream's frame interval instead.
+                        let stride = Self.repairStrideTicks(
+                            packetDuration: packet.pointee.duration,
+                            observedStride: isVideoPkt ? videoSourceStrideTicks : audioSourceStrideTicks,
+                            fallbackDuration: isVideoPkt ? videoFallbackDurationPts : audioFallbackDurationPts)
+                        packet.pointee.dts = anchor &+ stride
+                        packet.pointee.pts = packet.pointee.dts
+                        timestampsSynthesized = true
+                        noteSynthesizedTimestamp(strideTicks: stride, isVideo: isVideoPkt)
                     }
                 }
 
@@ -3055,7 +3172,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 if isVideoPkt {
                     noCutWatchdog?.noteVideoPacket(
                         pts: packet.pointee.pts,
-                        isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                        isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0,
+                        synthesizedTimestamp: timestampsSynthesized
                     )
                     if firstSeenVideoSourceDts == Int64.min {
                         firstSeenVideoSourceDts = packet.pointee.dts

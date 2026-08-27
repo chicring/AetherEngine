@@ -337,6 +337,7 @@ final class NativeAVPlayerHost {
 
         let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
         let item = AVPlayerItem(asset: asset)
+        AudioRatePolicy.apply(to: item)
         // 4s default matches loopback HLS segment cadence; raising it for live makes AVPlayer race to the edge and stall at the transcode warm-up gap.
         // Remote-HLS passes 0 (system adaptive): 4s forced a 3-4s black screen on bandwidth-limited Jellyfin live transcodes.
         item.preferredForwardBufferDuration = forwardBufferDuration
@@ -1211,11 +1212,19 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
-        // AVPlayer.play() starts at `defaultRate`（默认 1.0），会覆盖已设置的 rate；
-        // 同步 defaultRate 后，所有 play()（含 readyToPlay 重发、replaceCurrentItem 后恢复）
-        // 都按用户选择的倍速启动，而不是被重置回 1.0（对齐 Audio/Software host 的 lastRate 保护）。
+        // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
+        // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
+        // premature-end recovery, plus AVKit's own transport and the remote command centre calling
+        // play() straight on this player. `defaultRate` is what AVPlayer starts at when told to play,
+        // so recording the speed there is what makes it survive all of them, with no rate write in
+        // anyone's resume window. Setting `rate` does not update it (AVPlayer.h), hence both.
         if value != 0 { avPlayer.defaultRate = value }
         avPlayer.rate = value
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        avPlayer.defaultRate = rate
     }
 
     var volume: Float {

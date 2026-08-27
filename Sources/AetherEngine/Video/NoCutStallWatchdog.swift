@@ -36,6 +36,10 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         var videoPtsAdvanceSeconds: Double
         var videoPackets: Int
         var videoKeyframes: Int
+        /// AE#432: how many of `videoPackets` reached the pump without a timestamp of their own, so
+        /// `videoPtsAdvanceSeconds` is measuring a clock the engine synthesized rather than the
+        /// source's. A window that is all synthesized cannot be read as a statement about delivery.
+        var synthesizedVideoPackets: Int
         var audioPackets: Int
         var foreignPackets: Int
         var lastForeignStreamIndex: Int32
@@ -66,6 +70,7 @@ final class NoCutStallWatchdog: @unchecked Sendable {
     private var packetsReadAtWindowStart = 0
     private var videoPackets = 0
     private var videoKeyframes = 0
+    private var synthesizedVideoPackets = 0
     private var audioPackets = 0
     private var foreignPackets = 0
     private var lastForeignStreamIndex: Int32 = -1
@@ -94,11 +99,12 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         lock.unlock()
     }
 
-    func noteVideoPacket(pts: Int64, isKeyframe: Bool) {
+    func noteVideoPacket(pts: Int64, isKeyframe: Bool, synthesizedTimestamp: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         videoPackets += 1
         if isKeyframe { videoKeyframes += 1 }
+        if synthesizedTimestamp { synthesizedVideoPackets += 1 }
         guard pts != Int64.min else { return }
         if firstVideoPts == Int64.min { firstVideoPts = pts }
         lastVideoPts = pts
@@ -185,6 +191,7 @@ final class NoCutStallWatchdog: @unchecked Sendable {
             videoPtsAdvanceSeconds: ptsAdvance,
             videoPackets: videoPackets,
             videoKeyframes: videoKeyframes,
+            synthesizedVideoPackets: synthesizedVideoPackets,
             audioPackets: audioPackets,
             foreignPackets: foreignPackets,
             lastForeignStreamIndex: lastForeignStreamIndex,
@@ -196,6 +203,7 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         packetsReadAtWindowStart = packetsRead
         videoPackets = 0
         videoKeyframes = 0
+        synthesizedVideoPackets = 0
         audioPackets = 0
         foreignPackets = 0
         lastForeignStreamIndex = -1

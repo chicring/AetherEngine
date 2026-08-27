@@ -15,7 +15,7 @@ import Libavutil
 /// Shared state protected by locks.
 
 /// Dedupes `ReaderNetworkPhase` emissions so a flapping origin does not spam the callback (#85).
-/// Mutated only on the demux thread (the read loop), so it needs no locking.
+/// Held under the reader's `networkPhaseLock` together with the sink it deduplicates for (#433).
 ///
 /// The first statement always goes out, `.flowing` included (#410). The gate is per reader INSTANCE while
 /// the phase it feeds is per engine, so a reader installed by a reopen starts with no opinion rather than
@@ -27,6 +27,14 @@ struct NetworkPhaseGate {
         guard next != last else { return false }
         last = next
         return true
+    }
+
+    /// A listener that just attached has heard nothing, whatever this reader said before it arrived (#433).
+    /// The gate deduplicates emissions to a SINK, and the restart's reopen forms its opinion during
+    /// `open()`, one wiring step before the sink exists: without this, the reader that now serves the
+    /// session has nothing left to say and the axis keeps describing the reader that was aborted.
+    mutating func forgetForNewListener() {
+        last = nil
     }
 }
 
@@ -56,16 +64,36 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Typed source-fetch network phase, pushed on every stall/reconnect/recovery transition (#85).
     /// Mirrors `HLSVideoEngine.onSeekStateChanged`. `@Sendable`: invoked from the demux thread, the
     /// consumer hops to the main actor. Set only on the MAIN playback reader, never the subtitle side reader.
-    var onNetworkPhaseChanged: (@Sendable (ReaderNetworkPhase) -> Void)?
+    ///
+    /// #433: the sink and its dedupe history are one thing, under one leaf lock. The sink is installed from
+    /// whichever thread runs the handover (a producer restart, a live reopen) while the demux thread is the
+    /// one emitting, and attaching a listener CLEARS the history: a listener that just arrived has heard
+    /// nothing, whatever this reader said into a nil sink during its own `open()`.
+    var onNetworkPhaseChanged: (@Sendable (ReaderNetworkPhase) -> Void)? {
+        get {
+            networkPhaseLock.lock(); defer { networkPhaseLock.unlock() }
+            return _onNetworkPhaseChanged
+        }
+        set {
+            networkPhaseLock.lock()
+            _onNetworkPhaseChanged = newValue
+            networkPhaseGate.forgetForNewListener()
+            networkPhaseLock.unlock()
+        }
+    }
 
-    /// Demux-thread-only dedupe for `onNetworkPhaseChanged`.
+    /// Leaf lock over the sink and its gate: takes no other lock, and no other lock is held across it.
+    private let networkPhaseLock = NSLock()
+    private var _onNetworkPhaseChanged: (@Sendable (ReaderNetworkPhase) -> Void)?
     private var networkPhaseGate = NetworkPhaseGate()
 
-    /// Emit a phase transition through the gate (demux thread only).
+    /// Emit a phase transition through the gate. Called from the demux thread; the sink runs OUTSIDE the
+    /// lock so a consumer hop can never serialize against the read loop.
     private func emitNetworkPhase(_ phase: ReaderNetworkPhase) {
-        if networkPhaseGate.shouldEmit(phase) {
-            onNetworkPhaseChanged?(phase)
-        }
+        networkPhaseLock.lock()
+        let sink = networkPhaseGate.shouldEmit(phase) ? _onNetworkPhaseChanged : nil
+        networkPhaseLock.unlock()
+        sink?(phase)
     }
 
     /// Cached CDN URL after redirect resolution; skips proxy hop on subsequent chunks.

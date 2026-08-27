@@ -12,6 +12,193 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.50.0] - 2026-08-27
+
+### Fixed
+
+- **The local HLS origin answered anyone on the same network, not only this session.** The listener
+  binds `0.0.0.0` so an AirPlay receiver can reach it over the LAN (#86), which also puts it in front
+  of every other host on that network, and there was no access control at all: the endpoint names are
+  fixed (`/master.m3u8`, `/media.m3u8`, `/init.mp4`, `/segN.mp4`) and the peer address was read for a
+  diagnostic line rather than to filter, so the ephemeral port was the only thing a scan on the same
+  WiFi had to find before it could pull the stream that was playing. Every path now carries a 128-bit
+  per-session token as its first component, and a request without it is refused before it reaches the
+  router. Nothing else had to change: playlist URIs are relative, so segments, the init segment and
+  the subtitle renditions resolve under the prefix on their own, and only the three entry-point
+  accessors name it. `AirPlayPlaylistDecision.receiverURL` used to overwrite the whole path when it
+  swapped in `media.m3u8`, which would have handed the receiver an address the server now refuses; it
+  replaces the last component and keeps what precedes it.
+
+  Worth stating plainly, so this is not read as more than it was: no path traversal existed and none
+  is added (subtitle paths parse as integers, segments come from memory, no request maps to the file
+  system), and no credential was ever reachable there. What was reachable was the stream itself.
+
+### Changed
+
+- **FFmpegBuild 2.5.0, for a libzvbi security update.** libzvbi 0.2.45 fixes an out-of-bounds read,
+  an out-of-bounds write and an integer underflow (GHSA-86rm-g7qf-j2fh, moderate, no CVE assigned).
+  The `libzvbi_teletext` decoder is built and the teletext path is wired end to end, so a DVB
+  teletext stream reaches that code. The same release drops the `concat` demuxer, a script demuxer
+  selectable by probing alone, which made any stream handed to `avformat_open_input` a potential
+  file-open primitive; nothing here ever asked for it by name. It also carries dav1d 1.5.4 and zimg
+  3.0.6, neither under an advisory. FFmpeg stays on `n8.1.2`.
+
+- **LibDovi 2.1.0 (`dolby_vision` 3.4.0).** No advisory. The header change is additive only: two new
+  CMv4.0 metadata entry points, nothing removed, so the Profile 7 to 8.1 conversion path is
+  untouched.
+
+## [6.49.0] - 2026-08-27
+
+### Fixed
+
+- **A resume came back at 1.0 and discarded the playback speed, and no client could hold it from
+  outside (AE#436).** `AVPlayer.play()` is rate 1.0 by definition, and the native video host latched
+  a boolean play intent rather than a rate, so every pause dropped the speed. Re-applying it from the
+  outside did not work either, as the report measured: the engine re-issues play() from paths a
+  client cannot observe (the readyToPlay re-assert after an item swap, interruption and background
+  resume, the #287 premature-end recovery), and AVKit and the remote command centre call play()
+  straight on the player, so one client write was overwritten 45 ms later and again three seconds
+  after that, with the playback phase never changing to key a backstop on.
+
+  The rate a resume comes back at is `AVPlayer.defaultRate`, the platform's own "rate at which to
+  start playback when play is called", so both AVPlayer-backed hosts record the speed there and every
+  one of those paths resumes at it, with nobody writing rate inside a resume window. Zero is treated
+  as a pause rather than a speed at all four hosts: recorded as one it became the rate the next
+  resume, the software clock arming, and a rebuffer recovery all came back at, which brought a
+  session back frozen while it reported itself playing. The engine also remembers the requested speed
+  (`desiredRate`, the neighbour of `desiredVolume` the report asked for) and seeds it into each host
+  it builds, re-clamped to that host's ceiling, so the rebuilds a session makes on its own keep it.
+  The speed belongs to the item: a load of a different source, or `stop()`, returns to 1.0.
+
+  `aetherctl play --host-calls ratehold` is the measurement: it sets 1.5, pauses, resumes without the
+  client writing a rate, and reads the rate back off the transport itself. It reproduces the report
+  on the previous code and passes on this one, on the native and the software path.
+
+  Thanks to @rrgomes for measuring the client-side workaround as well as the defect, which is what
+  showed the re-issues were unreachable from outside.
+
+- **A 3D Blu-ray MVC remux played black on the native path (AE#435).** These files carry both eyes
+  inside one H.264 track, which Matroska declares as StereoMode 13 / 14 (`block_lr` / `block_rl`,
+  both eyes in one block) and libavformat reports as stream-level `AV_STEREO3D_FRAMESEQUENCE`. The
+  dependent view's slices reference a subset SPS the base decoder never receives, so a plain H.264
+  decoder can only skip them. libavcodec does exactly that and decodes the base view, which is the
+  left eye and the 2D fallback every non-3D player shows; VideoToolbox is handed whole samples with
+  both views' NALs inside and renders nothing, so the session played its audio over a black screen.
+  Nothing in the engine had ever read the stereo declaration, so these files took the native path on
+  the strength of being progressive H.264.
+
+  The container says it before a packet is decoded, so routing reads it at load: H.264 declaring
+  either both-eyes-in-one-block carriage now takes the software path, the one decoder that produces
+  a picture from it. Same shape as the rules already there for interlaced H.264 and High 4:2:2,
+  where the format looks native on paper and comes out wrong in practice. The frame-packed modes
+  (side by side, top / bottom, checkerboard, row or column interleaved, anaglyph) are single
+  self-contained pictures and keep the native path with hardware decode; cropping an eye out of one
+  of those stays the host's call. MV-HEVC keeps the native path too, being Apple's own format with a
+  base layer AVPlayer plays. Real MVC 3D output is not offered on any path, and the dispatch now
+  logs the decision, so a session that took this route says so.
+
+  Thanks to @TheyCallMeSpy for the report, which came with the packet cadence, the container tag and
+  the ffmpeg decode that narrows it to routing rather than decode.
+
+- **`setRate` documented the software path as playing speed without pitch correction, and it never
+  did (AE#434).** Both transport surfaces were running AVFoundation's TimeDomain algorithm, the
+  default an app linked on or after iOS 15 / macOS 12 gets, and the engine set the property nowhere,
+  so the sentence read perfectly while describing nothing in the build. The report measured it the
+  other way round on a VP9 / Opus MKV that routes to software decode: 1.25, 1.5 and 1.75 with no
+  pitch shift, on a route confirmed in the log rather than assumed. A wrong capability claim costs
+  more than a missing one, and this one came within a step of a per-peer capability bit in a
+  group-playback protocol, recomputed per title because routing depends on codec, resolution, frame
+  rate and hardware, to avoid offering speed to whoever landed in software.
+
+  `audioTimePitchAlgorithm` is now pinned to TimeDomain at all four hosts through one
+  `AudioRatePolicy`: on the native `AVPlayerItem`, on the audio-only item, and on the software
+  path's `AVSampleBufferAudioRenderer`, whose algorithm is what the synchronizer's timebase rate
+  runs through. The guarantee stops depending on the host app's link age (the default has moved
+  once already and differs per platform below those versions), and it is the same on every route.
+  Pitch behaviour is unchanged on any current build; what changes is that the documentation, in
+  `setRate`'s docstring and in docs/api.md, now says what the code does, with a test holding the
+  three statements to the configured value.
+
+  Thanks to @rrgomes for measuring the documented claim instead of budgeting against it.
+
+## [6.48.0] - 2026-08-26
+
+### Fixed
+
+- **A producer restart that replaced the reader left `playbackPhase` on `.stalled(reconnecting:)`
+  for the rest of the session (AE#433).** The axis a host reads for "the source is delivering" is
+  per session, the dedupe gate that feeds it is per reader instance, and the handover let the two
+  drift apart. The restart opens its replacement demuxer first and wires the phase sink one step
+  later, so everything `find_stream_info` read went through the gate into a nil sink and latched it
+  on `.flowing`. By the time the sink existed, the reader now serving the session had nothing left
+  to say, and the phase kept describing the reader that had just been aborted: reported as 454.8 s
+  of `.stalled(reconnecting: true)`, 298 s of it over normally playing video. Two adjacent holes
+  came out of the same reading: the replaced demuxer kept its sink, so an aborted pump outliving the
+  swap could still move the axis for a session it no longer feeds, and the live reopen never wired
+  the sink onto its fresh demuxer at all, which left that path unable to recover the axis for the
+  rest of the session.
+
+  The gate now deduplicates for a LISTENER rather than for a reader instance: attaching a sink
+  clears its history, because a listener that just arrived has heard nothing regardless of what the
+  reader said into the void beforehand. Sink and gate moved under one leaf lock, since the handover
+  thread installs while the demux thread emits. At the swap the outgoing demuxer is unwired and the
+  incoming one takes the sink on both the restart and the live-reopen paths, so the fresh reader
+  publishes a non-stalled phase off its own first measured delivery instead of anyone asserting
+  health at the swap. `setReaderNetworkPhase` also logs its transitions now
+  (`source network axis reconnecting -> flowing`); the axis moves a handful of times per session and
+  was named nowhere in the log, which forced the report to reconstruct it from reader generation
+  counters.
+
+  Measured against an origin that stops delivering on established sockets without closing them, so
+  the reader parks in a blocking read and the recovery takes the wedged-producer restart. Three runs
+  per arm, identical every time: before, 24 telemetry ticks reading `.stalled(reconnecting: true)`
+  with the clock advancing at 1.0x and zero drops through 21 of them; after, 3 ticks covering the
+  outage itself and `playing` from the first tick after the restart.
+
+- **A live source that stopped carrying timestamps wedged the segment cutter (AE#432).** A live
+  MPEG-TS whose video PES headers stopped carrying PTS/DTS put 1792 packets and 30 keyframes into
+  one 85 MB segment advertised as 0.5 s, and produced nothing afterwards. The repair for a packet
+  arriving with neither dts nor pts was `lastValidDts + 1`, one tick of the source time base, which
+  satisfies the muxer's monotonic invariant and nothing else: on the 90 kHz MPEG-TS axis it claims
+  11 microseconds of presentation time for a 20 ms frame. The live cutter's clock IS that timestamp,
+  so a run of timestamp-less packets froze it and no keyframe in the window could cut.
+
+  Such a packet now advances by a plausible frame interval: the demuxer's own duration for the
+  packet, else the last genuine inter-packet delta the stream showed (learned from genuine
+  timestamps only, never from a repaired one, and never across a delta past a second, which is a
+  program boundary rather than a cadence), else the frame duration the producer already carries,
+  else the historical single tick for a stream that never carried a usable timestamp at all. The
+  dts-only case (matroska B-frames) keeps its minimal bump, where pts is real and must not be
+  crossed. The repair states once per pump that the source stopped carrying timestamps and what
+  replaced them, and the no-cut stall line reports how many packets in its window carried a
+  synthesized timestamp, so `videoPtsAdvance` reads as a statement about the source rather than
+  about the engine's own repair. Measured on a 50 fps HEVC MPEG-TS losing its timestamps at t=20 s:
+  5 segments and a cutter wedge before, 12 segments through 52.8 s and uninterrupted playback after.
+
+## [6.47.0] - 2026-08-26
+
+### Fixed
+
+- **Every emitted log line carried its URL's credentials into OSLog and into the host handler.**
+  The engine logs whole URLs on purpose, since host, path and query are what a playback report is
+  diagnosed from, but media servers routinely put the access token in that same query (Jellyfin's
+  `api_key=`). So `[AetherEngine] load url=`, `[NativeAVPlayerHost] load url=` and `asset.url=` held
+  a live credential, emitted at `.public` privacy, which means a Console.app capture or a
+  sysdiagnose showed it in clear text and the host handler passed it to whatever in-app log a
+  consumer built on it. This belongs here rather than in each consumer: the engine composes the
+  line, it reaches three sinks a consumer does not control, and a host-side scrub only covers the
+  one sink that host owns. Both `emit` overloads now funnel through one path that strips
+  `api_key`, `apikey`, `access_token`, `token`, `secret`, `password`, `signature`, `x-emby-token`,
+  `x-mediabrowser-token` and `connect.sid` values in the query form, both header forms and the
+  cookie form, replacing each value whole rather than truncating it. Everything else about the URL
+  survives. Public API is unchanged and the redactor is internal.
+
+  Redaction sits at the funnel, never at the call sites, so a URL logged by code added later is
+  covered without its author knowing the redactor exists. It works on UTF-8 bytes and allocates its
+  output only when something matches: a first version compared `Character`s and built a lowercased
+  `String` per position, which cost enough to shift request timing in
+  `ServedFromMemoryProgressTests`, since `emit` is called from the demuxer and the segment producer.
+
 ## [6.46.0] - 2026-08-26
 
 ### Fixed

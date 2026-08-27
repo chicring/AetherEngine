@@ -75,12 +75,14 @@ func printUsage() {
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--sequential-origin] [--declared-duration S]
              [--max-concurrent-requests N]
-                     [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback] <url>
+                     [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback,seekfar] <url>
                      (full load+play session smoke test; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
                       --audio-stats taps decoded PCM and prints per-second audio lead
                       plus PTS-continuity gaps; seekback rewinds 20 s at t=15 and
-                      returns to the live edge at t=30; --switch-audio replays a host
+                      returns to the live edge at t=30; seekfar (or seekfar@N)
+                      seeks past the produced window at t=15 (or t=N), so the landing
+                      needs a producer restart; --switch-audio replays a host
                       applying a language preference just after play, default +20 ms;
                       --teletext-page fixes the caption page at load, while
                       --switch-teletext-page changes it on the playing channel

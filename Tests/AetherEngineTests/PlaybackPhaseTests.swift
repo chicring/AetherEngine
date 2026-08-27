@@ -173,7 +173,8 @@ struct PlaybackPhaseEngineTests {
 }
 
 /// The reader-side dedupe gate: emit only when the phase actually changes, so a flapping origin
-/// does not spam the callback. Demux-thread-only, no locking (#85).
+/// does not spam the callback (#85). It deduplicates for one SINK, so attaching a listener clears it
+/// (#433, `forgetForNewListener`).
 @Suite("NetworkPhaseGate (#85)")
 struct NetworkPhaseGateTests {
 

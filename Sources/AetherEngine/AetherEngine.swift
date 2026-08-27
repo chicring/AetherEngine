@@ -133,8 +133,18 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// Main-actor entry point for the demuxer's `@Sendable onNetworkPhaseChanged` callback (#85).
+    ///
+    /// #433: transitions are logged. This axis is the only signal a host has for "the source is delivering",
+    /// it moves a handful of times per session, and when it latched there was nothing in the diagnostic log
+    /// that named the state or the moment it stopped moving: the report had to reconstruct it from the
+    /// reader's generation counters.
     func setReaderNetworkPhase(_ phase: ReaderNetworkPhase) {
-        if readerStall != phase { readerStall = phase }
+        guard readerStall != phase else { return }
+        EngineLog.emit(
+            "[AetherEngine] source network axis \(readerStall) -> \(phase)",
+            category: .session
+        )
+        readerStall = phase
     }
 
     /// Bumped at every `seek(to:)` entry; a seek finalizes isSeeking only when its generation still matches,
@@ -2721,6 +2731,11 @@ public final class AetherEngine: ObservableObject {
     ) async throws -> SourceProbe? {
         var source = source
         var options = options
+        // #436: a speed the host set belongs to the item it was set on. The rebuilds a session makes
+        // on its own (reload at position, audio-track switch, AirPlay LAN swap, background return)
+        // reopen the same source and keep it; a different item starts at 1.0, so a host whose speed
+        // control resets per item cannot end up showing 1.0 over a session still running at 1.5.
+        if !Self.rateSurvivesLoad(of: source, loadedURL: loadedURL) { desiredRate = nil }
         // #199: a live master whose #168 carriage verdict already fired routes straight onto the
         // live-ingest loopback. Remounting the native bypass would burn readyToPlay plus the watchdog
         // grace on a deterministic no-video-track outcome; after an ingest death that discovery tax
@@ -3352,11 +3367,31 @@ public final class AetherEngine: ObservableObject {
                 )
             }
         }
+        // #435: a 3D Blu-ray MVC remux muxes both eyes into one H.264 track (Matroska StereoMode
+        // block_lr / block_rl, which libavformat reports as stream-level AV_STEREO3D_FRAMESEQUENCE).
+        // VideoToolbox is handed samples carrying both views and renders nothing; libavcodec skips the
+        // dependent view's NALs and decodes the base view, which is the left eye. Read here so the
+        // decision stays in the pure policy.
+        var containerStereoType: AVStereo3DType?
+        if probeOpened, let vStream = probe.stream(at: probe.videoStreamIndex) {
+            containerStereoType = Self.stereo3DType(stream: vStream)
+        }
+        let multiviewCarriage = VideoRoutingPolicy.routesSoftwareForMultiviewCarriage(
+            codecID: detectedCodecID, stereo3DType: containerStereoType)
+        if multiviewCarriage {
+            EngineLog.emit(
+                "[AetherEngine] H.264 carries both stereo views in one track "
+                + "(container stereo3d=frame sequence, MVC 3D remux); VideoToolbox has no base-view-only "
+                + "mode, routing to the software path so the left eye plays as 2D (#435)",
+                category: .engine
+            )
+        }
         var useSoftwarePath = VideoRoutingPolicy.requiresSoftwarePath(
             codecID: detectedCodecID,
             fieldOrder: detectedFieldOrder,
             av1Available: VTCapabilityProbe.av1Available,
-            spsIndicatesInterlaced: spsIndicatesInterlaced
+            spsIndicatesInterlaced: spsIndicatesInterlaced,
+            stereo3DType: containerStereoType
         )
         // #232: a declared interlaced field order is not evidence that any frame IS interlaced.
         // European 25 fps Blu-ray masters ship as 1080i25 (there is no 1080p25): interlaced carriage,
@@ -3369,7 +3404,7 @@ public final class AetherEngine: ObservableObject {
         // the demuxer the session reuses, and live 1080i broadcast (the case the rule exists for) is
         // neither seekable nor mis-declared.
         if useSoftwarePath, probeOpened, !options.isLive, probe.isSourceSeekable,
-           probe.videoStreamIndex >= 0,
+           probe.videoStreamIndex >= 0, !multiviewCarriage,
            VideoRoutingPolicy.routesSoftwareForDeclaredInterlace(
                codecID: detectedCodecID,
                fieldOrder: detectedFieldOrder,
@@ -4519,6 +4554,9 @@ public final class AetherEngine: ObservableObject {
         // Surviving stopInternal is deliberate (a reload keeps the card through the seam).
         pendingVideoNowPlayingInfo = [:]
         #endif
+        // #436: the speed belongs to the item, so it leaves with it. Same lifetime as the staged
+        // Now-Playing card above, and for the same reason: a reload keeps it through the seam.
+        desiredRate = nil
         // Clear loadedURL on public stop() so reloadAtCurrentPosition can't resurrect the URL after dismissal
         // and selectSubtitleTrack can't spawn a side demuxer against a stopped session.
         loadedURL = nil
@@ -4948,13 +4986,34 @@ public final class AetherEngine: ObservableObject {
         if let v = desiredVolume { host.volume = v }
     }
 
-    /// Playback rate (1.0 default), remembered across host/pipeline rebuilds so a
-    /// load-to-load change (seamless, reopen, background rebuild) re-applies the
-    /// user's chosen speed instead of silently resetting to 1.0.
-    var desiredRate: Float = 1.0
+    /// The speed the host asked for, remembered so the host rebuilds a session makes on its own
+    /// (reload at position, audio-track switch, AirPlay LAN swap, background return) come back at it
+    /// instead of silently at 1.0 (#436). Lifetime is the item: a load of a different source clears
+    /// it, as does `stop()`, so a host whose speed control resets per item stays in step. Within a
+    /// session the resume itself is the host's own business (`AVPlayer.defaultRate` on the native
+    /// paths, `lastRate` on the software ones), which is what covers the play() calls neither the
+    /// engine nor a client issues.
+    var desiredRate: Float?
 
     func applyDesiredRate(to host: any TransportControllable) {
-        host.setRate(min(desiredRate, maxSupportedRate))
+        // Seeded on every host the load builds, including the "no speed set" case: the native and
+        // audio AVPlayer hosts are REUSED across loads, and the rate they resume at lives on that
+        // player, so a new item would otherwise inherit the previous one's speed from a host object
+        // the engine's own memory no longer describes.
+        // Re-clamped per host: the cap is 3.0 for an audio-only session and 2.0 for video, so a rate
+        // carried out of one must not outrun the other.
+        host.setResumeRate(min(desiredRate ?? 1.0, maxSupportedRate))
+    }
+
+    /// #436: whether a speed set on the current item survives this load. A rebuild of the same source
+    /// keeps it; a different item starts at 1.0. A custom source has no URL to compare, and the only
+    /// way one is reopened is the engine reusing the retained reader, so a loaded session keeps it.
+    static func rateSurvivesLoad(of source: MediaSource, loadedURL: URL?) -> Bool {
+        guard let loaded = loadedURL else { return false }
+        switch source {
+        case .url(let url): return url == loaded
+        case .custom: return true
+        }
     }
 
     /// Maximum reliable forward rate: 3x for audio-only sessions, 2x for video.
@@ -4965,14 +5024,17 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// Set playback speed. Clamped to `maxSupportedRate` (AetherEngine#39). 0 pauses.
-    /// Native path: pitch-corrected via audioTimePitchAlgorithm. SW path: no pitch correction.
+    /// Both paths are pitch-preserving: the engine pins `audioTimePitchAlgorithm` to TimeDomain on the
+    /// native `AVPlayerItem` and on the software path's audio renderer, so speed never depends on which
+    /// decode route a title took (#434).
     public func setRate(_ rate: Float) {
         let cap = maxSupportedRate
         let clamped = min(rate, cap)
         if clamped != rate {
             EngineLog.emit("[AetherEngine] setRate(\(rate)) clamped to \(clamped) (max supported on this path)", category: .engine)
         }
-        desiredRate = clamped
+        // Zero is a pause, not a speed: it must not become what a later resume comes back at (#436).
+        if clamped != 0 { desiredRate = clamped }
         activeTransportHost?.setRate(clamped)
     }
 

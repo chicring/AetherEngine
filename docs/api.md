@@ -202,7 +202,7 @@ try await player.reloadAtCurrentPosition()
 | `pause()`, `togglePlayPause()` | |
 | `seek(to:)` | `async`. Source-axis seconds. Rejected when idle, errored, ended, or live without a DVR window. |
 | `seek(toSourceTime:)` | Deprecated alias for `seek(to:)`. The clock is unified onto source PTS, so the two are the same call. |
-| `setRate(_:)` | Clamped to `maxSupportedRate`. |
+| `setRate(_:)` | Clamped to `maxSupportedRate`; `0` pauses. The speed holds across pause and resume and across the host rebuilds a session makes on its own (reload at position, audio-track switch, AirPlay LAN swap, background return), and it belongs to the item: loading a different source, or `stop()`, returns to 1.0. Pitch-preserving on both decode routes: `audioTimePitchAlgorithm` is pinned to TimeDomain on the native player item and on the software path's audio renderer, so a speed control never has to be gated on which route a title took. |
 | `maxSupportedRate` | 2.0 for video, 3.0 audio-only. Query after load; returns 2.0 while idle. Size a speed picker against it. |
 | `volume` | 0.0 to 1.0. A write before a session exists is remembered and applied at load. |
 | `selectTitle(id:)`, `selectChapter(id:)` | Disc titles and chapters. |

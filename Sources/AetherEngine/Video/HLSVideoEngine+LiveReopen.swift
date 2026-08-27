@@ -992,6 +992,11 @@ extension HLSVideoEngine {
         }
         let oldDem = demuxer
         demuxer = dem
+        // #433: the reopen replaces the reader the phase axis describes. The lost source's reader parked
+        // the host on `.stalled`, and this demuxer was never handed the sink at all, so the axis kept
+        // reporting a transport that no longer exists for the rest of the session.
+        oldDem?.onNetworkPhaseChanged = nil
+        dem.onNetworkPhaseChanged = onNetworkPhaseChanged
         let (nextIndex, outputEnd) = prov.liveContinuationPoint()
         do {
             let newProd = try makeProducer(
@@ -1020,6 +1025,9 @@ extension HLSVideoEngine {
             return .done
         } catch {
             demuxer = oldDem
+            // The swap did not happen: the axis goes back to the reader that is still installed (#433).
+            dem.onNetworkPhaseChanged = nil
+            oldDem?.onNetworkPhaseChanged = onNetworkPhaseChanged
             restartLock.unlock()
             dem.close()
             freshReader?.close()

@@ -181,6 +181,29 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Public state
 
+    /// Per-session capability token, first component of every path this server answers.
+    /// The listener binds 0.0.0.0 so an AirPlay receiver can reach it over the LAN (#86), which
+    /// also puts it in front of every other host on that network. The endpoint names are fixed,
+    /// so without this the ephemeral port is the only thing between a stranger's port scan and
+    /// the stream. It costs nothing to carry: playlist URIs are relative, so they resolve under
+    /// the prefix on their own, and only the three entry-point accessors below have to name it.
+    let pathToken: String = {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        var generator = SystemRandomNumberGenerator()
+        for i in bytes.indices { bytes[i] = UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }()
+
+    /// The request path with the session token removed, or nil when the request does not carry it.
+    /// Static and internal so the check is unit-testable without a live socket.
+    static func pathAfterToken(_ token: String, in path: String) -> String? {
+        let prefix = "/" + token
+        guard path.hasPrefix(prefix) else { return nil }
+        let rest = String(path.dropFirst(prefix.count))
+        guard rest.hasPrefix("/") else { return nil }
+        return rest
+    }
+
     /// Kernel-assigned ephemeral port. Zero until start() succeeds.
     private(set) var port: UInt16 = 0
 
@@ -193,7 +216,7 @@ final class HLSLocalServer: @unchecked Sendable {
         // is still the playlist AVPlayer must open, or the injected renditions never reach media selection.
         let hasMaster = provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil
         let path = hasMaster ? "master.m3u8" : "media.m3u8"
-        return URL(string: "http://127.0.0.1:\(port)/\(path)")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(path)")
     }
 
     /// Direct media.m3u8 URL, bypassing master-playlist variant selection (used when the DV/HDR handshake is unavailable so AVPlayer doesn't try to match a dvh1 master on an SDR panel).
@@ -201,7 +224,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/media.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/media.m3u8")
     }
 
     /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
@@ -210,7 +233,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0, provider?.masterCodecs != nil else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/master_hdr.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/master_hdr.m3u8")
     }
 
     /// Numeric address of the peer on an accepted connection, or nil if the socket is already gone (#227 diag).
@@ -622,7 +645,16 @@ final class HLSLocalServer: @unchecked Sendable {
             path = rawTarget
             query = ""
         }
-        let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
+        // Reject anything that does not carry this session's token before it reaches the router.
+        // The listener is reachable from the whole LAN, so an unprefixed request is a scan or a
+        // stale URL, never AVPlayer following a playlist we handed out.
+        guard let routePath = Self.pathAfterToken(pathToken, in: path) else {
+            EngineLog.emit("[HLSLocalServer] rejected request without a valid session token: \(firstLine)",
+                           category: .hlsServer)
+            _ = send404(fd: fd, path: path, reason: "bad session token")
+            return false
+        }
+        let normalizedPath = (routePath == "/audio.m3u8") ? "/media.m3u8" : routePath
 
         // #50 diag: promoted to .info so the host mirror names the failing path without a verbose build. Revert once #50 is root-caused.
         EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)

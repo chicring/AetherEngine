@@ -890,6 +890,13 @@ final class SoftwarePlaybackHost {
     }
 
     func setRate(_ newRate: Float) {
+        // #436: zero is a pause, not a speed. `lastRate` is what the clock arms at and what a
+        // rebuffer resumes at, so storing a zero there brings the session back frozen while it
+        // reports itself playing. Park it the way pause() does and keep the last real speed.
+        if newRate == 0 {
+            pause()
+            return
+        }
         lastRate = newRate
         rate = newRate
         // Same rule as play(): never rate-change the un-anchored synchronizer. A host setRate
@@ -899,6 +906,11 @@ final class SoftwarePlaybackHost {
         if clockArmed {
             audioOutput?.setRate(newRate)
         }
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        lastRate = rate
     }
 
     /// #254: the demuxer reposition is awaited off the main actor. It used to run inline here, and
