@@ -70,7 +70,7 @@ Backed by the public `AetherEngine.swDecodeProbe(url:maxPackets:options:)` stati
 
 ## play
 
-Runs a full `load()` + `play()` session exactly like a host app and prints 1 Hz transport telemetry (state, phase, currentTime, sourceTime, buffered frontier, duration) plus the network half of the same `liveTelemetry` snapshot a host reads (`net` throughput, `rx` reader lifetime pull, `ahead` fetched-but-unconsumed window, `cushion` decoded video past the clock, `fwd` native forward buffer, `drop` / `delay`). Fields absent on the running path are omitted, so a software session reads `cushion` where a native one reads `fwd`. Note that `drop` climbs steadily in a CLI run: nothing binds a render surface, and the renderer drops what it cannot present. Where `swdecode` proves the decoder, `play` proves the transport: it fails loud on the two silent failure modes of a session that "loads fine" but never actually plays (#107): exit 2 when the clock does not advance, exit 3 when a selected subtitle track produces no cues.
+Runs a full `load()` + `play()` session exactly like a host app and prints 1 Hz transport telemetry (state, phase, currentTime, sourceTime, buffered frontier, duration) plus the network half of the same `liveTelemetry` snapshot a host reads (`net` throughput, `rx` what the playback consumer pulled over its own link, `origin` what the session pulled from the SOURCE, `ahead` fetched-but-unconsumed window, `cushion` decoded video past the clock, `fwd` native forward buffer, `drop` / `delay`). Fields absent on the running path are omitted, so a software session reads `cushion` where a native one reads `fwd`. Note that `drop` climbs steadily in a CLI run: nothing binds a render surface, and the renderer drops what it cannot present. `rx` and `origin` are two different links and routinely disagree: on the native path `rx` counts what AVPlayer fetched from the engine's own loopback server, so a live session whose source has gone quiet can keep raising `rx` out of the segment cache while `origin` stays flat. An origin question is an `origin` question (AE#443, where a fall in `rx` was read as an origin socket event). Both are session totals: they are summed across AVFoundation's access-log entries and across the subsystems a live reopen replaces, so neither falls back mid-session. Where `swdecode` proves the decoder, `play` proves the transport: it fails loud on the two silent failure modes of a session that "loads fine" but never actually plays (#107): exit 2 when the clock does not advance, exit 3 when a selected subtitle track produces no cues.
 
 ```bash
 swift run aetherctl play <url>                                  # VOD load, 30 s telemetry
@@ -92,6 +92,11 @@ external track by language) shows the `subs_N.m3u8` and `subs_N_0.vtt` fetches a
 that `cues=0` and "no cues arrived" are CORRECT there, because AVPlayer renders a rendition itself and the
 overlay pipeline stays empty (same as AE#154).
 
+`play` prints a `PHASE <phase> t+Ns` line on every `playbackPhase` edge, stamped from the load call on
+the same clock as `FIRSTFRAME`. The 1 Hz tick samples the phase, which is far too coarse to tell a start
+signal apart from the moment the rate rolls; a healthy native join is exactly two edges, `loading` at the
+load and `playing` at the roll (AE#440).
+
 `--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `ratehold` (set 1.5, pause at tick 3, resume at tick 5, then read the rate back off the transport itself: the #436 drill, and it fails the run if the resume came back at 1.0), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), and `overlapseek` (the #292 seek-window drills below); this is how the pre-arming `setRate` wedge was isolated.
 
 `--seek-every N` seeks once every N ticks past tick 10, walking `--seek-pattern <abs,abs,...>` if one is given (a short backward hop otherwise), and `--seek-count K` stops after K seeks so a run can be a BURST and then play. Both halves are needed for anything about what a seek sequence leaves behind: the burst puts the store in the state under test, and only the playing half shows what the overlay carries through it. That pairing is what made AE#362's second mechanism reproducible (a hole between a restarted pump and the island the previous run left ahead of it, decoded across and then never re-read).
@@ -101,6 +106,19 @@ overlay pipeline stays empty (same as AE#154).
 `--live-ingest` loads the URL through `HLSLiveIngestReader` as a custom source, which is the shape a host uses for a live channel it ingests and re-serves itself (Sodalite's direct live path). Pair it with `--live`. It reaches the reader DIRECTLY, which is what a repro of the reader itself needs; since AE#363 plain `--live` also ends up there, but by way of the engine's own route (the raw live path detects the playlist and hands it to the ingest), so use `--live-ingest` when the reader is the subject and plain `--live` when the routing is. `hlslive` only serves local `.ts` files. AE#359 (the master's SUBTITLES renditions were parsed away) survived precisely because this path had no harness; `--live-ingest --subs <lang>` reproduces and verifies it in 40 s against a public broadcaster URL.
 
 `--fast-zap` sets `LoadOptions.liveJoinProfile = .fastZap` for the load. `live` has carried the flag for its own raw-TS fixture since AE#195, but that fixture has no upstream playlist, and the served `#EXT-X-TARGETDURATION` is floored by the UPSTREAM's observed arrival cadence (`LiveCadencePolicy`), which is what sizes the holdback the first serve waits for. So fastZap against an origin of one's own, the shape a downstream player actually ships, could not be driven from here at all. Measured on the same 1 s-GOP seed, `--preroll 0 --realtime`: raw TS with no playlist serves at 1.325 s on TARGETDURATION 1 (holdback 3 s, full cushion), the same content behind an `hlsfixture` origin cutting 2 s segments serves on TARGETDURATION **2** (holdback 6 s) although the engine re-cut it at 1 s. Pair it with `--live`, and read the first-serve line (AE#374) rather than a first-frame stopwatch.
+
+`--live-start-immediately` / `--no-live-start-immediately` set `LoadOptions.liveJoinStartsImmediately`,
+which cuts AVPlayer's stall-avoidance hold short once at the live join (AE#440). It is **on by default**
+since 6.55.0, so `--no-live-start-immediately` is the flag that drives the control arm now; the positive
+one is still accepted. **The hold it addresses does not reproduce on this harness**, and that is itself the finding: measured on 6 window geometries against the raw-TS fixture
+at `--realtime --preroll 0` (shallow window under the holdback, window exactly at it, and a deep window
+from `--preroll 6/12/30`), the gap between `layer.isReadyForDisplay=true` and `timeControlStatus=playing`
+stayed between 10 and 60 ms every time, against 1.5 to 2.8 s reported on an Apple TV 4K over the same
+shape.
+Loopback answers at memory speed, so AVPlayer's buffering-rate evaluation concludes at once. The flag is
+here to drive the engine end of a device A/B, not to prove anything from a Mac. That A/B has since run
+(AE#440, on 6.53.0) and is what turned the default on; see the live-join section of `api.md` for its
+numbers.
 
 `--header "Name: Value"` (repeatable) fills `LoadOptions.httpHeaders` and, on `--live-ingest`, the reader's own fetches. Origins that enforce a per-request `User-Agent` / `Referer` / `Authorization` (tokenized IPTV, STB profiles) could not be driven from the CLI at all before AE#363; pair it with `hlsfixture --require-header` below to have both ends of the contract in one run.
 
@@ -126,6 +144,35 @@ before the first frame and during a stall, so it is not reported as a zero. This
 AE#418: AVPlayer presents a segment at the position the PLAYLIST gives it, not at the tfdt it
 carries, and then plays continuously from there, so a gate that opened below its boundary shifts the
 whole run by the re-aim (`axisErr=-13.583` on a 13.583 s re-aim, constant for the run).
+
+Round 3 added a second oracle, and this one works on a device with no capture card:
+`AVPlayerItem.loadedTimeRanges`. The range holding the playhead begins where AVPlayer PLACED that
+run, so `advertised - rangeStart` is the axis it composed onto, measured rather than assumed. The
+engine reads it after every VOD seam and says what it found, `#418 segN placement confirmed` or
+`#418 segN placed on base Xs, not Ys`, the second of which is a placement this side counted that
+AVPlayer discarded (a fetch during a seek burst, which is a fetch and not a placement). Against the
+picture probe the two oracles agree exactly: a resume predicting a seam at `52.000` reads
+`loaded [52.000-64.958]`, and a far seek predicting `21.000` reads `[21.000-38.622]`.
+
+**Round 4 lets that reading WIN.** Round 3 collapsed the measured base onto the nearest axis the
+session had already published, which made the prediction the yardstick for the measurement meant to
+check it: a base matching no prediction was refused (a reporter's session composed to `-26.152` while
+two readings 400 s of media apart both said `-10.93`, and ended 42.6 s out), and a base a frame or
+two off was called a confirmation, so that difference stayed in the axis and the next placement
+composed on top of it. What decides now is where the reading came from: a run that overlaps nothing
+the item held when the placement was recorded, or one that opened ABOVE it. A start that walked
+DOWNWARD is the same run backfilling, which AVPlayer does after a run opens, and is never read. The
+new lines are `#418 segN placement confirmed` (residual under a millisecond), `#418 segN placed on
+base Xs, not Ys (... residual Zs)`, `#418 segN opened no run of its own to measure`, and
+`#418 segN superseded before it was measured`.
+
+Round 4 also needs a fixture with B-FRAMES, and `Scripts/timecode-fixture.sh` now writes one
+(`tc-bframes.mkv`). `-preset ultrafast` disables them, so on `tc-drought.mkv` a segment's dts and pts
+are one number and the gate's offset is the same either way. On real content they are not: the gate
+opens on a random-access point in DECODE order, and taking the offset there put the axis
+`video_delay` frames under the truth on every epoch. The pair isolates exactly that. Read the verdict
+as the MEAN of `capErr` per axis over the run, since a single tick carries up to two frames of the
+probe's own quantisation.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 
@@ -191,6 +238,58 @@ Verifies SW-path background audio (iOS keepalive) headless on macOS, where the `
 
 Wraps a local file in a custom `IOReader` and plays it through `load(source:)`. `--memory` reads via `DataIOReader`, `--forward-only` drops the seek capability, `--audio-only` routes through the audio-only pipeline, and `--reload` / `--switch-audio` / `--select-subs` / `--extract` exercise the optional capabilities (background reload, audio-track switch, embedded subtitles, scrub preview) end-to-end. `--audio-index N` names the audio stream at LOAD and prints what it asked for next to what it got. Pair it with `--forward-only` for the one question a live host has to answer: `selectAudioTrack` refuses such a source (rebuilding a drained FIFO), so naming the stream at load is the only way onto another track, and this is where that was measured rather than assumed (Sodalite#64).
 
+### `--live`: a host-owned live spool, and the memory it costs (AE#445)
+
+`customio --live <file.ts>` puts the same file behind a reader shaped like a live host's: paced at
+`--rate-kbps` (default 8000) against the wall clock, blocking at the edge instead of ever returning
+EOF, answering `AVSEEK_SIZE` negative, and seekable by logical offset. `--seconds N` sets the run
+length (default 720), `--dvr-window N` the timeshift, `--report-size` makes the size known, and
+`--no-wrap` stops it looping the file. Every ten seconds it prints `physFP` and its slope, and it
+closes with that slope stated against the source's own mux rate:
+
+```
+VERDICT: physFP 105 -> 402 MB over 240s = 1.24 MB/s (source mux rate 0.95 MB/s, retention ratio 1.30)
+```
+
+A ratio near 1 means the session keeps one byte for every byte it plays, which on a source that never
+EOFs is unbounded by construction; near 0 means the footprint is the session's, not the stream's. That
+is the whole measurement, and before AE#445 the custom-source live shape had no harness at all: the
+defect it found (host reader callbacks ran on the pump's undrained thread) was reachable by every
+custom reader and visible to none of the engine's own buckets.
+
+**Which reader arm is running decides what the ratio is about.** The default arm reads with `pread`
+straight into the engine's buffer and allocates nothing, so whatever it retains is the ENGINE's.
+`--foundation-reader` swaps in a `FileHandle.readData` arm, which strands one autoreleased `Data`
+per read on any thread that never drains a pool, so what it retains is the HOST's.
+
+That distinction was learned the expensive way. AE#445 round 1 shipped only the Foundation arm and
+measured ratio 1.00 before the bridge pool and 0.00 after, which reads like the reporter's defect
+reproduced and fixed. It was not: his adapter `pread`s and allocates nothing, so the run had
+reproduced the harness's own retention with his signature. A harness that brings the cause with it
+matches the shape and answers a different question, and only a second arm that allocates nothing can
+tell those two apart. Run both: the Foundation arm is now the control that proves the pool drains,
+and the POSIX arm is the one that measures the engine.
+
+**`--host-carry removeFirst|subdata` is the third arm, and it names a cause rather than measuring
+the engine.** Round 3's census on the reporter's device pinned his footprint to ONE `REALLOC`-tagged
+block growing on an exact x1.25 ladder, holding every byte the session had consumed. That factor is
+Foundation's: `Data` grows a large buffer by `newLength >> 2`, where `av_fast_realloc` adds a
+sixteenth and FFmpeg's AVIO dynamic buffer a half, so the block is a Swift `Data`. The one `Data`
+shape that grows like that while its `count` stays tiny is a parse carry consumed from the front
+with `removeFirst`, which only advances the slice's lower bound and leaves the backing store holding
+everything below it. `--host-carry removeFirst` puts exactly that carry on the harness's delivery
+path, so the tool that measures the engine at ratio 0.00 can also produce ratio 1.00 on demand;
+`--host-carry subdata` is the same carry re-based, i.e. the fix. Both arms print the tell every ten
+seconds:
+
+```
+  t=240s ... physFP=447MB srcMB=417.2 growthMBps=1.67 carryCount=112B carryStart=417.1MB
+```
+
+A carry whose `count` is under one TS packet while its slice's lower bound tracks the consumed
+stream is riding a backing allocation that large. `startIndex` is the cheapest probe there is for
+this defect, in any host, without Instruments.
+
 ## disc-inspect
 
 Walks a local DVD-Video or Blu-ray ISO at the filesystem layer (FFmpeg-free) and reports what `DiscReader.wrap` makes of it: the recognition verdict and the stages it went through (ISO9660 / UDF signatures, BDMV / VIDEO_TS contents, resolved extents), so a disc that fails to play is debuggable instead of surfacing a bare `INVALIDDATA`. It also prints the full selectable-title list with each title's duration and chapter offsets (the same titles + chapters the engine exposes via `discTitles` / `discChapters`). Exit 0 when the image is recognized as playable, else 1. `--dump` adds the verbose UDF volume structure under the `.demux` log.
@@ -201,7 +300,9 @@ Activates two subtitle tracks simultaneously on one source (primary + secondary)
 
 ## live
 
-Runs a live MPEG-TS session against a built-in fixture that serves an endless broadcast by looping a seed `.ts` with rewritten timestamps. Flags simulate the failure modes the live path hardens against: `--drop-after N` (mid-stream connection drop + reconnect), `--discontinuity-at N` (program-boundary PTS / PCR jump), `--realtime` (1x wall-clock pacing), `--preroll N` (backlog seconds the paced fixture bursts before 1x pacing; default 30, `0` models a strict-realtime origin with no backlog), `--fast-zap` (loads with `LoadOptions.liveJoinProfile = .fastZap`; the first serve prefers the full holdback but is bounded after two finalized segments plus a 0.5...2.0 s observed-segment grace), `--dvr-window N` (timeshift), `--measure-rss` (sliding-window retention), `--reload-test` (live rejoin end to end, including the full-backlog replay shape some origins serve on reconnect). `--seed <ts>` overrides the seed clip, `--sw` forces the software live path, `--report-cache-bytes` tracks on-disk DVR footprint, `--serve-only` parks the fixture without attaching an engine (raw `curl` / `ffprobe` inspection), `--rewind-test` runs the DVR rewind-and-return matrix variant, and `--gen-highbitrate-seed` generates a ~22 Mbps 1080p H.264 MPEG-TS seed (for RSS-retention measurement) then exits. `--sliding` is still accepted and does nothing: the sliding window is unconditional for live sessions now, and the flag stays only so an older script does not fail on it.
+Runs a live MPEG-TS session against a built-in fixture that serves an endless broadcast by looping a seed `.ts` with rewritten timestamps. Flags simulate the failure modes the live path hardens against: `--drop-after N` (mid-stream connection drop + reconnect), `--discontinuity-at N` (program-boundary PTS / PCR jump), `--realtime` (1x wall-clock pacing), `--preroll N` (backlog seconds the paced fixture bursts before 1x pacing; default 30, `0` models a strict-realtime origin with no backlog), `--fast-zap` (loads with `LoadOptions.liveJoinProfile = .fastZap`; the first serve prefers the full holdback but is bounded after two finalized segments plus a 0.5...2.0 s observed-segment grace), `--dvr-window N` (timeshift), `--measure-rss` (sliding-window retention), `--reload-test` (live rejoin end to end, including the full-backlog replay shape some origins serve on reconnect). `--seed <ts>` overrides the seed clip, `--sw` forces the software live path, `--report-cache-bytes` tracks on-disk DVR footprint, `--serve-only` parks the fixture without attaching an engine (raw `curl` / `ffprobe` inspection), `--rewind-test` runs the DVR rewind-and-return matrix variant, `--rewind-hold N` parks the playhead N seconds behind the edge and HOLDS it there for the rest of the run (the regime that separates a resident floor doing its job from a window outrunning the reader: it reports the floor-minus-playhead inversion, stalled ticks, and any `live window slid past the consumer` line), `--freeze-after N` freezes the upstream with the connection still open, `--rewind-before-freeze N` parks the playhead inside the DVR window first, `--unfreeze-after N` lets the frozen upstream deliver again after N seconds (the only way to drive the recovery half: a window closed with ENDLIST re-opening, and where the rejoin puts a timeshifted viewer), `--live-only` loads with no DVR window at all (the shape of a client that keeps its rewind outside the engine, which is where AE#446 round 4 came from: the freeze leg then measures the only timeshift such a session can have, the backlog an outage puts between the closed window's end and the source's return, and the sliding 60 s live-only retention makes the fresh item's own axis observable), `--force-recovery-reload-at N` drives the stage-2 recovery reload without waiting for a real item death, and `--gen-highbitrate-seed` generates a ~22 Mbps 1080p H.264 MPEG-TS seed (for RSS-retention measurement) then exits. `--sliding` is still accepted and does nothing: the sliding window is unconditional for live sessions now, and the flag stays only so an older script does not fail on it.
+
+The freeze leg's verdict is stated in SEGMENTS, not in seconds. A forward step in seconds cannot tell a lost position from a source discontinuity the session correctly folded: a client that reconnects during the freeze is served from a fresh loop of the seed, and since a connection always starts at a loop boundary the remainder of the loop the parked connection had not reached is skipped, which is a real jump in the source (28.8 s on the bundled seed, 49.1 s reported on a 93 s capture) and shows up as a legitimate step in the playhead. What the verdict reads instead is which segments the consumer fetched before and after the rejoin: any the window listed, that it had not reached, and that the rejoin then jumped over. It also fails a rejoin that re-enters further below the place it held than the landing's own backward buffering explains (a re-fetch is not a re-watch, and the allowance is computed from the cut size because AVPlayer's lookback is a fixed 6 to 8 s of content), and a run where the source delivered again and the session never went live at all, which every seconds-based number reads as healthy (the playhead had not moved, so it had not moved wrong).
 
 ## dvr
 
@@ -230,9 +331,21 @@ Measured against pre-cut GOP-aligned segments, `play --live --fast-zap` entered 
 | 1 s | 2 | 7 | 2 | 1.003 / 1.005 / 1.010 s |
 | 0.5 s GOP inside 1 s segments | 2 | 3 | 2 | **0.510 s, three times** |
 
-Removing the padding changes nothing. The served TARGETDURATION is `max(advertised, ceil(observed arrival cadence), ceil(max own EXTINF), ceil(1.5 x cut target))`, and a strict-realtime origin's real inter-arrival gap is always a hair above the nominal cut, so the `ceil` lands on `cut + 1` whether or not the origin advertises it. Deepening the window changes nothing either: the ingest joins exactly three segments behind the edge at window 3, 5 and 7, so a deeper upstream window never becomes a deeper cushion. What moves is the cut, because the fastZap grace is `min(2.0, max(0.5, own cut duration))` and the engine re-cuts at the source GOP.
+Removing the padding changed nothing **at 6.34.1**, and that finding is what AE#447 later turned out to be. The served TARGETDURATION was `max(advertised, ceil(observed arrival cadence), ceil(max own EXTINF), ceil(1.5 x cut target))`, and a strict-realtime origin's real inter-arrival gap is always a hair above the nominal cut, so the `ceil` landed on `cut + 1` whether or not the origin advertised it. Reading that as "the padding is not what you pay for" was right; reading it as "there is nothing to pay" was not. Both terms were wrong for the same reason: an arrival interval is a cadence, and `ceil` treats it as a segment duration.
 
-Over-padding costs somewhere else than the join. TD 5 on 2 s cuts still serves in 2.010 s, because the bounded fastZap exit fires on the grace either way, but the served playlist then carries a 15 s holdback, so AVPlayer targets that far behind the live edge for the rest of the session.
+From **6.56.0** the advertised value is not read at all (it is printed in the seal line and nowhere else), and a measured cadence enters as the TARGETDURATION its patience actually needs, `ceil(gap / 1.5)`, because `1.5 x TD` is the unchanged-playlist tolerance the floor exists to satisfy. On the same 2 s origin advertising 3, measured on this harness: served TD **3, then 4, then 4** across three joins before, holdback 9 s then 12 s twice, escalating because the gate's own wait was being measured as the source's cadence; served TD **2** on every join after, holdback 6 s, measured floor 2.019 to 2.141 s. Deepening the window changes nothing either: the ingest joins exactly three segments behind the edge at window 3, 5 and 7, so a deeper upstream window never becomes a deeper cushion. What moves is the cut, because the fastZap grace is `min(2.0, max(0.5, own cut duration))` and the engine re-cuts at the source GOP.
+
+Over-padding costs somewhere else than the join. TD 5 on 2 s cuts still serves in 2.010 s, because the bounded fastZap exit fires on the grace either way, but the served playlist then carries a 15 s holdback, so AVPlayer targets that far behind the live edge for the rest of the session. Since 6.56.0 an over-padded advert cannot produce that at all: only the source's own segments and its closed inter-arrival gaps can.
+
+The seal line is where the whole derivation is now readable, once per session:
+
+```
+[HLSVideoEngine] live TARGETDURATION sealed at 2s (holdback 6.000s): max EXTINF 2.000s,
+  1.5 x cut target 0.750s, measured floor 2.069s needs 2s of patience;
+  upstream advertises 3.000s (reported, not used)
+```
+
+**And this harness cannot reproduce the last term of it (AE#447 round 2).** After the four fixes above, the reporter's device still sealed at 3 while that same line printed `max EXTINF 2.000s`. A live EXTINF is `nextStart - startSeconds`, a difference of two accumulated item-axis doubles, so a strictly 2.000 s GOP whose first segment starts at 0.060 s yields the odd `2.0000000000000004`; `ceil` charges a whole second for it, and the seal takes the max over the window, so one such segment is enough (6 of his 80 were). The fixture here starts its first segment at exactly 0 and cuts at a binary-exact duration, so its differences are exactly 2.0 and five joins in a row sealed at 2. The case lives in `Issue447TargetDurationEvidenceTests` instead, built by accumulating the way the producer accumulates. Since **6.56.0** every term is taken at the resolution the playlist serves (`#EXTINF` is written with `%.3f`), so the seal line can be checked against itself: what it prints is what decided it.
 
 ### The header-enforcing origin (AE#363)
 

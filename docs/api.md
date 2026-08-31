@@ -167,7 +167,7 @@ let player = try AetherEngine()
 
 | Symbol | What it is |
 | --- | --- |
-| `AetherEngine()` | `public init() throws`, `@MainActor`, an `ObservableObject`. One engine per playback surface. The audio-session category is declared off-main and never activated here, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24). |
+| `AetherEngine()` | `public init() throws`, `@MainActor`, an `ObservableObject`. One engine per playback surface, and several against one origin cost that origin one long-lived request each (see `maxConcurrentSourceRequests`). The audio-session category is declared off-main and never activated here, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24). |
 | `AetherPlayerSurface(engine:)` | SwiftUI view. Drop it in the tree; it mounts and binds an `AetherPlayerView` for you. |
 | `AetherPlayerView` | UIKit / AppKit view (`PlatformBaseView` is `UIView` or `NSView`). Hosts the engine's layer. |
 | `bind(view:)` | Attach a view. The engine swaps the hosted `CALayer` per session (`AVPlayerLayer` or `AVSampleBufferDisplayLayer`), so a bound host needs no per-route branch. |
@@ -192,7 +192,7 @@ try await player.reloadAtCurrentPosition()
 | `AetherEngine.probeDetectingAtmos(url:options:atmosDetection:)` | `probe` plus a bounded decode pass that authoritatively resolves E-AC-3 JOC for an Atmos badge. Strictly more expensive; never on the playback-start path. Decode-side failures degrade to "not confirmed" rather than throwing. |
 | `AetherEngine.externalSubtitleTrackIDBase` | `100_000`. Synthetic ids of external subtitle tracks start here. |
 
-`IOReader` is the custom-source protocol: `read`, `seek`, `close` are required; `cancel()`, `makeIndependentReader()` and `discImageProbeEnabled` have defaults that unlock teardown-unblocking, embedded subtitles plus scrub stills, and ISO/UDF probing respectively. Full contract in [formats.md](formats.md).
+`IOReader` is the custom-source protocol: `read`, `seek`, `close` are required; `cancel()`, `makeIndependentReader()` and `discImageProbeEnabled` have defaults that unlock teardown-unblocking, embedded subtitles plus scrub stills, and ISO/UDF probing respectively. Calls arrive on the engine's demux thread, each inside an autorelease pool the engine opens, so a reader built on `FileHandle` or `NSData` does not strand one autoreleased object per read for the length of a session. Full contract in [formats.md](formats.md).
 
 ## Transport
 
@@ -217,7 +217,7 @@ Time lives on `player.clock`, a separate `ObservableObject`, so ~10 Hz ticks nev
 | `clock.$sourceTime` | source PTS of the displayed frame; render subtitle overlays against this |
 | `clock.$progress` | `currentTime / duration` |
 | `clock.$bufferedPosition` | source-axis position buffered ahead |
-| `clock.$liveEdgeTime`, `clock.$seekableLiveRange`, `clock.$behindLiveSeconds`, `clock.$isAtLiveEdge` | live-window surfaces |
+| `clock.$liveEdgeTime`, `clock.$seekableLiveRange`, `clock.$behindLiveSeconds`, `clock.$isAtLiveEdge` | live-window surfaces. `seekableLiveRange` is the intersection of the DVR window (policy) and what the segment cache actually holds and can play forward from (fact), so it is honest to scale a rewind strip on and `seek(to:)` clamps to the same floor (AE#441). The two diverge for the whole first `dvrWindowSeconds` of a session and again whenever retention evicts faster than the window slides. Software live sessions have no such cache and keep the arithmetic bound. |
 | `player.currentTime`, `sourceTime`, `progress`, `bufferedPosition`, `liveEdgeTime`, `seekableLiveRange`, `behindLiveSeconds`, `isAtLiveEdge` | non-published mirrors of the same values for one-shot reads |
 | `$duration` | seconds; a `LoadOptions.declaredDurationSeconds` outranks the container's |
 
@@ -227,11 +227,11 @@ Time lives on `player.clock`, a separate `ObservableObject`, so ~10 Hz ticks nev
 | --- | --- |
 | `$state` | `.idle`, `.loading`, `.playing`, `.paused`, `.seeking`, `.ended`, `.error(String)`. |
 | `$errorInfo` | `PlaybackErrorInfo?`, the machine-readable half of `.error`: a `PlaybackErrorKind` token, plus the underlying `NSError` domain and code where one is involved. Non-nil exactly while `state` is `.error`, assigned before it. Classify on this, never on the message. |
-| `$playbackPhase` | The derived one-source-of-truth status: adds `.rebuffering` and `.stalled(reconnecting:)`. Prefer it over stitching `state` + `isBuffering` + `isSeeking`, and over matching log text. Precedence, highest first: `error > ended > idle > loading > stalled > seeking > rebuffering > playing/paused` - a source that stopped delivering stays visible while a seek is in flight, because no seek can land over it and `isSeeking` / `seekEvents` still carry the seek (#410). `.stalled(reconnecting: true)` is a reader that is retrying, `false` a reader whose ladder is spent and whose recovery has passed to the producer's reopen; both mean the source is down. `.rebuffering` is published on the AVPlayer-backed paths: the native loopback session, direct remote HLS, and the bare-AVPlayer audio host (a starved progressive stream, once the item has played), where `.stalled` cannot occur because there is no reader. The FFmpeg-backed hosts (software video, FFmpeg audio) have no AVPlayer to wait, so a starving source reads as `.stalled` there instead. |
+| `$playbackPhase` | The derived one-source-of-truth status, and **the only one of these that tracks motion**: `state` is transport INTENT and turns `.playing` the moment the engine has called `play()`, which on a live join can be seconds before the rate rolls (AE#440). Until the transport has moved once in a load, the phase stays `.loading`, and it turns `.playing` on the roll itself. Adds `.rebuffering` and `.stalled(reconnecting:)`. Prefer it over stitching `state` + `isBuffering` + `isSeeking`, and over matching log text. Precedence, highest first: `error > ended > idle > loading > stalled > seeking > rebuffering > playing/paused` - a source that stopped delivering stays visible while a seek is in flight, because no seek can land over it and `isSeeking` / `seekEvents` still carry the seek (#410). `.stalled(reconnecting: true)` is a reader that is retrying, `false` a reader whose ladder is spent and whose recovery has passed to the producer's reopen; both mean the source is down. `.rebuffering` is published on the AVPlayer-backed paths: the native loopback session, direct remote HLS, and the bare-AVPlayer audio host (a starved progressive stream, once the item has played), where `.stalled` cannot occur because there is no reader. The FFmpeg-backed hosts (software video, FFmpeg audio) have no AVPlayer to wait, so a starving source reads as `.stalled` there instead. |
 | `$isBuffering`, `$isSeeking`, `$seekTarget` | The raw axes `playbackPhase` folds. |
 | `seekEvents` | `AnyPublisher<SeekEvent, Never>`: `.began`, `.landed(renderedTime:)`, `.stalled`, `.superseded`, `.rejected(SeekEvent.Rejection)`, each with its `target`, an `id` that spans the seek, and a `SeekEvent.Origin` (`.programmatic`, `.nativeScrub`, `.deferred`; a deferred seek is one the session could not take yet, which is where the engine publishes an optimistic `currentTime` for a position nothing has reached). Use it where the falling edge of `$isSeeking` matters: a level cannot say whether a seek landed, gave up, or was superseded, and a `.stalled` seek can still land later under the same id. |
 | `$isSessionReady` | The session is ready in the AVFoundation sense. Not the edge a black cover comes off on. |
-| `$hasFirstFrameReadyForDisplay` | The picture for **this** load is up. Latched for the load, cleared at the next `load()` / `stop()`. Audio-only sessions never arm it. On an external screen (`isExternalPlaybackActive`) the local layer never reaches readiness, so the item's readiness is the honest edge and the flag latches there (#315). |
+| `$hasFirstFrameReadyForDisplay` | The picture for **this** load is up. A picture, not motion: a live join presents its first frame and can then hold it bit-static for seconds while AVPlayer decides whether to start (AE#440), so a host dropping a spinner here drops it onto a frozen frame. Use `$playbackPhase` for "it is moving". Latched for the load, cleared at the next `load()` / `stop()`. Audio-only sessions never arm it. On an external screen (`isExternalPlaybackActive`) the local layer never reaches readiness, so the item's readiness is the honest edge and the flag latches there (#315). |
 | `$startupProgress` | `StartupProgress?` for a determinate loading bar. |
 | `$videoRoute` | `VideoRoute`: which pipeline is actually serving, one of `.none`, `.remoteBypass`, `.loopback`, `.software`, `.audio`. `LoadOptions.nativeRemoteHLS` is only the request; the carriage watchdog, the remembered verdict and the HLS reroutes move a session between routes, mid-session too. Branch on this, above all for who draws subtitles. |
 | `$videoFormat` | The format being presented: `.sdr`, `.hdr10`, `.hdr10Plus`, `.dolbyVision`, `.hlg`. |
@@ -323,6 +323,82 @@ cadence and the holdback follows it down, so the win belongs to the source GOP r
 `TARGETDURATION` can never fall below `ceil(max EXTINF)`, and a long-GOP source therefore keeps most of
 its runway under either profile.
 
+### The tail after the first serve, and which signal survives it
+
+A serve is not motion. Past it AVPlayer can present the first frame, publish
+`waitingToPlayAtSpecifiedRate` with `AVPlayerWaitingToMinimizeStallsReason`, and hold that frame
+perfectly still while it decides whether the cushion it has will sustain playback. A host measured 1.5 to
+2.8 s of bit-static picture there on 9 of 11 consecutive tunes on an Apple TV 4K, confirmed against an
+HDMI capture, with the engine's clock advancing throughout (AE#440). Nothing on the item shortens it:
+`preferredForwardBufferDuration` measured inert, because the wait is a rate evaluation and not a buffer
+target. It does not reproduce on a macOS loopback harness in any window geometry, so treat it as a policy
+of the player on the device rather than as something the served playlist can be shaped out of.
+
+Two consequences for a host.
+
+**Key chrome on `$playbackPhase`, not on `state` or `$hasFirstFrameReadyForDisplay`.** Both of those fire
+before the rate rolls, and honestly so: one is intent and the other is a picture. `playbackPhase` is
+`.loading` for the whole hold and turns `.playing` on the roll.
+
+**`liveJoinStartsImmediately` cuts the hold short**, once per load, on a live session, over a buffer
+AVPlayer reports as non-empty and that carries at least 1.5 s ahead of the playhead. It is the other half
+of the trade `.fastZap` already prices: playback begins on a thinner cushion, so a source that hiccups
+just after the join rebuffers where it would otherwise have started later and played through. Every later
+hold in the session keeps AVPlayer's own policy, so a mid-stream rebuffer is untouched.
+
+**It is on by default since 6.55.0**, on a device A/B rather than an argument. Two runs of ten channel
+changes on the reported stack, control then lever:
+
+| | control | lever |
+|---|---|---|
+| press to moving picture, warm | 6.4 / 6.5 / 7.2 s | 4.3 / 4.8 / 5.1 / 5.6 s |
+| press to first PICTURE | 3.4-3.9 s | 3.4-3.9 s |
+| stalls / dropped frames | 0 / 0 | 0 / 0 |
+| cold joins | ~6.5 s | ~6.5 s |
+
+First picture is unchanged, so what the lever removes is exactly the frozen tail and nothing else, and
+the cold case is untouched because the guards keep it out of a starved join. Set it `false` to keep
+AVPlayer's own policy for the join.
+
+**Why a depth and not just the empty flag.** `isPlaybackBufferEmpty` is the precondition `AVPlayer.h`
+documents, not a measure of safety: one served fragment reads `false` exactly as a four-second cushion
+does. Sampling the buffer across every hold in the control run above read non-empty with **3.7 to 4.9 s**
+ahead of the playhead for the hold's whole duration, which says the hold on that stack is always AVPlayer
+waiting on its own rate estimate and never starvation at the edge. That is why cutting it short cost
+nothing there, and it is also why the guard reads the depth: behind the same `false`, a genuinely starved
+join holds a fraction of a second, and starting there would trade a still picture for an immediate stall.
+The depth is the contiguous span ahead of the playhead, so an island past a gap does not count. When the
+floor is not met the engine says so once per load (`leaving the stall-avoidance wait alone (buffer ahead
+...s, ...)`), which is what separates the two mechanisms in a report after the fact.
+
+### The rewind depth a live session really has
+
+`seekableLiveRange` used to be `max(0, edgeTime - dvrWindowSeconds) ... edgeTime`, pure arithmetic that
+never asked the cache. Two regimes where that over-promises, both measured on the loopback harness:
+
+- **The session's own start.** A session that joins a source already 181 s into its timeline advertised a
+  floor of 0.00 for its whole run; a seek to 0.20 landed at 181.66, the first position ever written. The
+  over-promise is exactly the join offset, so it is small on a source whose timeline starts with the
+  session and large on one that does not.
+- **Retention shallower than the window.** With `dvrWindowSeconds: 30` on 1 s segments the cache kept
+  24 s, and the advertised bound claimed 30.
+
+The bound is now the intersection of the two, and `seek(to:)` clamps to it, so a target the range accepts
+is a target the seek reaches. The floor is a backward-contiguous walk from the newest resident segment
+rather than the cache's lowest index: a minimum index is not proof of coverage, and a rewind advertised
+below an interior hole cannot play forward.
+
+Resuming a session that has fallen behind, `play()` recovers a playhead that no longer exists: it snaps a
+live-only source more than 45 s back to the edge, and lands a DVR session whose window has slid past the
+playhead just above the retained floor. Both are recoveries, not opinions about where a viewer should be,
+and both are silent. A host with live-pause semantics of its own (a long pause that re-tunes, say) sets
+`clampsLiveResumeToWindow: false`, after which `play()` moves nothing and `seekToLiveEdge()` performs the
+same recovery on request. The engine keeps reporting; the host decides.
+
+For "where did this seek actually land", the honest signal is `SeekEvent.landed(renderedTime:)` on
+`$seekEvents`. `await seek(to:)` returns no position, so a harness that records its own requested target
+reports an intention rather than an outcome.
+
 ## Picture, layers and PiP
 
 | Symbol | Notes |
@@ -379,6 +455,8 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP so an IPTV join costs seconds instead of a full holdback. |
+| `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
+| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep. The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto derives eligibility from observed upstream cadence, which is what keeps a bursty relay off a `-15410` loop. |
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Pair with `isLive: true`. |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |
@@ -406,7 +484,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `shortFirstSegmentSeconds` | nil | Short first-segment startup: cut seg0 at the first keyframe at or after this many seconds so AVPlayer gets a small first segment faster on slow sources; later segments keep the normal `targetDuration` stride. nil = normal 4 s first segment. Only affects keyframe-aligned plans; must be ≥ `minSegmentDurationSeconds` (1.0). |
 | `sequentialOrigin` | false | Declare an origin that fabricates range answers: one long-lived unranged GET, no ranged probes, non-seekable pb. **Seeking is unavailable**; re-request the archive at a shifted start instead. |
 | `declaredDurationSeconds` | nil | Trusted duration, overriding the container's. Required alongside `sequentialOrigin` on VOD, where the tail read is gone. |
-| `maxConcurrentSourceRequests` | nil | Most requests the reader may have open against this origin at once, across every path it fetches on (pump ranges, detour blocks, size probes, tail prefetch, subtitle side reader). nil counts without capping and lowers the ceiling on its own after a 429/503/509. Set it when the provider states a limit; `1` also switches off the speculative parallel paths, which exist only to overlap with the pump. Counts **requests**, not TCP connections, because over HTTP/2 a session multiplexes every request onto one connection while the origin still counts each one (AE#377). |
+| `maxConcurrentSourceRequests` | nil | Most requests the reader may have open against this origin at once, across every path it fetches on (pump ranges, detour blocks, size probes, tail prefetch, subtitle side reader). nil counts without capping and lowers the ceiling on its own after a 429/503/509. Set it when the provider states a limit; `1` also switches off the speculative parallel paths, which exist only to overlap with the pump. Counts **requests**, not TCP connections, because over HTTP/2 a session multiplexes every request onto one connection while the origin still counts each one (AE#377). It is also the only ceiling: several engines playing from one origin are bounded by this value and by what the origin refuses, not by a transport pool underneath it (AE#450). |
 | `autoplay` | true | False mounts paused: the load skips the terminal `play()` and settles at `.paused` for a host that resumes later. |
 
 ## Value types
@@ -435,9 +513,9 @@ All flags default to safe values; the table is the full set. Depth for the media
 
 Public for the CLI, the test suite, or a diagnostic overlay, and outside the shape this reference documents. They stay source-compatible under semver like everything else, but nothing here should carry playback logic:
 
-- **Test hooks**: `setForceSoftwarePathForTesting`, `setSourceThrottleKbpsForTesting`, `setSoftwareBackgroundAudioOnlyForTesting`, `softwareVideoFramesEnqueuedForTesting`, `setLargeAllocationCensusEnabled`.
+- **Test hooks**: `setForceSoftwarePathForTesting`, `setSourceThrottleKbpsForTesting`, `setSoftwareBackgroundAudioOnlyForTesting`, `softwareVideoFramesEnqueuedForTesting`, `setLargeAllocationCensusEnabled`, `forceStalledConsumerReloadForTesting`.
 - **`playbackBackend`**: the internal rendering backend, exposed read-only for overlays. Hosts must not branch on it; `videoRoute` is the surface that answers the same question honestly.
 - **`HLSVideoEngine`** and its `DiagnosticStats`: the loopback session's own machinery, public because `aetherctl` drives it directly.
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
-- **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `companionAudioReader`): fixture and diagnostic reads.
+- **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.

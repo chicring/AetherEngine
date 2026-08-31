@@ -42,16 +42,48 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
+    /// #450: connections the BOUNDED pool may hold to one host. A throttle, and it is allowed to be
+    /// one: every request on that pool ends (a 4 MB detour block, a size probe, the tail prefetch),
+    /// so a request that waits here waits for one that is finishing.
+    static let boundedConnectionsPerHost = 2
+
+    /// #450: connections the LONG-LIVED pool may hold to one host. Deliberately above any plausible
+    /// reader count rather than a limit, because the same number that throttles the bounded pool
+    /// deadlocks this one. See `makeSessionConfig`.
+    static let longLivedConnectionsPerHost = 64
+
     /// Session config factory. Short-lived probes/chunks get a 60s resource timeout;
     /// long-lived persistent/streaming connections omit it (fires mid-stream, NSURLError
     /// -1001; stall detection is handled by `connStallTimeout`). `urlCache = nil` avoids
     /// the "N URLCaches racing async invalidation" leak (reverted in fef8ef4).
-    private static func makeSessionConfig(longLived: Bool = false) -> URLSessionConfiguration {
+    ///
+    /// #450: the two pools carry different requests, so they carry different cap policies.
+    ///
+    /// `persistentSession` is a `static let`, so its cap is not a per-reader allowance, it is the
+    /// whole PROCESS's allowance to one origin, shared by every reader in it: the pump, the
+    /// subtitle side reader, the forward prefetcher, and one more pump per playback surface. Its
+    /// requests are open-ended by design, a live pump holding its connection for the whole session,
+    /// so the request that arrives on top of the cap is not slowed, it is parked behind connections
+    /// that are not going to end. URLSession parks it with no callback, no error and no metrics, so
+    /// the wait is not even observable as a wait: `awaitFirstPersistentData` spends its full 15 s
+    /// and the load reports a source that would not open, for a queue the engine built itself
+    /// (measured, reporter of #450: four live tiles on one origin, tiles 3 and 4 zero bytes, while
+    /// three concurrent `curl` pulls of the same endpoints flowed at full rate).
+    ///
+    /// What the engine asks of one origin is bounded by `OriginRequestBudget` (#377) instead. That
+    /// one counts requests rather than connections, which is what an origin meters and the only
+    /// thing that means anything over h2, it waits with a budget, it says that it waited, and it
+    /// lowers itself when the origin answers 429/503/509. A second ceiling underneath it, silent
+    /// and unyielding, made the documented contract of `LoadOptions.maxConcurrentSourceRequests ==
+    /// nil` ("counts but does not cap") false from the third concurrent long-lived read on. A
+    /// declared ceiling is a lie for as long as a lower one is silent.
+    static func makeSessionConfig(longLived: Bool = false) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         if !longLived {
             config.timeoutIntervalForResource = 60
         }
-        config.httpMaximumConnectionsPerHost = 2
+        config.httpMaximumConnectionsPerHost =
+            longLived ? longLivedConnectionsPerHost : boundedConnectionsPerHost
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         // No URLCache instance, kills the in-memory cache that the
         // long-lived-session fix from fef8ef4 was working around.
@@ -490,6 +522,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// 避免被假唤醒/微数据掩盖（实测 42s 卡顿只判出 3.5s）。健康连接窗口短暂不可用即恢复，
     /// 1s 阈值误判风险低。
     private static let fastStallTimeout: TimeInterval = 1.0
+    /// #450: fraction of the stall threshold at which a generation that has seen no first byte is
+    /// REPORTED. Derived from the threshold rather than set beside it so the invariant holds at
+    /// every value of the threshold, the shortened ones tests run with included: the witness speaks
+    /// before the threshold acts.
+    private static let firstByteWitnessFraction = 0.25
+    /// Ceiling on that, so a long threshold cannot push the line past the arcs that give up on a
+    /// source first. `awaitFirstPersistentData` allows an open 15 s, and the shipped threshold is
+    /// 20 s: the one outcome the stall witness could never describe was the one where the first
+    /// byte never comes, because the load was already over when it fired.
+    private static let firstByteWitnessMaxSeconds: TimeInterval = 5
     // A reconnect that delivers at least this much counts as progress; resets streak.
     private static let minReconnectProgress: Int64 = 512 * 1024
     // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
@@ -810,6 +852,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// load. It is not a `LoadOptions` field either: #272 measured that a shorter threshold is worse
     /// under CPU starvation, and that conclusion is unchanged.
     private let connStallTimeout: TimeInterval
+    /// #450: when this reader reports a generation that is on the link with nothing delivered.
+    private var firstByteWitnessDelay: TimeInterval {
+        min(Self.firstByteWitnessMaxSeconds, connStallTimeout * Self.firstByteWitnessFraction)
+    }
     /// High-water mark this reader ends the connection at. Mode-dependent (live absorbs a
     /// join burst the VOD value was never sized for — see the backpressure doc block) and
     /// an init parameter for the same reason `connStallTimeout` is one: a process-wide
@@ -2623,6 +2669,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         task.resume()
         // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
         armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
+        armFirstByteWitness(generation: generation, originURL: requestURLForBudget)
         // #240: not DEBUG-only any more, and it names its reader. This is the line a field report
         // needs to answer "who is on the link": with bounded ranges every 32 MiB refill starts a
         // generation, so an unlabelled sequence of them reads like several concurrent connections
@@ -2637,6 +2684,47 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// #309: timer queue for the delivery-gap watchdog. Shared and serial: the work is one
     /// timestamp comparison per armed generation and never touches the network.
     private static let deliveryGapQueue = DispatchQueue(label: "aether.avio.delivery-gap")
+
+    /// #450: report a generation that has been on the link for `firstByteWitnessDelay` with no
+    /// first byte. It REPORTS, it never acts: ending a connection stays with `checkDeliveryGap` and
+    /// the read loop, so an early line cannot change when anything reconnects.
+    ///
+    /// The line carries the two facts that separate the causes, because they pick different fixes.
+    /// A request parked in the transport behind this process's own long-lived connections looks,
+    /// from every vantage point downstream, exactly like an origin sitting on the request: the task
+    /// is resumed, no callback comes, no error comes, and no metrics come until it ends. `inflight`
+    /// is what this engine has open against the origin, the pool cap is what the transport will let
+    /// on the link, and a reporter who can read both off one line does not have to run curl to find
+    /// out which side is quiet.
+    private func armFirstByteWitness(generation: Int, originURL: URL) {
+        Self.deliveryGapQueue.asyncAfter(deadline: .now() + firstByteWitnessDelay) { [weak self] in
+            self?.reportMissingFirstByte(generation: generation, originURL: originURL)
+        }
+    }
+
+    private func reportMissingFirstByte(generation: Int, originURL: URL) {
+        if isClosed { return }
+        winCond.lock()
+        // Nothing to report: a newer generation owns the link, this one already ended, no transfer
+        // is installed, or the first byte landed while this closure was queued.
+        guard generation == connGeneration, !connEnded, activeTask != nil, !connFirstDataSeen else {
+            winCond.unlock()
+            return
+        }
+        let waited = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds)
+            / 1_000_000_000
+        let offset = connRequestedOffset
+        winCond.unlock()
+        // Outside winCond: the budget takes its own lock, and no lock of this reader is held across
+        // another object's.
+        let inflight = OriginRequestBudget.shared.snapshot(for: originURL)?.inflight
+        EngineLog.emit(
+            "[AVIOReader] \(label) gen=\(generation) no first byte after "
+            + "\(String(format: "%.1f", waited))s at offset \(offset); "
+            + (inflight.map { "\($0) request(s) open to this origin" } ?? "origin not in the budget's books")
+            + ", transport pool allows \(Self.longLivedConnectionsPerHost) connections per host",
+            category: .demux)
+    }
 
     /// #309: schedule the delivery-gap check for `generation`. One pending closure at a time per
     /// generation: it either ends the connection or re-arms itself for the remaining gap, so a

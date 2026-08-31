@@ -713,11 +713,12 @@ extension HLSVideoEngine {
                 liveReopenOutputEndSeconds: outputEnd
             )
             newProd.firstSegmentDiscontinuous = true
-            newProd.onVideoShiftKnown = { [weak self] shiftPts, _ in
+            newProd.onVideoShiftKnown = { [weak self] shiftPts, _, _ in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd
             restartLock.unlock()
+            retireProducer(failed)   // AE#443: the session's totals outlive the producer that held them
             newProd.start()
             EngineLog.emit(
                 "[HLSVideoEngine] live producer rebuilt in place: continuing at seg\(nextIndex) "
@@ -1005,7 +1006,7 @@ extension HLSVideoEngine {
             )
             // Fresh connection joins the broadcast at "now"; source clock jumps, so the seam carries #EXT-X-DISCONTINUITY. Shift handoff deferred to seam to avoid jumping the host clock while pre-loss content is on screen.
             newProd.firstSegmentDiscontinuous = true
-            newProd.onVideoShiftKnown = { [weak self] shiftPts, _ in
+            newProd.onVideoShiftKnown = { [weak self] shiftPts, _, _ in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd
@@ -1014,6 +1015,11 @@ extension HLSVideoEngine {
             let oldReader = reopenCustomReader
             if freshReader != nil { reopenCustomReader = freshReader }
             restartLock.unlock()
+            // AE#443: the swap is final only here; the catch below puts `oldDem` back, and folding it
+            // there would count the same reader's bytes twice. A reopen replaces the reader and the
+            // producer, not the session's totals.
+            retireProducer(failedProducer)
+            retireDemuxer(oldDem)
             oldDem?.close()
             if freshReader != nil { oldReader?.close() }
             newProd.start()

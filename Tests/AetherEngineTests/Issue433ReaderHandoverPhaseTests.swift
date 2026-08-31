@@ -81,6 +81,8 @@ struct Issue433ReaderHandoverPhaseTests {
     func replacementReaderClearsTheStall() throws {
         let engine = try AetherEngine()
         engine.state = .playing
+        // AE#440: the session in this report was playing a picture, so its transport had rolled.
+        engine.hasTransportRolled = true
 
         var dyingReaderGate = NetworkPhaseGate()
         if dyingReaderGate.shouldEmit(.reconnecting) { engine.setReaderNetworkPhase(.reconnecting) }

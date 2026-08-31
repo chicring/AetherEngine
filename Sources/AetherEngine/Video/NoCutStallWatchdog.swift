@@ -51,6 +51,10 @@ final class NoCutStallWatchdog: @unchecked Sendable {
 
     enum Decision: Equatable {
         case holdForSlowDelivery(Window)
+        /// AE#446 round 3: a starved source whose closed window is still feeding the consumer. The
+        /// exit would tear down the read that is the only thing able to see the source come back, and
+        /// a session that is still delivering pictures with it.
+        case holdForOutageRunway(Window)
         case exitForRetune(Window)
     }
 
@@ -146,7 +150,11 @@ final class NoCutStallWatchdog: @unchecked Sendable {
 
     /// One evaluation. Returns nil while there is nothing to say: not armed, parked, already
     /// latched, or simply healthy.
-    func evaluate(now: Date) -> Decision? {
+    ///
+    /// `servingOutageRunway` is read by the caller at verdict time rather than tracked here: it is a
+    /// fact about the CONSUMER (how far into a closed window it has walked), which this watchdog
+    /// knows nothing about and which changes while the window is being judged.
+    func evaluate(now: Date, servingOutageRunway: Bool = false) -> Decision? {
         lock.lock()
         defer { lock.unlock() }
         guard !exitLatched, reading, let finalizeAt = lastFinalizeAt else { return nil }
@@ -161,7 +169,8 @@ final class NoCutStallWatchdog: @unchecked Sendable {
             stalledFor: stalledFor,
             readRate: readRate,
             videoPtsAdvanceSeconds: ptsAdvance,
-            consecutiveHolds: consecutiveHolds
+            consecutiveHolds: consecutiveHolds,
+            servingOutageRunway: servingOutageRunway
         ) {
         case .keepReading:
             return nil
@@ -171,7 +180,9 @@ final class NoCutStallWatchdog: @unchecked Sendable {
                                     readRate: readRate, ptsAdvance: ptsAdvance)
             holdRearmedAt = now
             resetWindowCounters()
-            return .holdForSlowDelivery(window)
+            // #177's hold is a WEDGE whose PTS is still advancing, so a held window that is not one
+            // can only be the outage deferral: the two never overlap and the line can name which ran.
+            return window.isWedge ? .holdForSlowDelivery(window) : .holdForOutageRunway(window)
         case .exitForRetune:
             exitLatched = true
             return .exitForRetune(makeWindow(stalledFor: stalledFor, progress: progress,

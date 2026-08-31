@@ -27,7 +27,7 @@ struct TeletextPageSwitchRequest {
 /// and optionally activate an embedded subtitle track (`--subs <codec-or-lang>`)
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
-func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
+func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
                     censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, pictureProbe: Bool = false,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
                     teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil,
@@ -50,7 +50,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, declaredDuration: declaredDuration, httpHeaders: httpHeaders)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, declaredDuration: declaredDuration, httpHeaders: httpHeaders)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -59,14 +59,21 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
 
 /// #306: the network half of the 1 Hz snapshot, appended to the transport line. Every field is
 /// omitted where the snapshot has none, so the software path's numbers can be read off a run instead
-/// of inferred from a memprobe half a minute wide. `rx` is the reader's lifetime pull, `ahead` the
-/// part of it the demuxer has not consumed, and `cushion` the decoded video queued past the clock.
+/// of inferred from a memprobe half a minute wide. `ahead` is the fetched part the demuxer has not
+/// consumed, and `cushion` the decoded video queued past the clock.
+///
+/// AE#443: `rx` and `origin` are two different links, and the run that made that worth spelling out was
+/// a reporter reading a fall in `rx` as an origin socket event. `origin` is the session's pull from the
+/// SOURCE, which is the one an origin question is about; `rx` is what the playback consumer pulled over
+/// its own link, which on the native path is the loopback server and therefore says nothing about the
+/// origin at all. Both are session totals now.
 @MainActor
 private func networkTelemetryFragment(_ telemetry: LiveTelemetry?) -> String {
     guard let telemetry else { return "" }
     var out = ""
     if let mbps = telemetry.networkThroughputMbps { out += String(format: " net=%.2fMbps", mbps) }
     if let rx = telemetry.networkTransferredBytes { out += String(format: " rx=%.1fMB", Double(rx) / 1_048_576) }
+    out += String(format: " origin=%.1fMB", Double(telemetry.demuxerBytesFetched) / 1_048_576)
     if let ahead = telemetry.readerWindowAheadBytes { out += String(format: " ahead=%.1fMB", Double(ahead) / 1_048_576) }
     if let cushion = telemetry.displayCushionSeconds { out += String(format: " cushion=%.2fs", cushion) }
     if let fwd = telemetry.forwardBufferSeconds { out += String(format: " fwd=%.1fs", fwd) }
@@ -228,7 +235,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, pictureProbe: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:]) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, pictureProbe: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:]) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -292,12 +299,25 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
         }
         .store(in: &cancellables)
 
+    // AE#440: the 1 Hz tick samples `phase`, which is too coarse to tell a start signal from the
+    // moment the rate actually rolls. Every edge, stamped from the same load clock as FIRSTFRAME,
+    // so the two can be read against each other and against the host's timeControlStatus lines.
+    engine.$playbackPhase
+        .removeDuplicates()
+        .dropFirst()
+        .sink { phase in
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1e9
+            print(String(format: "  PHASE %@ t+%.2fs", String(describing: phase), elapsed))
+        }
+        .store(in: &cancellables)
+
     let options = LoadOptions(
         suppressDisplayCriteria: true,
         httpHeaders: httpHeaders,
         isLive: live,
         dvrWindowSeconds: dvrWindow,
         liveJoinProfile: fastZap ? .fastZap : .standard,
+        liveJoinStartsImmediately: liveStartImmediately,
         nativeRemoteHLS: nativeHLS,
         sequentialOrigin: sequentialOrigin,
         maxConcurrentSourceRequests: maxConcurrentRequests,
@@ -507,6 +527,13 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
                           engine.bufferedPosition,
                           engine.duration)
         line += " rfd=\(engine.hasFirstFrameReadyForDisplay ? "y" : "n")"
+        // AE#441: the live rewind surfaces a host actually scales its strip on. Sampling them needed a
+        // patched copy of this CLI before, which is how an over-promising lower bound stayed unseen.
+        if engine.isLive {
+            line += String(format: " edge=%.2f behind=%.2f", engine.liveEdgeTime, engine.behindLiveSeconds)
+            line += " range=" + (engine.seekableLiveRange.map {
+                String(format: "%.2f...%.2f", $0.lowerBound, $0.upperBound) } ?? "nil")
+        }
         if let monitor, let end = monitor.lastEndPTS {
             // Decoded-audio lead over the master clock (source axis). Near-zero = renderer starving.
             line += String(format: " alead=%.2f abufs=%d", end - engine.sourceTime, monitor.bufferCount)
