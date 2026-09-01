@@ -2,7 +2,7 @@ import Testing
 import Foundation
 import CoreMedia
 import CoreVideo
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #177 issue 3: anamorphic content on the software path rendered at coded dimensions (a thin

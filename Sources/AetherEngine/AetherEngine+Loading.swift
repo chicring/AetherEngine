@@ -1,9 +1,9 @@
 import Foundation
 import AVFoundation
 import Combine
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 extension AetherEngine {
 
@@ -254,24 +254,34 @@ extension AetherEngine {
                     // (measured on the harness: 250 ms of the 485 ms hand-off). Read where the item
                     // actually came up and let the fact decide, so a client that ignored the tag, or
                     // honoured it only to a segment boundary, still gets the correcting seek.
+                    //
+                    // Round 2: ask the playlist what it STATED before reconstructing it. The
+                    // reconstruction subtracts an axis the fresh item has not established yet, and on
+                    // the session's first swap that axis read 0 and the check moved an item that was
+                    // already exactly where the manifest had put it (reported on 6.57.0).
                     if pending.origin == .liveRejoin, let host = self.nativeHost,
-                       let itemTarget = self.liveRejoinItemAxisTarget(pending.seconds),
-                       abs(host.currentTime - itemTarget) <= Self.liveRejoinPlacementSatisfiedSeconds {
-                        EngineLog.emit(
-                            "[AetherEngine] #454 the playlist already placed this item at its own "
-                            + "\(String(format: "%.2f", host.currentTime))s, "
-                            + "\(String(format: "%.3f", abs(host.currentTime - itemTarget)))s from the "
-                            + "\(String(format: "%.2f", itemTarget))s the rejoin asked for; no correcting seek",
-                            category: .engine)
-                        self.acceptCurrentItemForPublishing()
-                        return
-                    }
-                    if pending.origin == .liveRejoin, let host = self.nativeHost {
+                       let resolved = Self.liveRejoinPlacementTarget(
+                           served: self.liveRejoinPlacementGeneration == host.itemGeneration
+                               ? self.nativeVideoSession?.servedLiveRejoinPlacement?.timeOffset : nil,
+                           reconstructed: self.liveRejoinItemAxisTarget(pending.seconds)) {
+                        let distance = abs(host.currentTime - resolved.target)
+                        let provenance = resolved.stated ? "the playlist served" : "the rejoin asked for"
+                        if distance <= Self.liveRejoinPlacementSatisfiedSeconds {
+                            EngineLog.emit(
+                                "[AetherEngine] #454 the playlist already placed this item at its own "
+                                + "\(String(format: "%.2f", host.currentTime))s, "
+                                + "\(String(format: "%.3f", distance))s from the "
+                                + "\(String(format: "%.2f", resolved.target))s \(provenance); no correcting seek",
+                                category: .engine)
+                            self.acceptCurrentItemForPublishing()
+                            return
+                        }
                         EngineLog.emit(
                             "[AetherEngine] #454 the fresh item came up at its own "
                             + "\(String(format: "%.2f", host.currentTime))s of "
                             + "\(String(format: "%.2f", host.seekableStart))..\(String(format: "%.2f", host.seekableEnd))s, "
-                            + "not where the rejoin asked for; the placement seek follows",
+                            + "\(String(format: "%.2f", distance))s from the "
+                            + "\(String(format: "%.2f", resolved.target))s \(provenance); the placement seek follows",
                             category: .engine)
                     }
                     Task { @MainActor in
@@ -620,6 +630,7 @@ extension AetherEngine {
         startPosition: Double?,
         audioSourceStreamIndex: Int32? = nil,
         keepDvh1TagWithoutDV: Bool = false,
+        forceDolbyVisionOnNonDVDisplay: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
@@ -679,6 +690,7 @@ extension AetherEngine {
             dvModeAvailable: Self.displayCapabilities.supportsDolbyVision,
             displaySupportsHDR: Self.displayCapabilities.supportsHDR,
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
+            forceDolbyVisionOnNonDVDisplay: forceDolbyVisionOnNonDVDisplay,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
@@ -2050,6 +2062,7 @@ extension AetherEngine {
                         isLive: loadedOptions.isLive, currentTime: resumeAt),
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
+                    forceDolbyVisionOnNonDVDisplay: loadedOptions.forceDolbyVisionOnNonDVDisplay,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
                     audioBridgeMode: loadedOptions.audioBridgeMode,

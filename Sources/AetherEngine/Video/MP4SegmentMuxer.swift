@@ -1,8 +1,8 @@
 import Darwin
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Long-lived fragmented-MP4 muxer for one playback session. ONE AVFormatContext (mp4 muxer,
 /// NOT hls wrapper) with movflags +empty_moov+default_base_moof+frag_custom+delay_moov.
@@ -39,18 +39,33 @@ final class MP4SegmentMuxer {
         let range: AVColorRange
     }
 
+    /// What happens to the source `dvcC` / `dvvC` record on its way into the fMP4 sample entry.
+    ///
+    /// One value, not a set of Bools: the four outcomes exclude each other, and while that was only
+    /// stated in comments a caller could ask for a strip AND a rewrite and get whichever the muxer's
+    /// if-chain reached first.
+    enum DoviConfigPolicy: Sendable, Equatable {
+        /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
+        case keep
+        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P7's base layer and P8.2 (hvc1 + dvcC
+        /// trips VT -12906), and P8.x on a non-DV panel (-11868).
+        case strip
+        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7-on-DV-panel
+        /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
+        case rewriteToProfile81
+        /// Rewrite to P5: `dv_profile=5`, `compat=0`, `el_present=0`. AE#455, opt-in. The bitstream
+        /// stays a P8.1 with an HDR10 base layer; only the container claim changes, which is what
+        /// makes AVPlayer run its own DV composition on a panel that cannot do DV itself.
+        case rewriteToProfile5
+    }
+
     struct VideoConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
         /// Forces fourCC on the output stream codec_tag (e.g. hvc1; hev1 default rejected by AVPlayer).
         let codecTagOverride: String?
-        /// Drop AV_PKT_DATA_DOVI_CONF before avformat_write_header; hvc1+dvcC trips VT -12906.
-        /// Mutually exclusive with `rewriteDoviConfigTo81`.
-        let stripDolbyVisionMetadata: Bool
-        /// Rewrite dvcC to valid P8.1 (dv_profile=8, compat=1, el_present=0) instead of stripping.
-        /// Used for P7-on-DV-panel (paired with per-packet RPU rewrite) and malformed "P8.6"
-        /// (invalid compat id; no packet rewrite needed). Mutually exclusive with `stripDolbyVisionMetadata`.
-        let rewriteDoviConfigTo81: Bool
+        /// What to do with the source Dolby Vision configuration record. See `DoviConfigPolicy`.
+        let doviConfig: DoviConfigPolicy
         /// Optional color-signaling override. See `ColorOverride`.
         let colorOverride: ColorOverride?
         /// Replaces codecpar.extradata after avcodec_parameters_copy. Used when the source hvcC
@@ -62,16 +77,14 @@ final class MP4SegmentMuxer {
             codecpar: UnsafePointer<AVCodecParameters>,
             timeBase: AVRational,
             codecTagOverride: String?,
-            stripDolbyVisionMetadata: Bool = false,
-            rewriteDoviConfigTo81: Bool = false,
+            doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
-            self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
-            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
+            self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
         }
@@ -399,10 +412,15 @@ final class MP4SegmentMuxer {
            let tag = Self.mkTag(fromFourCC: override) {
             videoStream.pointee.codecpar.pointee.codec_tag = tag
         }
-        if video.rewriteDoviConfigTo81 {
-            Self.rewriteDoviConfigToProfile81(videoStream.pointee.codecpar)
-        } else if video.stripDolbyVisionMetadata {
+        switch video.doviConfig {
+        case .keep:
+            break
+        case .strip:
             Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
+        case .rewriteToProfile81:
+            Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 8, blCompatibilityID: 1)
+        case .rewriteToProfile5:
+            Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 5, blCompatibilityID: 0)
         }
         if let co = video.colorOverride {
             videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
@@ -913,11 +931,13 @@ final class MP4SegmentMuxer {
         return String(format: "0x%08x", tag)
     }
 
-    /// Mutate AV_PKT_DATA_DOVI_CONF in-place: dv_profile=8, compat=1 (HDR10), el_present_flag=0.
-    /// Used for P7-on-DV-panel (paired with per-packet RPU conversion) and "P8.6" (invalid compat id only).
-    /// No-op when DOVI side data is absent.
-    private static func rewriteDoviConfigToProfile81(
-        _ codecpar: UnsafeMutablePointer<AVCodecParameters>
+    /// Mutate AV_PKT_DATA_DOVI_CONF in-place to the given profile / base-layer compatibility, always
+    /// clearing `el_present_flag` (every route that rewrites emits a single layer). No-op when DOVI
+    /// side data is absent. Internal, not private, so the rewrite can be asserted on directly.
+    static func rewriteDoviConfig(
+        _ codecpar: UnsafeMutablePointer<AVCodecParameters>,
+        profile: UInt8,
+        blCompatibilityID: UInt8
     ) {
         let count = Int(codecpar.pointee.nb_coded_side_data)
         guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return }
@@ -931,8 +951,8 @@ final class MP4SegmentMuxer {
                 to: AVDOVIDecoderConfigurationRecord.self,
                 capacity: 1
             ) { rec in
-                rec.pointee.dv_profile = 8
-                rec.pointee.dv_bl_signal_compatibility_id = 1
+                rec.pointee.dv_profile = profile
+                rec.pointee.dv_bl_signal_compatibility_id = blCompatibilityID
                 rec.pointee.el_present_flag = 0
             }
             return
@@ -940,7 +960,7 @@ final class MP4SegmentMuxer {
     }
 
     /// Strip AV_PKT_DATA_DOVI_CONF from coded_side_data; hvc1+dvcC trips VT -12906.
-    private static func stripDolbyVisionSideData(
+    static func stripDolbyVisionSideData(
         _ codecpar: UnsafeMutablePointer<AVCodecParameters>
     ) {
         guard codecpar.pointee.nb_coded_side_data > 0,

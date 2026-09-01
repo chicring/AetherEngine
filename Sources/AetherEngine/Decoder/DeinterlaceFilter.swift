@@ -1,6 +1,6 @@
 import Foundation
-import Libavfilter
-import Libavutil
+import AetherLibavfilter
+import AetherLibavutil
 
 /// Deinterlacer selection + cadence for the software-decode path, resolved from `LoadOptions`
 /// at load time and handed to `SoftwareVideoDecoder` before `open`.

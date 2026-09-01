@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 @Suite("VideoRoutingPolicy (#107 interlaced H.264 deinterlace routing)")

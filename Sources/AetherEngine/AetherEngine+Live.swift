@@ -163,6 +163,34 @@ extension AetherEngine {
     @MainActor
     func measureLiveItemAxisOffset() {
         guard isLive, let host = nativeHost else { return }
+        // AE#454 round 2: where the playlist placed this item, it also STATED the axis it placed it
+        // on, and a statement outranks a reconstruction. The measurement below is a difference between
+        // two independently sampled quantities (the producer's resident floor and the item's own
+        // seekable start), so it is only as good as the older of the two samples, it is latched for
+        // the item's whole life on the first tick that produces any number at all, and it cannot tell
+        // "this item has no offset" from "the sample I had did not belong to this item". Reported from
+        // a device on 6.57.0: the session's first swap read an axis of 0 while the item's own playlist
+        // began 6.76 s into the session, which put a correctly placed item through a correcting seek
+        // and left every published number 6.76 s away from the picture.
+        //
+        // Tested BEFORE the per-item latch below, and allowed to overrule it: the serve and the
+        // engine's 100 ms tick are not ordered, so a tick that finds a range in the gap between the
+        // swap and the serve would otherwise latch a measurement the playlist is about to contradict,
+        // and the latch is for the item's whole life.
+        if host.itemGeneration == liveRejoinPlacementGeneration,
+           host.itemGeneration != liveItemAxisStatedGeneration,
+           let stated = nativeVideoSession?.servedLiveRejoinPlacement {
+            liveItemAxisStatedGeneration = host.itemGeneration
+            liveItemAxisOffsetGeneration = host.itemGeneration
+            liveItemAxisOffsetSeconds = Swift.max(0, stated.playlistStartOutputSeconds)
+            EngineLog.emit(
+                "[AetherEngine] #454 the playlist this item loaded begins "
+                + "\(String(format: "%.2f", liveItemAxisOffsetSeconds))s into the session, so that is "
+                + "the axis it came up on; stated by the manifest that placed it rather than measured "
+                + "off the cache afterwards",
+                category: .engine)
+            return
+        }
         guard host.itemGeneration != liveItemAxisOffsetGeneration else { return }
         // AE#454: everything below this line establishes the axis; until it succeeds there is no
         // measurement for THIS item, and the one above it belongs to the item that just left. See
@@ -413,6 +441,24 @@ extension AetherEngine {
     /// is far outside this and still gets the seek. It is a test of whether the placement WORKED, not
     /// a tolerance on where a rejoin may land.
     nonisolated static let liveRejoinPlacementSatisfiedSeconds: Double = 0.5
+
+    /// AE#454 round 2: the item-axis position a rejoin's placement resolves to, and where the number
+    /// came from.
+    ///
+    /// Two ways to name the same content, and only one of them is a statement. The playlist SAID where
+    /// it placed the item, in the units the item counts in, so where that value exists it is the
+    /// answer and the check needs no axis at all. The reconstruction is what the check used to ask
+    /// instead: the session target, minus the seam shift, minus a separately measured axis offset, and
+    /// that last term is exactly the one a fresh item cannot supply yet.
+    ///
+    /// nil when neither is available, which leaves the correcting seek to run as it always did.
+    nonisolated static func liveRejoinPlacementTarget(
+        served: Double?, reconstructed: Double?
+    ) -> (target: Double, stated: Bool)? {
+        if let served { return (served, true) }
+        if let reconstructed { return (reconstructed, false) }
+        return nil
+    }
 
     /// AE#454: the item-axis position a live rejoin target resolves to right now, or nil with nothing
     /// to resolve it against. Same pure landing rule the seek itself uses, so the comparison cannot

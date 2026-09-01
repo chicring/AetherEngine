@@ -1,9 +1,9 @@
 import Foundation
 import CoreGraphics
 import Compression
-import Libavcodec
-import Libavformat
-import Libavutil
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
 
 /// Packet-by-packet decoder for an embedded subtitle stream (SubRip/ASS/SSA/WebVTT/mov_text/PGS/DVB/HDMV).
 /// Owns one AVCodecContext per active track; HLSSegmentProducer feeds packets and bridges results to MainActor.

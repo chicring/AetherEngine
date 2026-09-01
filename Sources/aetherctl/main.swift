@@ -67,8 +67,8 @@ func printUsage() {
 
     Usage:
       aetherctl probe <url>
-      aetherctl serve [--no-dv] [--start-position S] <url>
-      aetherctl validate [--no-dv] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--start-position S] <url>
+      aetherctl validate [--no-dv] [--force-dv] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--start-position S] [--switch-audio <index>[@ms]]
@@ -90,7 +90,7 @@ func printUsage() {
                       --sequential-origin declares a fake-range origin (one unranged
                       GET, no ranged probes) and needs --declared-duration on VOD
                       since the tail estimate is skipped)
-      aetherctl segverify [--from N] [--count K] [--no-dv] [--dump <dir>] <url>
+      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dump <dir>] <url>
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest <file>
@@ -130,6 +130,11 @@ func printUsage() {
                      Mirrors what AetherEngine.loadNative passes on a
                      non-DV TV / on macOS (where displayCapabilities
                      reports supportsDolbyVision=false anyway).
+      --force-dv     AE#455: serve a DV Profile 8.1 source as Profile 5
+                     (dvh1 + dvcC profile=5, CODECS=dvh1.05.LL) so
+                     AVPlayer composes the RPU itself. Only has an
+                     effect together with --no-dv; a display that does
+                     Dolby Vision keeps the P8.1 route.
 
     Flags (serve / seektest):
       --throttle-kbps N
@@ -280,6 +285,7 @@ if first == "segverify" {
     let fromIdx = takeIntFlag("--from", from: &rest) ?? 0
     let count   = takeIntFlag("--count", from: &rest) ?? 12
     let noDV    = takeFlag("--no-dv", from: &rest)
+    let forceDV = takeFlag("--force-dv", from: &rest)
     let dumpDir = takeStringFlag("--dump", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: segverify requires a <url> argument")
@@ -287,7 +293,8 @@ if first == "segverify" {
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "segverify")
-    exit(runSegVerify(url: parseSourceURL(urlArg), from: fromIdx, count: count, dvModeAvailable: !noDV, dumpDir: dumpDir))
+    exit(runSegVerify(url: parseSourceURL(urlArg), from: fromIdx, count: count, dvModeAvailable: !noDV,
+                      forceDVWithoutDisplay: forceDV, dumpDir: dumpDir))
 }
 
 // Rapid-seek burst repro (issue #35).
@@ -650,6 +657,8 @@ if first == "play" {
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {
     var rest = Array(args.dropFirst(2))
     let noDV = takeFlag("--no-dv", from: &rest)
+    // AE#455: opt-in P8.1-as-P5 routing, which only has an effect alongside --no-dv.
+    let forceDV = takeFlag("--force-dv", from: &rest)
     let framesOverride = takeIntFlag("--frames", from: &rest)
     let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1
@@ -709,10 +718,10 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     case "probe":
         exit(runProbe(url: url))
     case "serve":
-        runServe(url: url, dvModeAvailable: dvModeAvailable, nativeSubsIndex: nativeSubsIndex,
-                 startPosition: startPosition)
+        runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
+                 nativeSubsIndex: nativeSubsIndex, startPosition: startPosition)
     case "validate":
-        exit(runValidate(url: url, dvModeAvailable: dvModeAvailable))
+        exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV))
     case "swdecode":
         exit(runSWDecode(url: url, maxPackets: framesOverride ?? 100))
     case "extract":

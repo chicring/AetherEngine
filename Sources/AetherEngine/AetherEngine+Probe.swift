@@ -1,9 +1,9 @@
 import Foundation
 import CoreVideo
 import AVFoundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 extension AetherEngine {
 

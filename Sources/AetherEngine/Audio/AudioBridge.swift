@@ -1,7 +1,7 @@
 import Foundation
-import Libavcodec
-import Libavutil
-import Libswresample
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswresample
 
 /// Transcoding bridge for the HLS-fMP4 pipeline's audio sidecar. Decodes a source stream (TrueHD, DTS, DTS-HD MA,
 /// Vorbis, PCM, MP2) to PCM, resamples, re-encodes in one of two modes, emits packets HLSSegmentProducer writes

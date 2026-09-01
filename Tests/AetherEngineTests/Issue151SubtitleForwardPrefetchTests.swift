@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #151 (rrgomes): on direct-play sources the SubtitlePacketStore's forward frontier ends at the

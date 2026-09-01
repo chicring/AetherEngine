@@ -2,10 +2,10 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswscale
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswscale
 
 /// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
 /// Uses sws_scale (SIMD/NEON-optimized) for YUV→NV12/P010 conversion; required to hit 24fps at 1080p for AV1.

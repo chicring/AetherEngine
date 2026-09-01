@@ -1,7 +1,7 @@
 import XCTest
 import AudioToolbox
 import AVFoundation
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #401: `AudioDecoder` resamples to `av_channel_layout_default(channels)` and then stamps the

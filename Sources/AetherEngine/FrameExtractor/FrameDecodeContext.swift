@@ -1,10 +1,10 @@
 import Foundation
 import CoreGraphics
 import CoreMedia
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswscale
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswscale
 
 /// Isolated, single-threaded FFmpeg decode context for still-image extraction.
 /// Owns its own Demuxer, AVCodecContext (forced software), and SwsContext, separate

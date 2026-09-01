@@ -2,10 +2,10 @@ import Foundation
 import CoreMedia
 import CoreAudio
 import AudioToolbox
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswresample
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswresample
 
 /// FFmpeg software audio decoder: compressed AVPackets -> multichannel interleaved Float32 PCM in CMSampleBuffers
 /// for AVSampleBufferAudioRenderer. Uses libswresample to interleaved Float32 at source rate/channels (up to 7.1)

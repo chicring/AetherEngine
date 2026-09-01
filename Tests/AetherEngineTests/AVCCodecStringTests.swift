@@ -1,6 +1,6 @@
 import Testing
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// The H.264 CODECS string. The branch built it as

@@ -485,6 +485,12 @@ final class NativeAVPlayerHost {
         lastSuppressedStartupFailure = nil
         isReady = false
         seekableEnd = 0
+        // AE#454 round 2: both ends, or the mirror is a mixture. Only the end was reset here, so after
+        // an in-place swap `seekableStart` still carried the RETIRED item's window while `seekableEnd`
+        // already read the fresh item's. Anything reading the pair across a hand-off then measures one
+        // item against the other; the live axis offset is a difference between exactly those two, and
+        // it collapses to 0 on the reading that matters (AE#454 round 2, reported from a device).
+        seekableStart = 0
         // #334: the bypass's ceiling on silence. Started with the mount rather than at readyToPlay,
         // because the session it exists for is exactly the one that never gets there.
         if let budget = contract.readinessDeadline {
@@ -498,8 +504,13 @@ final class NativeAVPlayerHost {
             let end = Self.seekableEnd(from: item.seekableTimeRanges)
             let start = Self.seekableStart(from: item.seekableTimeRanges)
             Task { @MainActor in
-                self?.seekableEnd = end
-                self?.seekableStart = start
+                // AE#454 round 2: a reading belongs to the item it was taken from. The observation is
+                // replaced on the next attach, but a notification already in flight is not, and its
+                // hop to the main actor can land after the swap; the same `sid == sessionID` guard the
+                // end-of-media path has carried since #15.
+                guard let self, self.sessionID == sid else { return }
+                self.seekableEnd = end
+                self.seekableStart = start
             }
         }
 

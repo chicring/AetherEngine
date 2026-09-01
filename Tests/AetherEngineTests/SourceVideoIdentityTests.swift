@@ -1,7 +1,7 @@
 import Testing
 import Foundation
 import CoreMedia
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// The published source identity a stats panel reads: `sourceVideoCodecName` and `sourceContainerFormat`.

@@ -476,6 +476,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// fetching the playlist that carries it, so a seconds value would name a different place by the
     /// time it was served; a segment index does not renumber.
     private var _liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)?
+    /// AE#454 round 2: what the playlist that carried the placement actually STATED, and the axis it
+    /// stated it on. See `noteServedLiveRejoinPlacement`.
+    private var _servedLiveRejoinPlacement: (timeOffset: Double, playlistStartOutputSeconds: Double)?
     private var refreshCounter: Int = 0
     /// EXT-X-MEDIA-SEQUENCE first index; monotonically advancing, stays 0 for VOD.
     private var _liveFirstVisible: Int = 0
@@ -1662,8 +1665,39 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let into = Swift.max(0, seconds - segs[idx].startSeconds)
         stateLock.lock()
         _liveRejoinStart = (idx, into)
+        // A new placement supersedes whatever the last one was served as.
+        _servedLiveRejoinPlacement = nil
         stateLock.unlock()
         return (idx, into)
+    }
+
+    /// AE#454 round 2: record the placement a build actually served, and the axis it served it on.
+    ///
+    /// A live item's zero is the first segment ITS playlist listed, so the playlist that carries the
+    /// placement is also the statement of the axis the item will come up on. Both numbers are known
+    /// here. The engine was rebuilding the second of them instead, as the difference between the
+    /// segment cache's resident floor and the item's own reported seekable start, and a difference
+    /// between two independently sampled quantities is only as good as the older sample: fed the
+    /// range of the item that just left, it collapses to exactly 0 and is then latched for the fresh
+    /// item's whole life (reported from a device on 6.57.0, AE#454 round 2, seam 1 of the session).
+    ///
+    /// First build wins. An item's zero is the FIRST playlist it loaded, and later builds of a
+    /// sliding window state a smaller offset against the very same content.
+    func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard _servedLiveRejoinPlacement == nil else { return }
+        guard firstVisible >= 0, firstVisible < segments.count else { return }
+        _servedLiveRejoinPlacement = (timeOffset, segments[firstVisible].startSeconds)
+    }
+
+    /// AE#454 round 2: the placement the playlist stated, for as long as it describes the item that
+    /// loaded it. Survives `clearLiveRejoinStart`, which retires the ARM: the readiness handler clears
+    /// the arm and then asks this same question about the item that just came up.
+    var servedLiveRejoinPlacement: (timeOffset: Double, playlistStartOutputSeconds: Double)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _servedLiveRejoinPlacement
     }
 
     /// AE#454: the placement is spent once the item that asked for it is running. Left armed, the next

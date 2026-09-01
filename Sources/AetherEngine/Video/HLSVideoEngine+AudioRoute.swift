@@ -1,7 +1,7 @@
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 extension HLSVideoEngine {
 
@@ -133,7 +133,7 @@ extension HLSVideoEngine {
                 codecpar: vcfg.codecpar,
                 timeBase: vcfg.timeBase,
                 codecTagOverride: vcfg.codecTagOverride,
-                stripDolbyVisionMetadata: vcfg.stripDolbyVisionMetadata,
+                doviConfig: vcfg.doviConfig,
                 colorOverride: vcfg.colorOverride,
                 extradataOverride: vcfg.extradataOverride
             )

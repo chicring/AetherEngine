@@ -1,7 +1,7 @@
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Bounds (and optional track override) for `AetherEngine.probeDetectingAtmos`'s bounded EAC3/JOC decode pass.
 ///

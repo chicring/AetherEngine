@@ -1,7 +1,7 @@
 import Testing
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#396: a plain SD MKV with mono MP3 audio failed on the native route at every start position,

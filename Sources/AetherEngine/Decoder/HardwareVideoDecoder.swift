@@ -2,9 +2,9 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// VTDecompressionSession-backed HEVC decoder for the SoftwarePlaybackHost pipeline.
 /// Owns the decoded-frame pool, IOSurface lifetime, and session teardown explicitly

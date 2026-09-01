@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #409 follow-up. The repair settles its verdict by reading ahead and HOLDING what it read, so the

@@ -1,8 +1,8 @@
 import CoreMedia
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Drives one playback session's read-to-mux pipeline via a per-segment
 /// `MP4SegmentMuxer` writing into `SegmentCache`. Forward-only; backward
@@ -37,12 +37,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// force `dvh1` / `hvc1` / `avc1` instead of FFmpeg's defaults
         /// of `hev1` / `h264`, which AVPlayer rejects.
         let codecTagOverride: String?
-        /// Strip the dvcC record (P7 on non-DV panel, P8.2). Mutually exclusive with `rewriteDoviConfigTo81`.
-        let stripDolbyVisionMetadata: Bool
-        /// Per-packet RPU conversion P7 -> 8.1 (HEVC P7 on DV panel). Container dvcC rewrite is separate (`rewriteDoviConfigTo81`).
+        /// What the muxer does with the source dvcC record. See `MP4SegmentMuxer.DoviConfigPolicy`.
+        let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
+        /// Per-packet RPU conversion P7 -> 8.1 (HEVC P7 on DV panel). The container dvcC is a separate
+        /// decision (`doviConfig`); this one rewrites the bitstream.
         let convertP7ToProfile81: Bool
-        /// Rewrite container dvcC to valid P8.1 in init.mp4; true for P7-on-DV-panel and malformed-P8.6-on-DV-panel routes.
-        let rewriteDoviConfigTo81: Bool
         /// Optional color-signaling override forwarded to `MP4SegmentMuxer.ColorOverride`.
         let colorOverride: MP4SegmentMuxer.ColorOverride?
         /// Optional replacement for `codecpar.extradata` before write_header.
@@ -56,9 +55,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecpar: UnsafePointer<AVCodecParameters>,
             timeBase: AVRational,
             codecTagOverride: String?,
-            stripDolbyVisionMetadata: Bool = false,
+            doviConfig: MP4SegmentMuxer.DoviConfigPolicy = .keep,
             convertP7ToProfile81: Bool = false,
-            rewriteDoviConfigTo81: Bool = false,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
             nalFramingOverride: VideoNALFraming? = nil
@@ -66,9 +64,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
-            self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.doviConfig = doviConfig
             self.convertP7ToProfile81 = convertP7ToProfile81
-            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
             self.nalFramingOverride = nalFramingOverride
@@ -1967,8 +1964,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecTagOverride: videoConfig.codecTagOverride,
             // Ad creative carries its own signaling; don't force the program's overrides onto it. A same-PID
             // parameter-set change is still the same program, so it keeps them (isAdCreative false).
-            stripDolbyVisionMetadata: isAdCreative ? false : videoConfig.stripDolbyVisionMetadata,
-            rewriteDoviConfigTo81: isAdCreative ? false : videoConfig.rewriteDoviConfigTo81,
+            doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
             colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
             extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride
         )

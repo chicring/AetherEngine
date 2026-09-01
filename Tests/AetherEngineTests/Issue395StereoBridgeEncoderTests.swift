@@ -1,7 +1,7 @@
 import Testing
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#395: a live MPEG-TS program carrying H.264 + MP2 stereo + AC3 5.1 + a second MP2 stereo played on

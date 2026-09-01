@@ -1,7 +1,7 @@
 import Testing
 import Foundation
-import Libavformat
-import Libavcodec
+import AetherLibavformat
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Fixture-backed tests for the bounded EAC3/JOC decode-detection path (`AetherEngine.detectAtmos` /

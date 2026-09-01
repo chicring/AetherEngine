@@ -12,6 +12,82 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.58.0] - 2026-09-01
+
+### Added
+
+- **`LoadOptions.forceDolbyVisionOnNonDVDisplay` (experimental, default off, AE#455).** On a display
+  with no Dolby Vision of its own, an HEVC Profile 8.1 source is served the way a Profile 5 source is
+  served: `dvh1` sample entry, container `dvcC` rewritten to profile 5 / compatibility 0,
+  `CODECS="dvh1.05.LL"`, no supplemental. AVPlayer then composes the Dolby Vision itself and applies
+  the per-frame RPU to the pixels before they leave the device, where the default route hands the
+  panel the HDR10 base layer and its single static grade. The bitstream is untouched; what changes is
+  the container's claim about it. Profile 8.1 only, ignored on a display that does Dolby Vision, and
+  reachable from `aetherctl serve|validate|segverify --no-dv --force-dv`. Device-verified against
+  Dolby's own test kit, which ships the same graded content as Profile 5 and as 8.1: on an Apple TV
+  4K (tvOS 26.6) at a Samsung HDR10+ panel without Dolby Vision, the 8.1 with the opt-in renders like
+  the genuine P5 and the default route does not, so the composition really does engage rather than
+  the `dvh1` track merely being tone-mapped as PQ. It stays opt-in because that is one panel and one
+  OS version, and a decoder reading the container's profile instead of the RPU would show a green /
+  violet cast over the whole picture.
+
+## [6.57.1] - 2026-08-31
+
+### Fixed
+
+- **A rejoin's axis is stated by the playlist that placed the item, not measured off the cache
+  afterwards (AE#454 round 2).** Retested on a device on 6.57.0: three of four seams read `0.000s`
+  and retired the correcting seek exactly as designed, and the session's FIRST swap seeked an item
+  that was already precisely where the manifest had put it, then reported the place it held while
+  the picture ran 6.76 s ahead of it. The item was blameless, and so was the placement: its first
+  requests were the consumer's own segments and it came up at the served `TIME-OFFSET` to the
+  millisecond. What moved it was the check, and underneath the check, the axis.
+
+  That axis was a DIFFERENCE between two independently sampled quantities, the segment cache's
+  resident floor and the item's own reported seekable start, latched for the item's whole life on
+  the first tick that produced any number at all. Fed the range of the item that just left, whose
+  axis IS the session's, the difference collapses to exactly 0, which is indistinguishable from
+  "this item has no offset". The playlist knew the answer the whole time: it computes the placement
+  offset from the segments it lists, so the same build also states where the item's timeline
+  begins. Both numbers are now recorded when they are served, the readiness check compares against
+  the value the playlist actually stated, and a statement overrules a measurement even when a tick
+  got there first. Measured on the harness across both arms: the stated axis is the same 45.00 s
+  the measurement produced where the measurement was right, and it is fixed before readiness
+  instead of depending on where a 100 ms tick falls.
+
+- **A mirrored seekable range belongs to the item it was read from.** `NativeAVPlayerHost` reset
+  `seekableEnd` on attach and left `seekableStart` carrying the retired item's window, and a KVO
+  notification already in flight could land after the swap. Both ends now reset together, and a
+  reading is dropped unless it belongs to the item under the host. Observed in a harness log as
+  `range=30.0..0.0` under the fresh item's generation.
+
+## [6.57.0] - 2026-08-31
+
+### Changed
+
+- **The FFmpeg frameworks ship under an `Aether` prefix (FFmpegBuild 3.0.0).** Every FFmpeg packaged
+  for Apple platforms declares targets named `Libavcodec`, `Libavformat` and friends, and SwiftPM
+  target names are unique across the whole dependency graph, so an app whose player keeps a second
+  engine (KSPlayer, mpv, MobileVLCKit) could not resolve a graph holding this one at all: `multiple
+  similar targets 'Libavcodec', 'Libavfilter', 'Libavformat' and 3 others appear in package
+  'ffmpegbuild' and 'ffmpegkit'`. `moduleAliases` does not reach it, since it renames Swift source
+  targets rather than binary ones. Behind it sat a second collision on one install name in
+  `App.app/Frameworks/`. Both are name problems, so both are settled by naming: the modules are
+  `AetherLibavcodec` and friends, the install names follow
+  (`@rpath/AetherLibavcodec.framework/AetherLibavcodec`), and the umbrella product is
+  `AetherFFmpegBuild`. Same n8.1.2 binaries as before, and the FFmpeg C API is untouched.
+
+  **Hosts see nothing**: the public API never exposed an FFmpeg type. Only a host that imports
+  `Libav*` itself has a line to change.
+
+### Documentation
+
+- **docs/api.md gains the case a rename cannot cover.** Two dynamic framework sets coexist on their
+  own, because the two-level namespace binds per reference. A static FFmpeg in the same executable
+  still captures `_avcodec_*` for everything linked beside it, so the section now carries the recipe:
+  link the engine into a dynamic framework of the host's own and let its references bind there, with
+  the two commands that show which build actually answered.
+
 ## [6.56.9] - 2026-08-30
 
 ### Added

@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #290: the #177 component gate bounds each SAR component to 256, which catches the pathological

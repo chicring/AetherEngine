@@ -1,8 +1,8 @@
 import Foundation
 import AVFoundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 import os
 
 /// Which subtitle output path a reader / apply / cancel call targets.

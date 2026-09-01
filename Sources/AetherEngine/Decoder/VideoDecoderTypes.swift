@@ -1,8 +1,8 @@
 import Foundation
 import CoreMedia
 import CoreVideo
-import Libavformat
-import Libavcodec
+import AetherLibavformat
+import AetherLibavcodec
 
 /// Decoded frame callback. `hdr10PlusT35` carries HDR10+ dynamic metadata serialised to ITU-T T.35 bytes
 /// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.

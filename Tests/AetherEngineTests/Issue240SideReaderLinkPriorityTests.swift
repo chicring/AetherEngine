@@ -1,7 +1,7 @@
 import Foundation
 import Testing
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #240 (cmcpherson274, custom tvOS host, 48 GB 4K remux over ~90 Mbit/s Wi-Fi): far seeks in a

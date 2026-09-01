@@ -9,10 +9,12 @@ import AetherEngine
 /// ISOLATION (`init.mp4` + that one segment, fresh decoder, no predecessor). `framesDecoded == 0` means
 /// the segment carries no usable IRAP to start from, i.e. it is not independently decodable, which is
 /// exactly what AVPlayer hits on a fresh decode at a mid-stream open-GOP boundary (#92).
-func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool, dumpDir: String? = nil) -> Int32 {
+func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool,
+                  forceDVWithoutDisplay: Bool = false, dumpDir: String? = nil) -> Int32 {
     setvbuf(stdout, nil, _IONBF, 0)   // unbuffered: progressive output survives a long-running run
     print("segverify: starting engine for \(url.absoluteString)")
-    let engine = HLSVideoEngine(url: url, dvModeAvailable: dvModeAvailable)
+    let engine = HLSVideoEngine(url: url, dvModeAvailable: dvModeAvailable,
+                                forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay)
     let playbackURL: URL
     do {
         playbackURL = try engine.start()

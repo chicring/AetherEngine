@@ -76,12 +76,26 @@ ffmpeg -hide_banner -loglevel error -y \
     -tag:v hvc1 \
     "$FIXTURES_DIR/hdr10-hevc.mp4"
 
-# AV1 SDR 1080p
-echo "→ av1.mp4 (AV1 1080p @ 24fps, low CPU preset)"
-ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "testsrc2=size=1920x1080:rate=24" \
-    -t 5 -c:v libaom-av1 -crf 30 -b:v 0 -cpu-used 8 \
-    "$FIXTURES_DIR/av1.mp4"
+# AV1 SDR 1080p. Either AV1 encoder will do, the fixture only has to BE AV1.
+# Homebrew's ffmpeg ships libsvtav1 and, depending on the formula's options, no
+# libaom, and under `set -e` that missing encoder used to abort the whole run and
+# leave the corpus half regenerated.
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " libaom-av1 "; then
+    AV1_ENC=(-c:v libaom-av1 -crf 30 -b:v 0 -cpu-used 8)
+elif ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " libsvtav1 "; then
+    AV1_ENC=(-c:v libsvtav1 -crf 30 -preset 10)
+else
+    AV1_ENC=()
+fi
+if [ ${#AV1_ENC[@]} -gt 0 ]; then
+    echo "→ av1.mp4 (AV1 1080p @ 24fps, low CPU preset)"
+    ffmpeg -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=size=1920x1080:rate=24" \
+        -t 5 "${AV1_ENC[@]}" \
+        "$FIXTURES_DIR/av1.mp4"
+else
+    echo "→ av1.mp4 SKIPPED (no libaom-av1 and no libsvtav1 in this ffmpeg)"
+fi
 
 # VP9 SDR 1080p
 echo "→ vp9.webm (VP9 1080p @ 24fps)"

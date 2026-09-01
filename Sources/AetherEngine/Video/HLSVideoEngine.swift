@@ -1,8 +1,8 @@
 import AVFoundation
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// HLS-fMP4 loopback session: libavformat `hls` muxer fed by `Demuxer`, fragments
 /// redirected into `SegmentCache` via custom `io_open`/`io_close2`, served to
@@ -46,6 +46,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
     private let keepDvh1TagWithoutDV: Bool
+
+    /// From `LoadOptions.forceDolbyVisionOnNonDVDisplay` (AE#455); default OFF. Read only by the P8.1
+    /// route, and only while `effectiveDvMode` is false.
+    let forceDolbyVisionOnNonDVDisplay: Bool
 
     /// Match Content master toggle at load time; one input to the master-vs-media-playlist routing decision.
     private let matchContentEnabled: Bool
@@ -718,6 +722,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         dvModeAvailable: Bool = true,
         displaySupportsHDR: Bool = true,
         keepDvh1TagWithoutDV: Bool = false,
+        forceDolbyVisionOnNonDVDisplay: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
@@ -754,6 +759,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
+        self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
@@ -1166,9 +1172,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let videoRange = route.videoRange
         let primaryCodecs = route.primaryCodecs
         let supplementalCodecs = route.supplementalCodecs
-        let stripDolbyVisionMetadata = route.stripDolbyVisionMetadata
+        let doviConfig = route.doviConfig
         let convertP7ToProfile81 = route.convertP7ToProfile81
-        let rewriteDoviConfigTo81 = route.rewriteDoviConfigTo81
         let dvVariant = route.dvVariant
 
         let resolution = (Int(codecpar.pointee.width), Int(codecpar.pointee.height))
@@ -1269,8 +1274,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Forcing the canonical IPT-PQ-c2 tuple writes `colr nclx` so AVPlayer sees the PQ signal.
         // Primaries/transfer/matrix are spec-fixed for P5, so this is a repair. Range is preserved if
         // already signaled (full-range P5 is legal, #20); unspecified defaults to limited.
+        // The AE#455 P8.1-as-P5 route needs the same guarantee for the same reason, and lands on the
+        // same tuple: an HDR10 base layer is BT.2020 / PQ / BT.2020-NCL by definition.
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
-        if dvVariant == .profile5 {
+        if dvVariant == .profile5 || doviConfig == .rewriteToProfile5 {
             let sourceRange = codecpar.pointee.color_range
             p5ColorOverride = MP4SegmentMuxer.ColorOverride(
                 primaries: AVCOL_PRI_BT2020,
@@ -1317,9 +1324,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             codecpar: UnsafePointer(ownedVideoParams.ptr),
             timeBase: videoTimeBase,
             codecTagOverride: codecTagOverride,
-            stripDolbyVisionMetadata: stripDolbyVisionMetadata,
+            doviConfig: doviConfig,
             convertP7ToProfile81: convertP7ToProfile81,
-            rewriteDoviConfigTo81: rewriteDoviConfigTo81,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
             nalFramingOverride: measuredVideoNALFraming
@@ -2999,6 +3005,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// AE#454: the placement is spent once the item that asked for it is running.
     func clearLiveRejoinStart() { provider?.clearLiveRejoinStart() }
+
+    /// See `VideoSegmentProvider.servedLiveRejoinPlacement`.
+    var servedLiveRejoinPlacement: (timeOffset: Double, playlistStartOutputSeconds: Double)? {
+        provider?.servedLiveRejoinPlacement
+    }
 
     /// #178: called by the engine when a NEW user seek is dispatched. A recovery re-anchor still
     /// holding the coalescer's authoritative slot belongs to the superseded seek; left in place it

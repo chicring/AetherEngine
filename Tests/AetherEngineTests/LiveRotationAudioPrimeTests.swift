@@ -1,8 +1,8 @@
 import Testing
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// Live rotation wedge: a mid-session muxer rotation (same-PID parameter-set change after a live reconnect

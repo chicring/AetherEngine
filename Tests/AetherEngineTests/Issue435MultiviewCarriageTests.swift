@@ -1,7 +1,7 @@
 import Testing
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#435: a 3D Blu-ray MVC remux carries both eyes inside one H.264 track. Matroska calls that

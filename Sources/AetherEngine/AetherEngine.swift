@@ -5,9 +5,9 @@ import CoreMedia
 import CoreVideo
 import AVFoundation
 import Combine
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 #if canImport(UIKit)
 import UIKit
@@ -686,6 +686,15 @@ public final class AetherEngine: ObservableObject {
     var liveItemAxisOffsetSeconds: Double = 0
     /// The item generation `liveItemAxisOffsetSeconds` was measured for.
     var liveItemAxisOffsetGeneration: Int = -1
+    /// AE#454 round 2: the item generation whose axis the playlist has already stated, so the
+    /// statement is taken once rather than on every tick.
+    var liveItemAxisStatedGeneration: Int = -1
+    /// AE#454 round 2: the item generation a rejoin armed a manifest placement for.
+    ///
+    /// Only that item came up on an axis the playlist stated, so only for that item may the stated
+    /// axis be believed over a measurement. Any later item loaded for an unrelated reason reads the
+    /// producer as before.
+    var liveRejoinPlacementGeneration: Int = -1
     /// AE#454: the item generation the session's published position describes, accepted at readiness.
     /// -1 until the first item of a session is ready, which is what keeps a cold join publishing
     /// exactly as before. See `liveItemPlacementPending`.
@@ -2328,10 +2337,12 @@ public final class AetherEngine: ObservableObject {
         // 37s for 140 to 220ms, thirteen swaps out of thirteen. Armed before the swap so the item's
         // FIRST manifest carries it; the stashed seek stays as the fallback for a client that ignores
         // the tag, and it is the same seek it always was.
+        var didArmPlacement = false
         if isLive, let rejoinPosition, let session = nativeVideoSession {
             let outputSeconds = presentationAxis.itemSeconds(forSourceSeconds: rejoinPosition)
                 ?? (rejoinPosition - playlistShiftSeconds)
             if let armed = session.armLiveRejoinStart(atOutputSeconds: outputSeconds) {
+                didArmPlacement = true
                 EngineLog.emit(
                     "[AetherEngine] #454 placing the fresh item at "
                     + "\(String(format: "%.2f", rejoinPosition))s in its own playlist: segment "
@@ -2352,6 +2363,9 @@ public final class AetherEngine: ObservableObject {
         host.swapItem(url: url,
                       startPosition: isLive ? nil : anchor,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
+        // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
+        // the only one whose axis the playlist will state.
+        if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
         host.play()
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
@@ -3830,6 +3844,7 @@ public final class AetherEngine: ObservableObject {
                     startPosition: startPosition,
                     audioSourceStreamIndex: selectedAudio,
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
+                    forceDolbyVisionOnNonDVDisplay: options.forceDolbyVisionOnNonDVDisplay,
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: panelHDRAfterHandshake,
                     audioBridgeMode: options.audioBridgeMode,
@@ -5646,6 +5661,8 @@ public final class AetherEngine: ObservableObject {
         pendingPreReadySeek = nil
         liveItemAxisOffsetSeconds = 0
         liveItemAxisOffsetGeneration = -1
+        liveRejoinPlacementGeneration = -1
+        liveItemAxisStatedGeneration = -1
         liveAcceptedItemGeneration = -1
 
         // Shut down cache-backed scrub-thumbnail FrameExtractors with the session.

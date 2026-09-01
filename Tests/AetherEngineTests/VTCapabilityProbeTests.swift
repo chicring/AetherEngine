@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// AetherPlayer#2 finding 2: `canHardwareDecode` builds a format description from the avcC / hvcC and

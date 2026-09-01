@@ -156,4 +156,74 @@ struct Issue454RejoinPlacementTests {
         #expect(!AetherEngine.liveItemPlacementPending(
             acceptedGeneration: -1, itemGeneration: 1, axisGeneration: -1, itemReportsRange: false))
     }
+
+    // MARK: - Round 2: the axis belongs to the playlist that stated it
+
+    /// Retested on 6.57.0 (tschuegy): seams 2 to 4 read `0.000s` and retired the correcting seek, and
+    /// seam 1, the session's FIRST swap, read 6.76 s and seeked an item that was already exactly where
+    /// the manifest had put it. The content witness cleared the client: its first requests were the
+    /// consumer's own segments and it came up at the served TIME-OFFSET to the millisecond.
+    ///
+    /// What moved it was the check, and underneath the check, the axis. The axis was reconstructed as
+    /// a DIFFERENCE between two independently sampled quantities, the producer's resident floor and
+    /// the item's own seekable start. Fed the range of the item that just left, whose axis IS the
+    /// session's and whose seekable start is therefore the playlist floor itself, that difference
+    /// collapses to exactly 0, which reads as "this item has no offset" and is latched for life.
+    @Test("the retired item's seekable start collapses the axis to exactly zero")
+    func retiredItemStartCollapsesTheAxis() {
+        // Seam 1 as reported: the producer holds from 6477.26 on the session axis, the session's shift
+        // is 6470.496, and the fresh item's playlist begins 6.76 s into the session.
+        let producerFloorSession = 6477.256
+        let shift = 6470.496
+        // Sampled from the FRESH item, which reports 0.00..60.20: the axis is the 6.76 s the window
+        // had dropped, and every conversion after it lands on the picture.
+        #expect(abs(AetherEngine.liveItemAxisOffset(
+            producerFloorSession: producerFloorSession,
+            itemSeekableStart: 0, shift: shift) - 6.76) < 0.005)
+        // Sampled from the item that just LEFT, whose seekable start is the playlist floor: zero, to
+        // the last decimal, and zero is the number the field log carried for the rest of that item.
+        #expect(AetherEngine.liveItemAxisOffset(
+            producerFloorSession: producerFloorSession,
+            itemSeekableStart: 6.76, shift: shift) == 0)
+    }
+
+    /// So the check asks the playlist instead. It served a TIME-OFFSET in the units the item counts
+    /// in, which is a statement about content, and whether the client carried it out is answerable
+    /// without an axis at all.
+    @Test("the check reads the value the playlist served, not a reconstruction of it")
+    func checkReadsTheServedValue() {
+        let tolerance = AetherEngine.liveRejoinPlacementSatisfiedSeconds
+        // Seam 1: served 37.330, the item came up at 37.33, and the reconstruction through the
+        // collapsed axis claimed 44.09. The served value retires the seek; the reconstruction fired it.
+        let stated = AetherEngine.liveRejoinPlacementTarget(served: 37.330, reconstructed: 44.090)
+        #expect(stated?.stated == true)
+        #expect(abs(37.33 - (stated?.target ?? 0)) <= tolerance)
+        let reconstructed = AetherEngine.liveRejoinPlacementTarget(served: nil, reconstructed: 44.090)
+        #expect(reconstructed?.stated == false)
+        #expect(abs(37.33 - (reconstructed?.target ?? 0)) > tolerance)
+    }
+
+    /// The fallback is the point of keeping the seek, so a client that ignored the tag must still get
+    /// it. Seam 1's own item range says where that client would have come up: the edge, 60.20.
+    @Test("a client that ignored the served placement still gets the correcting seek")
+    func ignoredPlacementStillSeeks() {
+        let resolved = AetherEngine.liveRejoinPlacementTarget(served: 37.330, reconstructed: 44.090)
+        #expect(abs(60.20 - (resolved?.target ?? 0)) > AetherEngine.liveRejoinPlacementSatisfiedSeconds)
+    }
+
+    /// With neither number there is nothing to decide against, and the seek runs as it always did.
+    @Test("no statement and no reconstruction leaves the seek alone")
+    func noTargetLeavesTheSeek() {
+        #expect(AetherEngine.liveRejoinPlacementTarget(served: nil, reconstructed: nil) == nil)
+    }
+
+    /// The two numbers the playlist states are consistent with the place the rejoin asked for, which
+    /// is what makes the statement usable for the axis as well as for the check: the item's zero plus
+    /// the offset it was placed at plus the seam shift IS the held place.
+    @Test("the playlist's own two numbers reconstruct the held place exactly")
+    func statedNumbersReconstructTheHeldPlace() {
+        // Seam 1: the playlist began at output 6.760 and placed the item 37.330 into itself.
+        let playlistStartOutput = 6.760, servedOffset = 37.330, shift = 6470.496
+        #expect(abs((playlistStartOutput + servedOffset + shift) - 6514.586) < 0.005)
+    }
 }

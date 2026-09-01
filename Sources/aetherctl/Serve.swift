@@ -3,8 +3,8 @@ import AetherEngine
 
 // MARK: - serve
 
-func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
-              startPosition: Double? = nil) -> Never {
+func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
+              nativeSubsIndex: Int? = nil, startPosition: Double? = nil) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -15,6 +15,7 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
     }
 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
     print("aetherctl serve: \(url.absoluteString)\(flagSuffix)")
@@ -22,7 +23,8 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
 
     let engine = HLSVideoEngine(
         url: url,
-        dvModeAvailable: dvModeAvailable
+        dvModeAvailable: dvModeAvailable,
+        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay
     )
     // Resume anchor exactly like AetherEngine.loadNative's load(startPosition:) (#99 repro).
     engine.initialStartSeconds = startPosition
@@ -70,7 +72,7 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
 
 // MARK: - validate
 
-func runValidate(url: URL, dvModeAvailable: Bool) -> Int32 {
+func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false) -> Int32 {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -80,13 +82,15 @@ func runValidate(url: URL, dvModeAvailable: Bool) -> Int32 {
         print("[\(timestamp)] \(line)")
     }
 
-    let flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     print("aetherctl validate: \(url.absoluteString)\(flagSuffix)")
     print("")
 
     let engine = HLSVideoEngine(
         url: url,
-        dvModeAvailable: dvModeAvailable
+        dvModeAvailable: dvModeAvailable,
+        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay
     )
     let playbackURL: URL
     do {

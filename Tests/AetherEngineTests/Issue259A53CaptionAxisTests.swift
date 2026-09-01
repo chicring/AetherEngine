@@ -9,7 +9,7 @@
 // this pins the producer path to the same axis.
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Fixtures/ is local-only by design (gitignored; Scripts/fetch-fixtures.sh regenerates the

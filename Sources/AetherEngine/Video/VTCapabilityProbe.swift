@@ -1,8 +1,8 @@
 import Foundation
 import VideoToolbox
 import CoreMedia
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Cached VTIsHardwareDecodeSupported probe after VTRegisterSupplementalVideoDecoderIfAvailable. Cached on first access; registration is idempotent.
 enum VTCapabilityProbe {

@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 /// #151: subtitle-only forward side reader. The producer pump harvests subtitle packets only as
 /// far as its own forward park (#102), so the drainer's 60 s lead window (`subtitleDrainLeadSeconds`)

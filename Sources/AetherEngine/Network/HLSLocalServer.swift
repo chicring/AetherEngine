@@ -108,6 +108,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// every build except the ones between an in-place rejoin swap and the item it placed running.
     var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { get }
 
+    /// AE#454 round 2: tell the provider what this build actually served for that placement, and from
+    /// which first segment, so the item's axis is a statement rather than a later reconstruction.
+    func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int)
+
     /// Upper bound on how long a blocking reload may hold before the 503. Production providers derive
     /// it from the sealed TARGETDURATION (3 x TD, the HOLD-BACK depth) so a fastZap session (TD=2)
     /// times out in 6 s instead of 18 s — a hold that outlives AVPlayer's forward buffer guarantees
@@ -138,6 +142,7 @@ extension HLSSegmentProvider {
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
     var liveTargetSegmentDuration: Double? { nil }
     var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { nil }
+    func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {}
     var liveBlockingReloadEnabled: Bool { true }
     var liveTargetDurationFloorSeconds: Double? { nil }
     func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int {
@@ -1416,6 +1421,10 @@ final class HLSLocalServer: @unchecked Sendable {
                 + "\(String(format: "%.2f", rejoin.secondsIntoSegment))s, \(count - firstVisible) "
                 + "segment(s) listed from seg\(firstVisible)",
                 category: .session)
+            // AE#454 round 2: the same build knows the axis it just placed the item on, which is where
+            // the playlist it served begins. Stating it is the whole fix; measuring it afterwards is
+            // what put a correctly placed item through a correcting seek.
+            provider.noteServedLiveRejoinPlacement(timeOffset: offset, firstVisible: firstVisible)
         }
         if typeIsLive {
             // Refresh counter keeps consecutive polls byte-distinct, which is worth having against any

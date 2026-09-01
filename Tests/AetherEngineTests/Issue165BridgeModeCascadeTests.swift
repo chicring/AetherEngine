@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #165: on an FFmpeg build missing the bridge encoder the configured mode resolves to (e.g. no

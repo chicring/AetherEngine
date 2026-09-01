@@ -1,7 +1,7 @@
 import Foundation
-import Libavcodec
-import Libavformat
-import Libavutil
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
 
 /// #409: some MP4 writers drop the `ctts` table while keeping a bitstream that reorders pictures.
 /// Every sample then reports `PTS == DTS`, so the container hands decode order out as presentation

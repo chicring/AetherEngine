@@ -1,8 +1,8 @@
 import XCTest
-import Libavcodec
-import Libavformat
-import Libavutil
-import Libswresample
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
+import AetherLibswresample
 @testable import AetherEngine
 
 /// AE#396 cost a downstream adopter five fixtures and two devices, and the defect was never in the

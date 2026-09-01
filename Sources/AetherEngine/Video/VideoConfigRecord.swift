@@ -1,7 +1,7 @@
 import Foundation
-import Libavcodec
-import Libavformat
-import Libavutil
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
 
 /// The video config record (`hvcC` / `avcC`) and the framing question that hangs off it (#365).
 ///

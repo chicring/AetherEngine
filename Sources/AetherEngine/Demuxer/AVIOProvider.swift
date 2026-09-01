@@ -1,5 +1,5 @@
 import Foundation
-import Libavformat
+import AetherLibavformat
 
 /// Abstraction over a custom-AVIO byte source attached to `AVFormatContext.pb`.
 /// `AVIOReader` (HTTP) and `CustomIOReaderBridge` (custom `IOReader`) both conform.

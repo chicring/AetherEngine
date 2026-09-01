@@ -1,9 +1,9 @@
 import Foundation
 import AVFAudio
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswresample
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswresample
 
 /// One decoded PCM chunk in the tap's fixed format. `ptsSeconds` is on the axis of the packets
 /// that were fed in (playlist axis when fed from loopback segments, source axis on the SW path).

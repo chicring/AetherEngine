@@ -1,8 +1,8 @@
 import Foundation
-import Libavcodec
-import Libavformat
-import Libavutil
-import Libswresample
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
+import AetherLibswresample
 
 /// Witnesses which FFmpeg actually answers in this process.
 ///

@@ -1,6 +1,6 @@
 import Foundation
-import Libavformat
-import Libavutil
+import AetherLibavformat
+import AetherLibavutil
 
 /// Bridges an `IOReader` into `AVIOContext` via avio_alloc_context callbacks,
 /// mirroring AVIOReader's lifecycle at the same Demuxer seam.

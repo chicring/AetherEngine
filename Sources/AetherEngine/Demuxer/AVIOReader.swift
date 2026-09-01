@@ -1,7 +1,7 @@
 import Foundation
 import os
-import Libavformat
-import Libavutil
+import AetherLibavformat
+import AetherLibavutil
 
 /// Custom AVIO context feeding FFmpeg via URLSession. Three modes:
 /// - **Persistent** (known size + prefetch=true, playback path): single long-lived

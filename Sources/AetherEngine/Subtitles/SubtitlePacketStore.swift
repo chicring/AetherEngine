@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 /// #112 rework: session-lifetime retention of compressed subtitle packets harvested
 /// from the owning host's demux pump (HLSSegmentProducer or SoftwarePlaybackHost).

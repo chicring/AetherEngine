@@ -216,6 +216,22 @@ public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: force dvh1 codec tags + master playlist regardless of display capability. OFF by default: non-DV displays route DV through the media playlist (no master) so AVPlayer auto-tonemaps the HEVC base layer (only path that avoids AVFoundationErrorDomain -11868 on tvOS 26). AetherEngine#4.
     public var keepDvh1TagWithoutDV: Bool
 
+    /// AE#455, EXPERIMENTAL, default OFF. On a display with no Dolby Vision of its own, serve a Profile 8.1
+    /// source the way a Profile 5 source is served: `dvh1` sample entry, container `dvcC` rewritten to
+    /// profile 5 / compatibility 0, `CODECS="dvh1.05.LL"`. AVPlayer then runs its own DV composition and
+    /// applies the per-frame RPU to the pixels before they reach the panel, instead of handing the panel the
+    /// static-metadata HDR10 base layer it hands it today.
+    ///
+    /// The bitstream is untouched: only the container's claim about it changes. What makes that survivable is
+    /// that a P8.1 RPU already carries the mapping out of its HDR10 base layer, so the composer does not need
+    /// the container to tell it what the base layer is. What makes it experimental is that this is not what
+    /// the profile field means, and a tvOS build that reads the base layer's colorimetry from the profile
+    /// rather than the RPU would render IPT out of YCbCr (the green/violet cast of AE#4 and AE#176).
+    ///
+    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 only. Reported by
+    /// DrHurt against a Samsung HDR10 panel.
+    public var forceDolbyVisionOnNonDVDisplay: Bool
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -497,6 +513,7 @@ public struct LoadOptions: Sendable, Equatable {
         suppressDisplayCriteria: Bool = false,
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
+        forceDolbyVisionOnNonDVDisplay: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
@@ -534,6 +551,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.suppressDisplayCriteria = suppressDisplayCriteria
         self.httpHeaders = httpHeaders
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
+        self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioBridgeMode = audioBridgeMode
@@ -983,7 +1001,7 @@ public struct SubtitleImage: @unchecked Sendable {
 // MARK: - Audio Utilities
 
 import CoreAudio
-import Libavutil
+import AetherLibavutil
 
 /// #401: this tag has to describe the channel order the RESAMPLER writes, or the renderer places
 /// the audio somewhere the decoder never put it. It is one buffer with two descriptions of it,

@@ -1,8 +1,8 @@
 import Testing
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#382: E-AC-3 (JOC/Atmos included) from live MPEG-TS never stream-copied into the loopback fMP4. The

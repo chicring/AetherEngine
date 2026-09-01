@@ -1,6 +1,6 @@
 import Foundation
-import Libavfilter
-import Libavutil
+import AetherLibavfilter
+import AetherLibavutil
 
 /// Tone-maps a decoded HDR (PQ/HLG, BT.2020) AVFrame to SDR BT.709 RGBA via a
 /// zscale + tonemap libavfilter graph (one graph per call; extractor is low-frequency).

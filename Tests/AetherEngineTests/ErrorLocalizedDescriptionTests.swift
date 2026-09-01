@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// AE#283: the load path publishes its terminal state as `state = .error("Failed to load: \(error.localizedDescription)")`
