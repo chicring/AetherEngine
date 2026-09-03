@@ -125,6 +125,27 @@ enum VideoRoutingPolicy {
         }
     }
 
+    /// AE#461: the decode path a session ends up on, given what the routing concluded and what the
+    /// host asked for. Pure so the override is unit-testable next to the decisions it overrules.
+    ///
+    /// One-way by construction: `.software` moves a session onto `SoftwarePlaybackHost`, and nothing
+    /// moves one off it. Every route the engine sends to software it sends there because the native
+    /// path cannot serve it (AV1 without hardware decode, VP9, a forward-only source, MVC carriage,
+    /// a format VideoToolbox cannot hardware-decode), so a `.native` preference would buy a black
+    /// screen and does not exist. The host's evidence is only ever "this native session is not
+    /// decoding", never "this software session should be native".
+    ///
+    /// This does NOT suspend the guards that run after the routing decision. A source whose only
+    /// signal is IPT-PQ-c2 still fails the load through `softwarePathCannotRepresent`, and a
+    /// demuxed-audio live source still fails rather than playing silent: an override says which host
+    /// serves the session, not what that host is able to represent.
+    static func usesSoftwarePath(routedSoftware: Bool, preferred: DecodePath) -> Bool {
+        switch preferred {
+        case .automatic: return routedSoftware
+        case .software: return true
+        }
+    }
+
     /// #176 follow-up: DV variants whose only signal is IPT-PQ-c2 (no compatible base layer) cannot be
     /// color-correctly decoded by the software path: libavcodec / dav1d hand the IPT signal on as YCbCr,
     /// which renders with a green/purple cast. That is HEVC P5 and AV1 P10.0 (compat 0). P7 / P8.x /

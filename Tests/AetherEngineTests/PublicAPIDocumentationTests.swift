@@ -58,6 +58,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
     /// reading the docs is better off not meeting this symbol, so it carries its reason.
     private static let notHostAPI: [String: String] = [
         "setForceSoftwarePathForTesting": "test hook, aetherctl live --sw",
+        "setForceAudioPipelineFailureForTesting": "test hook, aetherctl play --drop-audio",
         "setForceMasterPlaylistForTesting": "test hook, aetherctl live --force-master",
         "setSourceThrottleKbpsForTesting": "test hook, aetherctl --throttle-kbps",
         "setSoftwareBackgroundAudioOnlyForTesting": "test hook",

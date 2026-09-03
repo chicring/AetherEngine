@@ -374,6 +374,15 @@ final class NativeAVPlayerHost {
         var readinessDeadline: Double?
     }
 
+    /// AE#446 round 5: a fresh item is about to attach, invoked before anything can fetch a playlist
+    /// for it.
+    ///
+    /// A live item's zero is the first segment ITS playlist listed, so the axis belongs to the item,
+    /// and the engine has to know which item a served playlist describes. Every attach passes through
+    /// `load` (`swapItem` delegates to it), so this hook is the one place that knows, and a swap path
+    /// added later inherits it without anyone remembering to arm at the call site.
+    var onWillAttachItem: (@MainActor () -> Void)?
+
     /// Replace the item under a session that survives the swap, keeping the contract that session was
     /// loaded under (#440 round 5).
     ///
@@ -419,6 +428,9 @@ final class NativeAVPlayerHost {
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
+        // AE#446 round 5: before the item exists, so the first playlist it fetches is recorded against
+        // it rather than against the one it replaces.
+        onWillAttachItem?()
         let loadStart = DispatchTime.now()
         loadStartTime = loadStart
 

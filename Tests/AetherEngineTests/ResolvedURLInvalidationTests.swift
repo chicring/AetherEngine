@@ -12,6 +12,12 @@ import Foundation
 @Suite("Resolved-URL invalidation on hard server errors", .serialized)
 struct ResolvedURLInvalidationTests {
 
+    /// These tests drive real 429 and 509 answers, and each one arms the request-rate pacer's
+    /// wall-clock quiet ladder. Their subject is the resolved-URL verdict, not that ladder, so it is
+    /// pinned away: unpinned it added 44 s to a single test here and blocked a reader thread for all
+    /// of it. `.serialized` above already declares this suite a mutator of process-wide test hooks.
+    init() { OriginRequestBudget.shared.quietPeriodCapForTesting = 0 }
+
     private final class AttemptCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var counts: [Int64: Int] = [:]

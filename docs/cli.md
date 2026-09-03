@@ -56,6 +56,8 @@ open 'http://127.0.0.1:<port>/master.m3u8'   # macOS QuickTime
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
 
+`--audio-delay <ms>` parks the server with the AE#464 audio offset already in its muxer, which is how the DELIVERED offset is measured rather than argued about: fetch the media playlist and walk its segments, then read the first audio and video packet timestamps out of `init.mp4` + a segment with `ffprobe -show_entries packet=stream_index,pts_time`. On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms, `--audio-delay 200` reads +221.8 ms and `--audio-delay -150` reads -128.2 ms, i.e. exactly the offset asked for, with the video timestamp unchanged in every arm.
+
 ## validate
 
 `serve` plus an inline `xcrun mediastreamvalidator` run against the loopback manifest, with the report printed and the engine torn down on completion.
@@ -130,6 +132,14 @@ numbers.
 
 `--teletext-page N` sets `LoadOptions.teletextPage` for the load, and `--switch-teletext-page <page|auto>[@ms]` changes it on a channel that is already playing (default +20 s, deliberately long: the switch has to land after `--subs` has a teletext track showing, else the run measures the load option it could already measure). The engine states what the change reached, `re-decoding N channel(s)` or `no active teletext track to re-decode`, so a page that does nothing is distinguishable from a page that never arrived. Real teletext needs a broadcast transport stream; there is no way to synthesise one with ffmpeg, so the CLI check covers the wiring and the gate, and the decode itself is confirmed against a live DVB channel (#364).
 
+`--audio-delay <ms>` sets `LoadOptions.audioDelaySeconds` for the load, and `--switch-audio-delay <ms>[@ms]` calls `setAudioDelay(_:)` on a session that is already playing (default +20 s, same reason as the teletext switch). The runtime half is the interesting one: at load the offset is just a number handed to a muxer or a renderer, while mid-session it has to reach media the session has already committed to the previous value, and the two routes pay differently for that (a seek on `.software`, the session-preserving reload on `.loopback`). The engine states the delivered offset rather than the requested one: `[AudioOutput] AE#464 audio delay in effect: +200 ms (sample at 3.994s delivered at 4.194s)` on the software path, `[MP4SegmentMuxer] AE#464 cutting seg1+ with audio delay -150 ms` on the loopback one (AE#464).
+
+`--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, and `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
+
+`play --sw` sets `LoadOptions.preferredDecodePath = .software` (#461), the shipping per-session lever, rather than the process-global `setForceSoftwarePathForTesting` it drove before; that hook is still what `live --sw` and `dvr` use, since those harnesses run several sessions and want every one of them on the software host. `--reload-applying decode-path=software` is the same lever applied to a session that is already playing: on the 300 s H.264 fixture the run dispatches `codec=27 → native`, takes the correction at t=9.90 s and comes back `codec=27 → software` at 10.81 s, playing. On a live load the override reaches the same routing decision, which is the case with no alternative, since the #2 capability gate is VOD-only and a live session is never classified at all.
+
+`--drop-audio` forces every audio pipeline to fail, so the AE#462 video-only drop is observable without a source this build has no decoder for: the loopback cascade skips both the stream-copy probe and the bridge, and `SoftwarePlaybackHost` refuses its decoder open. The run then prints `audio delivery=droppedNoPipeline pipeline=none`, which is the pair a host reads (the typed fact plus the human label), against `delivery=streamCopy` / `bridged` / `decoded` on the same source without the flag. It is loud in the log on purpose, in both the CLI line and the engine's own, because a forced classification read as a real one would be worse than no harness.
+
 `--frame-times` installs the #311 software frame-time observer BEFORE `load()` (the documented usage: the engine re-arms each new host with it) and reads `softwarePresentationTimebase`. Per tick it appends `ft` (frames reported since the last tick), `ftLast` (newest reported presentation time), `ftGen` (renderer flush generation, which a seek moves) and `ooo`, the count of reports that arrived out of presentation order. `ooo` is the API's own claim under test: these are reported past the reorder buffer, so it must stay 0. `tb` is the timebase read at the same instant, and its closeness to `ftLast` is the point, both are on the source axis with nothing to convert between them.
 
 `--sequential-origin` declares `LoadOptions.sequentialOrigin`, the IPTV timeshift / catch-up shape whose `206` answers are fabricated (#346): one long-lived unranged GET, no ranged probes, no tail read, so **seeking is unavailable** in the run. On VOD it needs `--declared-duration S`, which fills `LoadOptions.declaredDurationSeconds`, because the estimate that the tail read would have produced is gone with the tail read.
@@ -175,6 +185,25 @@ opens on a random-access point in DECODE order, and taking the offset there put 
 `video_delay` frames under the truth on every epoch. The pair isolates exactly that. Read the verdict
 as the MEAN of `capErr` per axis over the run, since a single tick carries up to two frames of the
 probe's own quantisation.
+
+**Round 6: how much a lead counts is a property of the SOURCE, so the session measures it.** Round 5
+found that a composition lands on a BASE one presentation lead under the axis, measured it on
+`tc-bframes.mkv` and shipped it as arithmetic. It is not arithmetic. The script now writes a third
+clip, `tc-bf1.mkv`, identical but for `-bf 1`, and on the same burst arm the three reorder depths
+place three different ways, the reading and the picture agreeing in all nine runs:
+
+| clip | gate lead | base a composition lands on | burst arm |
+|---|---|---|---|
+| `tc-drought.mkv` | 0.000 | the axis | -9.000 -> -18.000 -> -23.000 |
+| `tc-bf1.mkv` | 0.042 (one frame) | the axis | -9.000 -> -18.000 -> -23.000 |
+| `tc-bframes.mkv` | 0.083 (two frames) | one lead below the axis | -9.000 -> -18.083 -> -23.166 |
+
+So a session now starts with no coefficient and composes without one, and the first placement it can
+read back states what a lead is worth here: `#418 segN says a lead counts 1.00x on this source (axis
+Xs, base measured Ys, lead Zs)`. Every `placed` line prints the coefficient it used (`lead 0.083s
+x1.00`, or `x0.00 unmeasured` before the first reading). Under round 5 the middle row was composed
+0.042 s low and corrected back on every measurable placement, and the placements that cannot be
+measured at all kept that error for the rest of the session.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 

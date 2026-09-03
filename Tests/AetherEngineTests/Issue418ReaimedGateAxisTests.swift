@@ -97,29 +97,29 @@ struct Issue418ReaimedGateAxisTests {
 
     @Test("the first placement of a session establishes the axis")
     func firstPlacementEstablishesTheAxis() {
-        #expect(HLSVideoEngine.axisShift(after: 0, placing: -9.0, presentationLead: 0) == -9.0)
+        #expect(HLSVideoEngine.axisShift(after: 0, placing: -9.0, presentationLead: 0, coefficient: 1) == -9.0)
     }
 
     @Test("an axis-true segment leaves the axis where it is")
     func axisTrueSegmentChangesNothing() {
         // The reporter's seek burst: seg179 was cut on its own boundary, and the run kept -14.056.
-        #expect(HLSVideoEngine.axisShift(after: -14.056, placing: 0, presentationLead: 0) == -14.056)
+        #expect(HLSVideoEngine.axisShift(after: -14.056, placing: 0, presentationLead: 0, coefficient: 1) == -14.056)
     }
 
     @Test("re-placing the segment the gate opened into adds its offset again")
     func rePlacingTheAnchorComposes() {
         // Measured: resume 53 reads -9.000, and a seek that re-fetches that same segment reads -18.000.
-        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, presentationLead: 0) == -18.0)
+        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, presentationLead: 0, coefficient: 1) == -18.0)
         // And at the deepest tier of the tiered fixture, -11.000 -> -22.000.
-        #expect(HLSVideoEngine.axisShift(after: -11.0, placing: -11.0, presentationLead: 0) == -22.0)
+        #expect(HLSVideoEngine.axisShift(after: -11.0, placing: -11.0, presentationLead: 0, coefficient: 1) == -22.0)
     }
 
     @Test("a later epoch's own re-aim composes onto what the timeline already carries")
     func newEpochComposesOntoTheOldAxis() {
         // Measured: a -9.000 run, seek to 60, producer restarts at seg12 and re-aims 5 s, reads -14.000.
-        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -5.0, presentationLead: 0) == -14.0)
+        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -5.0, presentationLead: 0, coefficient: 1) == -14.0)
         // Tiered fixture: a -11.000 run whose seek restarts at seg23 re-aiming 7 s reads -18.000.
-        #expect(HLSVideoEngine.axisShift(after: -11.0, placing: -7.0, presentationLead: 0) == -18.0)
+        #expect(HLSVideoEngine.axisShift(after: -11.0, placing: -7.0, presentationLead: 0, coefficient: 1) == -18.0)
     }
 
     // MARK: - Round 5: a composition lands on the base, not on the axis
@@ -140,38 +140,101 @@ struct Issue418ReaimedGateAxisTests {
         #expect(HLSSegmentProducer.presentationLeadPts(actualFirstPts: 42_917, actualFirstDts: 43_000) == 0)
     }
 
-    @Test("a composition onto an existing timeline lands one lead below the axis")
+    @Test("on a two-frame reorder source a composition lands one lead below the axis")
     func compositionLandsOnTheBase() {
-        // Measured on tc-bframes.mkv: the axis stood at -9.000 and AVPlayer held the re-placed
-        // segment from item 61.083, not the 61.000 the axis alone predicts, and the picture read
-        // -18.083 for the rest of the run.
-        #expect(HLSVideoEngine.placementBase(axis: -9.0, presentationLead: 0.083) == -9.083)
+        // Measured on tc-bframes.mkv (`-bf 3`, pyramid, lead two frames): the axis stood at -9.000
+        // and AVPlayer held the re-placed segment from item 61.083, not the 61.000 the axis alone
+        // predicts, and the picture read -18.083 for the rest of the run. Round 6 arrives at the
+        // coefficient of 1 by reading it back rather than by assuming it, see
+        // `readingTeachesTheCoefficient`.
+        #expect(HLSVideoEngine.placementBase(axis: -9.0, presentationLead: 0.083, coefficient: 1) == -9.083)
         #expect(abs(HLSVideoEngine.axisShift(
-            after: -9.0, placing: -9.0, presentationLead: 0.083) - (-18.083)) < 1e-9)
+            after: -9.0, placing: -9.0, presentationLead: 0.083, coefficient: 1) - (-18.083)) < 1e-9)
     }
 
-    @Test("each composition eats its own lead, so an unmeasured chain of them accumulates")
+    @Test("where a lead counts, each composition eats one, so an unmeasured chain accumulates")
     func leadAccumulatesPerComposition() {
         // The three-placement burst arm: -9.000 -> -18.083 -> -27.166, all three read back off the
         // picture. Before this the third was kept at -27.000, 0.166 s over the truth.
-        let second = HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, presentationLead: 0.083)
-        let third = HLSVideoEngine.axisShift(after: second, placing: -9.0, presentationLead: 0.083)
+        let second = HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, presentationLead: 0.083, coefficient: 1)
+        let third = HLSVideoEngine.axisShift(after: second, placing: -9.0, presentationLead: 0.083, coefficient: 1)
         #expect(abs(third - (-27.166)) < 1e-9)
+    }
+
+    // MARK: - AE#418 round 6: how much a lead counts is measured, not assumed
+    //
+    // Round 5 measured `1` on tc-bframes.mkv and shipped it as arithmetic for every source. The
+    // reporter's asset (23.976 fps, one frame of reorder) reads the other way, and so does the
+    // fixture that isolates it: `Scripts/timecode-fixture.sh` writes tc-bf1.mkv, identical to
+    // tc-bframes.mkv but for `-bf 1`, and on the same burst arm the picture reads -23.000 where
+    // round 5 kept -23.042. Three runs each, three reorder depths, the reading and the picture
+    // agreeing in all nine.
+
+    @Test("a reading is what the next composition learns its coefficient from")
+    func readingTeachesTheCoefficient() {
+        // tc-bframes.mkv: axis -9.000, AVPlayer held the re-placed segment from item 61.083, so the
+        // base it composed onto was -9.083, one whole lead below.
+        let twoFrames = HLSVideoEngine.leadCoefficient(
+            axis: -9.0, measuredBase: -9.083, presentationLead: 0.083)
+        #expect(twoFrames != nil && abs((twoFrames ?? 0) - 1) < 1e-9)
+        // tc-bf1.mkv, same arm: held from item 61.000, so the base IS the axis and the lead counts
+        // for nothing. Round 5 predicted -9.042 here and the reading had to undo it every time.
+        let oneFrame = HLSVideoEngine.leadCoefficient(
+            axis: -9.0, measuredBase: -9.0, presentationLead: 0.042)
+        #expect(oneFrame != nil && abs(oneFrame ?? 1) < 1e-9)
+    }
+
+    @Test("a placement carrying no lead teaches nothing about what a lead is worth")
+    func noLeadTeachesNothing() {
+        // tc-drought.mkv has no reordering at all, so its every placement divides by zero here. The
+        // coefficient it would produce describes the reading's resolution, not the placement.
+        #expect(HLSVideoEngine.leadCoefficient(
+            axis: -9.0, measuredBase: -9.0, presentationLead: 0) == nil)
+        #expect(HLSVideoEngine.leadCoefficient(
+            axis: -9.0, measuredBase: -9.083, presentationLead: 0.0005) == nil)
+    }
+
+    @Test("a wrong reading cannot teach more than a reorder depth could ever produce")
+    func coefficientIsBounded() {
+        // Round 4 adopts a reading that can be wrong once, on the grounds that the next placement
+        // undoes it. What it must not do is leave a coefficient behind that outlives the mistake.
+        #expect(HLSVideoEngine.leadCoefficient(
+            axis: -9.0, measuredBase: -42.0, presentationLead: 0.042) == HLSVideoEngine.maxLeadCoefficient)
+        #expect(HLSVideoEngine.leadCoefficient(
+            axis: -9.0, measuredBase: 33.0, presentationLead: 0.042) == -HLSVideoEngine.maxLeadCoefficient)
+    }
+
+    @Test("round 5's rule leaves a one-frame-reorder source two frames out per composition")
+    func roundFiveOvershotASingleFrameReorder() {
+        // tc-bf1.mkv, the three-placement burst: -9.000 -> -18.000 -> -23.000 off the picture, 3 of
+        // 3 runs. Under round 5 the measurable placement was corrected back every time and the
+        // unmeasurable one kept -23.042.
+        let roundFive = HLSVideoEngine.axisShift(
+            after: -18.0, placing: -5.0, presentationLead: 0.042, coefficient: 1)
+        let roundSix = HLSVideoEngine.axisShift(
+            after: -18.0, placing: -5.0, presentationLead: 0.042, coefficient: 0)
+        #expect(abs(roundFive - (-23.042)) < 1e-9)
+        #expect(abs(roundSix - (-23.0)) < 1e-9)
     }
 
     @Test("a source without reordering composes exactly as it did")
     func noLeadIsTheOldArithmetic() {
         // tc-drought.mkv, same three arms: -9.000 -> -18.000, confirmed by both the reading and the
         // picture, so this round changes nothing where there is nothing to change.
-        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, presentationLead: 0) == -18.0)
-        #expect(HLSVideoEngine.placementBase(axis: -9.0, presentationLead: 0) == -9.0)
+        #expect(HLSVideoEngine.axisShift(
+            after: -9.0, placing: -9.0, presentationLead: 0, coefficient: 1) == -18.0)
+        #expect(HLSVideoEngine.placementBase(
+            axis: -9.0, presentationLead: 0, coefficient: 1) == -9.0)
+        // And with no coefficient learned yet, which is where every session starts.
+        #expect(HLSVideoEngine.axisShift(
+            after: -9.0, placing: -9.0, presentationLead: 0.083, coefficient: 0) == -18.0)
     }
 
     @Test("the seam sits where the placement lands, which is below the advertised start by the base")
     func seamFollowsTheBase() {
         // seg13 advertised at 52.000 composing onto -9.000 with a lead of 0.083 begins at item
         // 61.083, which is where AVPlayer reported holding it.
-        let base = HLSVideoEngine.placementBase(axis: -9.0, presentationLead: 0.083)
+        let base = HLSVideoEngine.placementBase(axis: -9.0, presentationLead: 0.083, coefficient: 1)
         #expect(abs(HLSVideoEngine.seamItemSeconds(advertisedStart: 52.0, currentShift: base) - 61.083) < 1e-9)
     }
 
@@ -389,82 +452,11 @@ struct Issue418PlacementReconcileTests {
             advertisedStart: 52.0, worth: -9.0, assumedBase: 0.0, observedItemStart: .nan) == nil)
     }
 
-    // MARK: - Which range describes the picture
-
-    @Test("the range holding the playhead is the one that was placed")
-    func rangeHoldingThePlayhead() {
-        let ranges = [(352.9, 400.0), (791.2, 816.6)]
-        #expect(HLSVideoEngine.placementRangeStart(ranges: ranges, itemClock: 810.868) == 791.2)
-        #expect(HLSVideoEngine.placementRangeStart(ranges: ranges, itemClock: 360.0) == 352.9)
-    }
-
-    @Test("a playhead no range holds says nothing about a placement")
-    func noRangeHoldsThePlayhead() {
-        // The state right after a seek, before AVPlayer has taken the bytes. Answering from the range
-        // that happens to exist is how a check invents a placement out of the previous epoch.
-        #expect(HLSVideoEngine.placementRangeStart(
-            ranges: [(352.9, 400.0)], itemClock: 810.868) == nil)
-        #expect(HLSVideoEngine.placementRangeStart(ranges: [], itemClock: 810.868) == nil)
-    }
-
-    @Test("overlapping ranges resolve to the newest placement")
-    func overlappingRangesTakeTheHighestStart() {
-        // Two runs can cover one position while the older one is still being evicted; the picture is
-        // the one placed last.
-        #expect(HLSVideoEngine.placementRangeStart(
-            ranges: [(780.0, 800.0), (791.2, 816.6)], itemClock: 795.0) == 791.2)
-    }
-
     // MARK: - Which run belongs to this placement
-
-    @Test("a resume has no baseline, so the first run it opens is its own")
-    func firstRunOfTheSessionIsFresh() {
-        // Measured on the fixture: at the placement the item holds nothing, and 250 ms later it holds
-        // [52.000-64.958] for an advertised 52.000.
-        #expect(HLSVideoEngine.freshRunStart(
-            ranges: [(52.0, 64.958)], baseline: [], itemClock: 53.1) == 52.0)
-    }
-
-    @Test("the run that was already there is not this placement's")
-    func baselineRunIsRefused() {
-        // A placement is recorded when AVPlayer FETCHES, so it cannot have the bytes yet: a range whose
-        // start the baseline already reported is the previous epoch's run still holding the playhead.
-        // Its start inverts to an OLDER placement's base, and round 3 read that as a confirmation.
-        #expect(HLSVideoEngine.freshRunStart(
-            ranges: [(52.0, 74.9)], baseline: [(52.0, 68.952)], itemClock: 60.0) == nil)
-    }
-
-    @Test("a run that opens above the baseline is a placement, not backfill")
-    func upwardRunIsFresh() {
-        // The fixture's second arm: a seek that re-places the overlong segment opens [61.000-81.969]
-        // against a baseline of [52.000-68.952]. It overlaps, and it is still a different run.
-        #expect(HLSVideoEngine.freshRunStart(
-            ranges: [(61.0, 81.969)], baseline: [(52.0, 68.952)], itemClock: 74.1) == 61.0)
-    }
-
-    @Test("a start that walked downward is the same run backfilling")
-    func backfilledRunIsRefused() {
-        // His Apple TV: a run that opened at 1522.6 read 1507.1 fifteen seconds later, so "the start of
-        // the range holding the playhead" answers a different question depending on when it is sampled.
-        // AVPlayer only ever extends a run downward, so a downward move is never a placement. The cost
-        // is a missed measurement on a backward reopen inside the buffer, where the composed axis
-        // stands, as it did before any of this.
-        #expect(HLSVideoEngine.freshRunStart(
-            ranges: [(1507.1, 1538.9)], baseline: [(1510.6, 1518.5)], itemClock: 1530.0) == nil)
-    }
-
-    @Test("a run disjoint from everything the baseline held is fresh either way")
-    func disjointRunIsFresh() {
-        // The same device four seconds earlier: the buffer flushed and a fresh run opened at 1522.6.
-        #expect(HLSVideoEngine.freshRunStart(
-            ranges: [(1522.6, 1530.6)], baseline: [(1510.6, 1518.5)], itemClock: 1525.0) == 1522.6)
-    }
-
-    @Test("a playhead outside every range measures nothing")
-    func noFreshRunWithoutThePlayhead() {
-        #expect(HLSVideoEngine.freshRunStart(
-            ranges: [(61.0, 81.969)], baseline: [], itemClock: 40.0) == nil)
-    }
+    //
+    // Round 7 replaced this question. The baseline answers "which run is new", and during a seek
+    // burst that is not the same question as "which run is this placement's": see
+    // `Issue418PlacementIdentityTests`, where both failures are measured with the picture as witness.
 }
 
 /// AE#418 round 4: the gate's offset describes what AVPlayer SHOWS, so it is taken on the PTS.
@@ -495,4 +487,167 @@ struct Issue418PresentedShiftTests {
             actualFirstPts: 42917, desiredTfdtPts: 52000) == -9083)
     }
 
+}
+
+/// AE#418 round 7: a run that does not belong to this placement answers nothing about it, whether it
+/// is read (a wrong adoption) or missing (a composition nobody holds).
+///
+/// Round 4 asked "which run is new here" and answered it from a BASELINE of what the item held when
+/// the placement was recorded. That question has no answer during a seek burst: a run opened for a
+/// later seek is new by every baseline test, and a run opened for THIS placement below the playhead
+/// looks like backfill. Both failures are measurable on the fixture, with the picture as the witness
+/// (`play --picture-probe`, `tc-bf-cues-lie.mkv` over a throttled origin,
+/// `--seek-every 1 --seek-count 4 --seek-pattern 70,53,71,54`):
+///
+///   seg11 placed (advertised 44.000, worth -1.000): axis -9.000 -> -10.000, seam item 53.000
+///   sample 1-4: ranges=[53.083-70.035]  the placement's own run, opening one lead above its seam
+///   sample 5:   ranges=[74.208-86.099]  a later seek's run, adopted: axis -10.000 -> -31.208
+///
+/// The picture reads -10.125 for the rest of that run, so the session published a 21 s error off a
+/// reading it had no business taking, and the reading it needed was in its hand four samples earlier.
+@Suite("AE#418 round 7: the run that answers a placement is the one that opens at its seam")
+struct Issue418PlacementIdentityTests {
+
+    // MARK: - The run that opens where the segment begins
+
+    @Test("the run opening at the predicted seam is this placement's, whatever the baseline holds")
+    func runAtTheSeamIsThePlacement() {
+        // The wrong-adoption arm, sample 1: seam 53.000, the run opens at 53.083 (one lead above it),
+        // and the baseline still holds [65.083-84.974] from before. Round 4 refused this for moving
+        // downward against an overlapping baseline range.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(53.083, 70.035)], predictedSeam: 53.0)?.start == 53.083)
+    }
+
+    @Test("the fixture's own correction is still read the same way")
+    func roundFourCorrectionSurvives() {
+        // `tc-bf-cues-lie.mkv`, second placement: seam 61.000 predicted, AVPlayer opens [61.083-82.052]
+        // and the residual -0.083 is the lead this source's compositions land below.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(61.083, 82.052)], predictedSeam: 61.0)?.start == 61.083)
+    }
+
+    @Test("a placement that merges into the run it extends still opens at its seam")
+    func mergedRunOpensAtTheSeam() {
+        // Round 5 called this case unmeasurable and kept the composition. Measured, the run opens on
+        // the seam to the millisecond ([66.166-83.118] for a predicted 66.166), so there was a reading
+        // all along; it was refused for sitting below a baseline of [78.166-94.057].
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(66.166, 83.118)], predictedSeam: 66.166)?.start == 66.166)
+    }
+
+    @Test("a run seconds away from the seam is another segment's")
+    func distantRunIsNotThePlacement() {
+        // Sample 5 of the same arm. A segment is seconds long, so nothing that belongs to this
+        // placement can be 21 s from where it said it would land.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(74.208, 86.099)], predictedSeam: 53.0, rawSeam: 44.0) == nil)
+    }
+
+    @Test("the closest run to the seam is the one read")
+    func closestRunWins() {
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(52.0, 60.0), (61.083, 82.052)], predictedSeam: 61.0)?.start == 61.083)
+    }
+
+    @Test("the tolerance covers a couple of leads and nothing else")
+    func toleranceIsFrameScale() {
+        // Two frames at 24 fps is 0.083, and the reporter's asset leads by one at 23.976. Half a
+        // second is already past every geometry measured and still far inside one segment.
+        #expect(HLSVideoEngine.placementSeamToleranceSeconds > 0.166)
+        #expect(HLSVideoEngine.placementSeamToleranceSeconds < 1.0)
+    }
+
+    // MARK: - The timeline AVPlayer rebuilt
+
+    @Test("a timeline AVPlayer threw away places the segment at its advertised start")
+    func rebuiltTimelineOpensAtTheAdvertisedStart() {
+        // `tc-wide-cues-lie.mkv`, seek 35 s back out of the buffer: the composition assumed the axis
+        // carried on (-10.333) and predicted a seam at item 62.333, while AVPlayer dropped everything
+        // and opened [52.000-75.969] for an advertised 52.000, base 0.000. The reading is 10.3 s from
+        // the prediction and it is right: the picture reads -12.000 for the rest of the run.
+        let run = HLSVideoEngine.placementRunStart(
+            ranges: [(52.0, 75.969)], predictedSeam: 62.333, rawSeam: 52.0)
+        #expect(run?.start == 52.0)
+        #expect(run?.source == .rebuiltTimeline)
+    }
+
+    @Test("a run at neither seam is another segment's, however new it looks")
+    func runAtNeitherSeamIsRefused() {
+        // The wide fixture's burst: seg10 (advertised 40.000, seam 50.333) against a run at
+        // [92.000-...] opened for a seek to 99 s. It shares nothing with what the item held, which is
+        // how round 4's baseline test admitted it and published a 41.667 s residual for a segment
+        // whose bytes were nowhere near it.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(92.0, 109.3)], predictedSeam: 50.333, rawSeam: 40.0) == nil)
+    }
+
+    @Test("the composed seam is the first answer, the rebuilt one the fallback")
+    func composedSeamWinsOverRaw() {
+        let run = HLSVideoEngine.placementRunStart(
+            ranges: [(52.0, 60.0), (61.083, 82.052)], predictedSeam: 61.0, rawSeam: 52.0)
+        #expect(run?.start == 61.083)
+        #expect(run?.source == .ownRun)
+    }
+
+    @Test("a resume composes onto nothing, so both answers are the same one")
+    func firstPlacementOfTheSession() {
+        let run = HLSVideoEngine.placementRunStart(
+            ranges: [(52.0, 64.958)], predictedSeam: 52.0, rawSeam: 52.0)
+        #expect(run?.start == 52.0)
+        #expect(run?.source == .ownRun)
+    }
+
+    // MARK: - What nobody holds never moved the axis
+
+    @Test("bytes held at the seam are a placement that happened")
+    func heldSeamIsAPlacement() {
+        #expect(HLSVideoEngine.placementIsHeld(ranges: [(66.166, 83.118)], seam: 66.166))
+        #expect(HLSVideoEngine.placementIsHeld(ranges: [(52.0, 75.969)], seam: 62.333))
+    }
+
+    @Test("a seam no range covers is a placement that never reached the timeline")
+    func unheldSeamIsNoPlacement() {
+        // The reporter's run 1: seg735 composed -28.028 s onto -12.889, was unmeasurable, and was
+        // kept. The producer that opened for it was torn down with its segment discarded, and the next
+        // measurable placement 4.5 s later found the axis 33 ms from where it stood before.
+        #expect(!HLSVideoEngine.placementIsHeld(ranges: [(3743.7, 3780.5)], seam: 2953.3))
+        #expect(!HLSVideoEngine.placementIsHeld(ranges: [], seam: 66.166))
+    }
+
+    // MARK: - A reading is a sample, not a measurement
+
+    @Test("the coefficient is what the readings agree on, not the last one taken")
+    func coefficientIsTheMedian() {
+        // His run 2, three readings on one asset: -1.00, then 2.00, then -1.00. Under round 6 the
+        // stray took the session from a settled -1.00 to 2.00, three leads in one step, because one
+        // reading replaced the last.
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [-1.0]) == -1.0)
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [-1.0, 2.0]) == -1.0)
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [-1.0, 2.0, -1.0]) == -1.0)
+    }
+
+    @Test("an even count holds what the odd one before it settled on")
+    func evenCountHolds() {
+        // Two samples cannot outvote each other, and averaging them would invent a coefficient no
+        // reading took. The standing value is the one an odd count last agreed on.
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [0.0, 2.0]) == 0.0)
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [0.0, 2.0, 2.0]) == 2.0)
+    }
+
+    @Test("a session with no reading yet has no coefficient")
+    func noSamplesNoCoefficient() {
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: []) == nil)
+    }
+
+    @Test("a stray never composes, even when the readings after it agree with it")
+    func strayNeverComposes() {
+        // His run 1 read -0.00, then -2.00, then -0.20. Both rules end it on -0.20; what separates
+        // them is the composition in between, which under round 6 used the -2.00 the next reading
+        // then took back. Two leads is what that costs on a source whose lead is a frame.
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [0.0]) == 0.0)
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [0.0, -2.0]) == 0.0)
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [0.0, -2.0, -0.2]) == -0.2)
+        #expect(HLSVideoEngine.leadCoefficientEstimate(from: [-1.0, -1.0, 2.0, -1.0, -0.98]) == -1.0)
+    }
 }

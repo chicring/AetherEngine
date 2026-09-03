@@ -717,6 +717,8 @@ extension AetherEngine {
             forwardBufferSegments: loadedOptions.forwardBufferSegments,
             shortFirstSegmentSeconds: loadedOptions.shortFirstSegmentSeconds
         )
+        // AE#464: every producer this session builds reads it off the session. Set before start().
+        session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate
@@ -757,6 +759,10 @@ extension AetherEngine {
                 // is still on screen those differ, and the picture is what the clock has to describe.
                 let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
                 self.playlistShiftSeconds = activeShift
+                // The cache did not move, but the fold onto the display axis did. Re-publish the band
+                // from the raw spans so it does not carry the retired epoch's offset until the next
+                // segment lands (AE#468 follow-up).
+                self.republishResidentRanges()
                 // AE#422: read off-main before building the line (see `avPlayerBufferAheadSeconds`).
                 let avBufAhead = await self.avPlayerBufferAheadSeconds()
                 // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
@@ -1116,6 +1122,16 @@ extension AetherEngine {
         }
         replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
+        // AE#446 round 5: an item's axis is stated by the playlist it loads, so the statement has to be
+        // keyed to the item that loaded it. Installed on the one funnel every attach passes through, so
+        // the session's FIRST item is covered as well as every swap: both used to reconstruct the axis
+        // from the cache instead, and a reconstruction is only as good as the older of its two samples.
+        host.onWillAttachItem = { [weak self] in
+            // The host owns this closure, so it reaches back for the host rather than capturing it.
+            guard let self, let attaching = self.nativeHost else { return }
+            self.nativeVideoSession?.armLiveItemAxisStatement()
+            self.liveItemAxisArmedGeneration = attaching.itemGeneration
+        }
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
@@ -1569,6 +1585,7 @@ extension AetherEngine {
         // of such a wiring work in isolation, which is why a dead sink here reads as a working one.
         softwareCancellables.removeAll()
         let host = SoftwarePlaybackHost()
+        host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate
@@ -2043,8 +2060,9 @@ extension AetherEngine {
                 activeVideoDecoder = Self.videoDecoderLabel(
                     codecID: preservedVideoCodec, isSoftware: true
                 )
+                // AE#462: the rebuilt host's own resolved index (see the load site).
                 activeAudioDecoder = Self.softwareAudioDecoderLabel(
-                    audioTracks: audioTracks, activeIndex: audioStreamIndex ?? -1
+                    audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
                 presentCurrentLayer()
                 softwareHost?.play()

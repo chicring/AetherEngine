@@ -137,7 +137,21 @@ final class SoftwarePlaybackHost {
     private let demuxCondition = NSCondition()
 
     private var videoStreamIndex: Int32 = -1
-    private var audioStreamIndex: Int32 = -1
+    /// The audio stream this host actually serves, or -1 when it serves none: the source had no audio
+    /// track, or `AudioDecoder.open` refused it and the session went video-only (AE#462). Read by the
+    /// engine for the published decoder label, which used to be built from the PROBE and therefore
+    /// named a decoder that never opened. Also the host's own resolve, which is not always the
+    /// engine's pick (#133 live-TS by-type fallback).
+    private(set) var audioStreamIndex: Int32 = -1
+
+    /// AE#464: the host's audio presentation offset in seconds, positive = audio later. Kept here as
+    /// well as on the decoder so a decoder opened later in the session (an audio-track switch, a
+    /// rebuild) starts out carrying it rather than at zero.
+    private(set) var audioDelaySeconds: Double = 0
+
+    /// AE#462: how this host delivers audio, as a typed fact for the engine's published
+    /// `audioDelivery`. Set once the audio decoder has been given its chance.
+    private(set) var audioDelivery: AudioDelivery = .none
 
     private var videoTimeBaseSeconds: Double = 0
     private var audioTimeBaseSeconds: Double = 0
@@ -496,6 +510,14 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Audio stream resolution (#133)
 
+    /// AE#462: how this host's audio ended up, from the two facts that decide it. Silence has two
+    /// causes here exactly as it does in the loopback cascade, and only one of them is a reason for
+    /// a host to demote to a source that carries the audio differently.
+    nonisolated static func audioDelivery(resolvedAudioIndex: Int32, decoderOpened: Bool) -> AudioDelivery {
+        guard resolvedAudioIndex >= 0 else { return .noAudioInSource }
+        return decoderOpened ? .decoded : .droppedNoPipeline
+    }
+
     /// Resolve the audio stream index for a SW-host session. `av_find_best_stream` (`bestStream`)
     /// returns -1 for a live-MPEG-TS AAC stream whose codecpar the probe left empty
     /// (sample_rate/channels=0 because find_stream_info bailed before decoding a frame). On live
@@ -708,6 +730,11 @@ final class SoftwarePlaybackHost {
             }
             let aDec = AudioDecoder()
             do {
+                // AE#462 harness (TEST-ONLY): same forced drop the loopback cascade honors.
+                if AetherEngine.forceAudioPipelineFailureForTesting {
+                    throw NSError(domain: "AetherEngineTestHook", code: -462, userInfo: [
+                        NSLocalizedDescriptionKey: "audio pipeline forced to fail (TEST-ONLY)"])
+                }
                 try aDec.open(stream: aStream)
                 self.audioDecoder = aDec
                 self.audioStreamIndex = resolvedAudioIdx
@@ -718,6 +745,11 @@ final class SoftwarePlaybackHost {
                 self.audioStreamIndex = -1
             }
         }
+        // AE#462: after the decoder has had its chance, whichever way the block above left it, so a
+        // stream present but unusable (no codecpar) classifies as the drop it is rather than as a
+        // source without audio.
+        self.audioDelivery = Self.audioDelivery(resolvedAudioIndex: resolvedAudioIdx,
+                                                decoderOpened: self.audioDecoder != nil)
         // #112 rework: capture embedded subtitle stream indices + time bases for the demux
         // loop's subtitle tap dispatch.
         var subIndices: Set<Int32> = []
@@ -735,6 +767,7 @@ final class SoftwarePlaybackHost {
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         self.audioOutput = AudioOutput()
+        self.audioOutput?.setPresentationOffset(seconds: audioDelaySeconds)   // AE#464
 
         // Reset the live feeder state for the new session.
         resetFeederState()
@@ -906,6 +939,17 @@ final class SoftwarePlaybackHost {
         if clockArmed {
             audioOutput?.setRate(newRate)
         }
+    }
+
+    /// AE#464: set the audio presentation offset. Positive delivers audio later relative to video.
+    ///
+    /// Only the stamp changes; nothing is flushed here. The samples already decoded (up to
+    /// `AudioLookaheadPolicy.targetLeadSeconds` of them on the decoupled VOD arm) still carry the
+    /// previous offset, so a caller that wants the change to be audible now re-anchors at the
+    /// playhead afterwards. `AetherEngine.setAudioDelay` does exactly that.
+    func setAudioDelay(_ seconds: Double) {
+        audioDelaySeconds = seconds
+        audioOutput?.setPresentationOffset(seconds: seconds)
     }
 
     func setResumeRate(_ rate: Float) {

@@ -86,6 +86,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let bridge: AudioBridge?
         /// Strip 7/9-byte ADTS header per frame for MPEG-TS AAC stream-copy into fMP4; engine synthesises the ASC.
         let stripAacAdts: Bool
+        /// AE#458: the source track's language as ISO 639-2/T, carried into every muxer this config builds
+        /// (a producer restart rebuilds one, so it has to live on the config, not on the first muxer).
+        let language: String?
 
         init(codecpar: UnsafePointer<AVCodecParameters>,
              timeBase: AVRational,
@@ -93,7 +96,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
              inputTimeBase: AVRational,
              sourceTimeBase: AVRational,
              bridge: AudioBridge?,
-             stripAacAdts: Bool = false) {
+             stripAacAdts: Bool = false,
+             language: String? = nil) {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.sourceStreamIndex = sourceStreamIndex
@@ -101,6 +105,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.sourceTimeBase = sourceTimeBase
             self.bridge = bridge
             self.stripAacAdts = stripAacAdts
+            self.language = language
         }
     }
 
@@ -710,6 +715,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// so the race-ahead parks once it has filled the session retention budget (`PrefetchDiskBudget`).
     /// 0 disables the park (live, and any host that never opted in stays far below its budget anyway).
     private let prefetchDiskBudgetBytes: Int
+
+    /// AE#464: the host's audio offset this producer's muxers write. Fixed for the producer's life;
+    /// a new value arrives as a new producer (see `MP4SegmentMuxer.audioDelaySeconds`).
+    private let audioDelaySeconds: Double
 
     /// #65 stall diag: only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
     /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
@@ -1357,9 +1366,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         prefetchDiskBudgetBytes: Int = 0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioMoovPrimeKnownUnobtainable: Bool = false,
+        audioDelaySeconds: Double = 0,
         epoch: UInt64 = 0
     ) throws {
         self.epoch = epoch
+        self.audioDelaySeconds = audioDelaySeconds
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.audioMoovPrimeKnownUnobtainable = audioMoovPrimeKnownUnobtainable
         self.capturesAudioPrimeFrames =
@@ -1969,7 +1980,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride
         )
         let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in
-            MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase)
+            MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase, language: a.language)
         }
 
         do {
@@ -1989,6 +2000,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
+                audioDelaySeconds: audioDelaySeconds,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {

@@ -158,13 +158,20 @@ extension AetherEngine {
     /// 0.00 to 15.00 and the producer's from 51.40 to 66.40.
     ///
     /// Latched per item, because it is a property of the playlist that item loaded, and re-measured
-    /// when the item under the host changes. It reads 0 for the item a session starts with, which is
-    /// why nothing needed it until a swap attached a second one.
+    /// when the item under the host changes.
+    ///
+    /// Round 5: the measurement below is the FALLBACK. Where the engine serves the playlist it also
+    /// knows the axis exactly, and it states it (see `noteServedLiveItemAxis`); the difference used
+    /// to be reconstructed for every item except the one a rejoin placed, which left the session's
+    /// own first item on the reconstruction as well. Measured against a device on 6.60.0: a start
+    /// item whose playlist begins at exactly 0.00s reconstructed 0.05s and then carried it for the
+    /// session (AE#446, cmcpherson274). The same construction read 0 for an item whose playlist began
+    /// 6.76s in on 6.57.0, which is the same defect with a bigger number.
     @MainActor
     func measureLiveItemAxisOffset() {
         guard isLive, let host = nativeHost else { return }
-        // AE#454 round 2: where the playlist placed this item, it also STATED the axis it placed it
-        // on, and a statement outranks a reconstruction. The measurement below is a difference between
+        // AE#454 round 2: the playlist that placed this item also STATED the axis it placed it on,
+        // and a statement outranks a reconstruction. The measurement below is a difference between
         // two independently sampled quantities (the producer's resident floor and the item's own
         // seekable start), so it is only as good as the older of the two samples, it is latched for
         // the item's whole life on the first tick that produces any number at all, and it cannot tell
@@ -173,16 +180,25 @@ extension AetherEngine {
         // began 6.76 s into the session, which put a correctly placed item through a correcting seek
         // and left every published number 6.76 s away from the picture.
         //
+        // AE#446 round 5: this used to be gated on the item having carried a rejoin PLACEMENT, which
+        // is an unrelated condition. Every live build knows which segment it listed first, so every
+        // live item's axis is stated, and the gate is now the item attach that armed the statement.
+        // The paths that gained it: the session's own first item, the #130 media fallback (documented
+        // to run after the window slid), the #35 gate reloads, an AirPlay hop, and the rejoin branch
+        // whose target had been evicted, which arms no placement and therefore had none.
+        //
         // Tested BEFORE the per-item latch below, and allowed to overrule it: the serve and the
         // engine's 100 ms tick are not ordered, so a tick that finds a range in the gap between the
         // swap and the serve would otherwise latch a measurement the playlist is about to contradict,
         // and the latch is for the item's whole life.
-        if host.itemGeneration == liveRejoinPlacementGeneration,
-           host.itemGeneration != liveItemAxisStatedGeneration,
-           let stated = nativeVideoSession?.servedLiveRejoinPlacement {
+        if Self.liveItemAxisStatementApplies(armedGeneration: liveItemAxisArmedGeneration,
+                                             itemGeneration: host.itemGeneration,
+                                             statedGeneration: liveItemAxisStatedGeneration),
+           let stated = nativeVideoSession?.servedLiveItemAxisOutputSeconds {
+            liveItemStatedAxisReconstructionError(stated: Swift.max(0, stated), host: host)
             liveItemAxisStatedGeneration = host.itemGeneration
             liveItemAxisOffsetGeneration = host.itemGeneration
-            liveItemAxisOffsetSeconds = Swift.max(0, stated.playlistStartOutputSeconds)
+            liveItemAxisOffsetSeconds = Swift.max(0, stated)
             EngineLog.emit(
                 "[AetherEngine] #454 the playlist this item loaded begins "
                 + "\(String(format: "%.2f", liveItemAxisOffsetSeconds))s into the session, so that is "
@@ -267,6 +283,50 @@ extension AetherEngine {
         // Ready and axis-less is not a contradiction: they are separate signals and their order is
         // AVFoundation's business, so the second reading is guarded on its own input.
         return itemGeneration != axisGeneration && !itemReportsRange
+    }
+
+    /// AE#446 round 5: what the reconstruction this statement replaces would have said, on the line
+    /// where the statement is made.
+    ///
+    /// The error was only ever visible where the two samples were far enough apart to notice, which
+    /// is why it survived from 6.56.5 to 6.60.0 as a 0.05 s reading nobody could attribute (and, on
+    /// one device, as a 6.76 s one that was attributed to something else first). Both terms are known
+    /// at this instant and neither costs anything to take, so the difference is stated rather than
+    /// left to be inferred from a later disagreement between two logs.
+    ///
+    /// One line per item attach, and the case where the reconstruction has nothing yet is itself the
+    /// answer: it means the measurement would have been taken from a sample this item had not
+    /// produced.
+    @MainActor
+    private func liveItemStatedAxisReconstructionError(stated: Double, host: NativeAVPlayerHost) {
+        guard host.seekableEnd > host.seekableStart,
+              let producerFloor = residentLiveFloorSessionSeconds() else {
+            EngineLog.emit(
+                "[AetherEngine] #446 the reconstruction this replaces had nothing to say yet, so it "
+                + "would have been latched from a later sample",
+                category: .engine)
+            return
+        }
+        let reconstructed = Self.liveItemAxisOffset(producerFloorSession: producerFloor,
+                                                    itemSeekableStart: host.seekableStart,
+                                                    shift: playlistShiftSeconds)
+        EngineLog.emit(
+            "[AetherEngine] #446 the reconstruction this replaces would have said "
+            + "\(String(format: "%.2f", reconstructed))s, \(String(format: "%.2f", reconstructed - stated))s "
+            + "off the axis the manifest states",
+            category: .engine)
+    }
+
+    /// AE#446 round 5: whether an axis a build stated describes the item under the host right now.
+    ///
+    /// Two conditions, and they are different questions. The statement has to have been armed by THIS
+    /// item's own attach, or it belongs to the item that just left; and the item must not already
+    /// carry one, because an item's zero is the FIRST playlist it loaded and later builds of a sliding
+    /// window state a smaller offset against the very same content.
+    nonisolated static func liveItemAxisStatementApplies(
+        armedGeneration: Int, itemGeneration: Int, statedGeneration: Int
+    ) -> Bool {
+        itemGeneration == armedGeneration && itemGeneration != statedGeneration
     }
 
     /// AE#446 round 4: the arithmetic behind `measureLiveItemAxisOffset`, on its own so the case can

@@ -75,6 +75,81 @@ public enum VideoRoute: String, Sendable, Equatable {
     }
 }
 
+/// How the session's audio reaches the renderer, as a typed fact (AE#462).
+///
+/// The reason this exists is `.droppedNoPipeline`. A source whose audio can neither stream-copy into
+/// fMP4 nor go through the bridge plays video-only: `state` reaches `.playing`, nothing failed by the
+/// error taxonomy's lights, and before this the only account was a log line. A host with a fallback
+/// ladder (a server-side transcode, a second player) could reconstruct the drop from a non-empty
+/// `audioTracks` paired with a nil `activeAudioDecoder`, which was an undocumented pairing of two
+/// publishers that broke in both directions: it read as a drop where a probe had merely failed to list
+/// the tracks, and it read as healthy on the software path, whose label is built from the probe rather
+/// than from the decoder that was opened. `audioDelivery` is the fact itself, published where the
+/// pipelines decide it. **A host with a ladder should demote on `.droppedNoPipeline`**, the way it
+/// demotes on `PlaybackErrorKind.audioBridgeProducedNoOutput`, which is the same user outcome reached
+/// through a bridge that WAS built and then decoded nothing.
+///
+/// Not a `PlaybackErrorKind`: `publishError` makes a failure terminal by moving `state` to `.error`,
+/// and `errorInfo` is cleared by the state's own move away from it. Video-only playback is neither
+/// terminal nor an error for every host, so carrying it there would break the invariant that ties
+/// those two publishers together.
+///
+/// Derived from `playbackBackend`, the session's effective options and the live pipeline's own
+/// classification, never assigned on its own, so it cannot drift from the running session (the
+/// `videoRoute` arrangement, #321). Raw values are API, like `PlaybackErrorKind`'s.
+///
+/// The pair with `activeAudioDecoder` still holds and is now honest on both paths: that publisher
+/// names the pipeline for a human, this one classifies it for a ladder.
+public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
+    /// No session: pre-load, or torn down.
+    case none
+    /// The source carries no audio stream (or none was selected). Silence is the source's, not the
+    /// engine's, and no ladder rung can change it.
+    case noAudioInSource
+    /// The source's audio bitstream is muxed into fMP4 unchanged: Atmos, DTS-HD and every other
+    /// bitstream reach the renderer exactly as authored.
+    case streamCopy
+    /// The audio is decoded and re-encoded (FLAC or E-AC-3) for the fMP4 pipeline, because its codec
+    /// is not fMP4-legal or AVPlayer rejects it there. Lossless for the bed channels; object metadata
+    /// in a TrueHD-MAT or JOC bitstream does not survive the PCM intermediate.
+    case bridged
+    /// libavcodec decodes the audio and the engine renders it itself (the software path and the
+    /// software audio-only host).
+    case decoded
+    /// The source HAS audio and none of it could be delivered: no libavcodec decoder for it, or the
+    /// bridge could not be built or could not write its header. The session plays video-only and
+    /// silently. This is the one value a fallback ladder acts on.
+    case droppedNoPipeline
+    /// AVFoundation owns the audio: the remote-HLS bypass and the native audio-only host both hand
+    /// the source to AVPlayer, which does its own media selection. The engine has no pipeline of its
+    /// own to classify and does not guess on AVFoundation's behalf.
+    case playerManaged
+
+    /// Single point where a backend, the session's remote-HLS bit and a pipeline's own classification
+    /// become one published fact.
+    ///
+    /// The routing bits alone can never produce `.droppedNoPipeline`: the drop is only ever reported
+    /// by the pipeline that dropped, about itself.
+    static func derive(backend: PlaybackBackend,
+                       nativeRemoteHLS: Bool,
+                       loopbackSession: AudioDelivery?,
+                       softwareHost: AudioDelivery?,
+                       audioOnlyHost: AudioDelivery?) -> AudioDelivery {
+        switch backend {
+        case .none, .aether:
+            return .none
+        case .native:
+            // The bypass has no HLSVideoEngine to ask, and a leftover fact from the session before a
+            // reroute must not answer for it.
+            return nativeRemoteHLS ? .playerManaged : (loopbackSession ?? .none)
+        case .software:
+            return softwareHost ?? .none
+        case .audio:
+            return audioOnlyHost ?? .none
+        }
+    }
+}
+
 /// What playback is doing right now, as one observable (#85). Derived from `state`, `isBuffering`,
 /// `isSeeking`, and the reader network phase, so it can never desync from them. Observe `$playbackPhase`
 /// instead of stitching `state == .loading` + `$isBuffering` + `$isSeeking` together, and instead of
@@ -205,6 +280,17 @@ public enum LiveJoinProfile: Sendable, Equatable {
 }
 
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.
+/// Which playback host serves a session's video (#461). See `LoadOptions.preferredDecodePath`.
+public enum DecodePath: String, Sendable, Equatable, CaseIterable {
+    /// The engine routes: codec support, the VideoToolbox capability probe, declared interlace,
+    /// source seekability. The default, and right for every session that does not have evidence
+    /// the engine cannot have.
+    case automatic
+    /// Serve this source through `SoftwarePlaybackHost`, whatever the routing concluded. Scoped to
+    /// the session; it does not touch any other session on the shared engine.
+    case software
+}
+
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
     public var omitCriteriaColorExtensions: Bool
@@ -483,6 +569,17 @@ public struct LoadOptions: Sendable, Equatable {
     /// waypoint; the host resumes later with `play()`. Same declared-vs-real family as #122/#123 (#124).
     public var autoplay: Bool = true
 
+    /// AE#464: audio presentation offset for this session, in seconds. Positive presents audio
+    /// LATER relative to video, negative earlier. Default 0.
+    ///
+    /// A lip-sync correction belongs to the viewer's chain, not to the file, so this is the value a
+    /// host sets once per setup and the engine honours for the session (and across the rebuilds a
+    /// session makes on its own). Applied on `.loopback` and `.software`; on `.remoteBypass` and
+    /// audio-only sessions the engine does not hold the timestamps and says so rather than pretending.
+    /// Clamped to `AudioDelayPolicy.maxAbsSeconds`. Correct it mid-session with
+    /// `AetherEngine.setAudioDelay(_:)`, which is the same value seen from the other end.
+    public var audioDelaySeconds: Double = 0
+
     /// Teletext caption page for `dvb_teletext` subtitle decode. nil (default) = libzvbi auto-detect
     /// (`txt_page=subtitle`); an explicit page (e.g. 801 for AU) targets channels whose caption page
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).
@@ -497,6 +594,33 @@ public struct LoadOptions: Sendable, Equatable {
     /// (50/60 fps), `.frame` keeps frame rate. Ignored by the software fallback (always frame
     /// rate). See `DeinterlaceFieldRate`.
     public var deinterlaceFieldRate: DeinterlaceFieldRate = .field
+
+    /// AE#461: which decode path this session runs on when the host needs to overrule the engine's
+    /// own routing. `.automatic` (default) leaves the routing alone. `.software` serves the source
+    /// through `SoftwarePlaybackHost` (libavcodec / dav1d) whatever the routing concluded, scoped to
+    /// this session, and without costing the source anything: seeks, the mid-session audio switch and
+    /// the title switch all still work, unlike the forward-only reader that was previously the only
+    /// way onto that host.
+    ///
+    /// The lever exists because `VTCapabilityProbe.canHardwareDecode` FAILS OPEN by design (four
+    /// classes it cannot classify keep the native path), which is the right default and occasionally
+    /// wrong: if VideoToolbox then cannot build a decoder for what arrives, the item reaches
+    /// `readyToPlay` and renders nothing. In-band parameter sets (`hev1` / `avc1` with an empty
+    /// config record) are the class where the deciding evidence genuinely is not present at load
+    /// time, and a stream whose parameter sets turn undecodable mid-play has no other in-place
+    /// answer. Pair with `reloadAtCurrentPosition(applying:)` (#460) to correct a running session.
+    ///
+    /// One-way on purpose: there is no `.native`. Every route the engine sends to software it sends
+    /// there because the native path cannot serve it (AV1 without hardware decode, VP9, a
+    /// forward-only source, MVC carriage), so forcing native past those buys a black screen.
+    ///
+    /// `.software` does not suspend the guards downstream of the routing decision, and must not: a
+    /// source whose only signal is IPT-PQ-c2 (Dolby Vision HEVC P5, AV1 P10.0) still fails the load
+    /// with `dolbyVisionUnplayableOnSoftwarePath` rather than decoding as YCbCr and rendering
+    /// green/purple, and a demuxed-audio live source still fails rather than playing silent.
+    /// `nativeRemoteHLS` is a different route entirely (AVPlayer plays the remote playlist, nothing
+    /// is demuxed), so this has nothing to act on there and the engine says so in the log.
+    public var preferredDecodePath: DecodePath = .automatic
 
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
@@ -544,8 +668,10 @@ public struct LoadOptions: Sendable, Equatable {
         forwardBufferSegments: Int? = nil,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
+        audioDelaySeconds: Double = 0,
         deinterlaceMode: DeinterlaceMode = .auto,
-        deinterlaceFieldRate: DeinterlaceFieldRate = .field
+        deinterlaceFieldRate: DeinterlaceFieldRate = .field,
+        preferredDecodePath: DecodePath = .automatic
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -582,8 +708,10 @@ public struct LoadOptions: Sendable, Equatable {
         self.forwardBufferSegments = forwardBufferSegments
         self.autoplay = autoplay
         self.teletextPage = teletextPage
+        self.audioDelaySeconds = audioDelaySeconds
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
+        self.preferredDecodePath = preferredDecodePath
     }
 }
 
@@ -672,6 +800,11 @@ public struct SoftwareDecodeProbeResult: Sendable {
     public let firstFrameWidth: Int
     public let firstFrameHeight: Int
     public let firstError: String?
+    /// #407: presentation timestamps of the decoded pictures, in the order the decoder handed them
+    /// out. A healthy reordering stream produces a strictly ascending, evenly spaced ladder here; a
+    /// container that withheld its PTS and had one invented from decode order produces a sawtooth,
+    /// which is the one shape no packet-level or renderer-level counter can see.
+    public let frameTimesSeconds: [Double]
 
     public init(
         codecName: String,
@@ -686,8 +819,10 @@ public struct SoftwareDecodeProbeResult: Sendable {
         firstFramePixelFormat: String?,
         firstFrameWidth: Int,
         firstFrameHeight: Int,
-        firstError: String?
+        firstError: String?,
+        frameTimesSeconds: [Double] = []
     ) {
+        self.frameTimesSeconds = frameTimesSeconds
         self.codecName = codecName
         self.codecID = codecID
         self.width = width

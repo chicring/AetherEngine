@@ -92,6 +92,14 @@ extension HLSVideoEngine {
         + "\(FFmpegRuntimeCheck.avcodecIdentity), cascading to \(encoderLabel(cascadingTo))"
     }
 
+    /// AE#462: the cascade's video-only tail is reached by two different sources of silence, and a
+    /// host's ladder acts on exactly one of them. A source with no audio track has nothing to demote
+    /// to; a source whose audio was dropped plays silently over a server-side transcode that would
+    /// have carried it. `audioPipelineDescription` is nil for both.
+    static func videoOnlyAudioDelivery(hadSourceAudioStream: Bool) -> AudioDelivery {
+        hadSourceAudioStream ? .droppedNoPipeline : .noAudioInSource
+    }
+
     /// Guards `audioSourceStreamIndexOverride` against stale picker selections from a previous title.
     static func isAudioStream(demuxer: Demuxer, index: Int32) -> Bool {
         guard index >= 0, let stream = demuxer.stream(at: index) else {
@@ -108,7 +116,8 @@ extension HLSVideoEngine {
         streamCopyAudio: HLSSegmentProducer.AudioConfig?,
         sourceAudioStreamIndex: Int32,
         sourceAudioStream: UnsafeMutablePointer<AVStream>?,
-        audioHLSCodecs: inout String?
+        audioHLSCodecs: inout String?,
+        audioLanguage: String? = nil
     ) throws -> HLSSegmentProducer {
         // EAC3 profile=30 is the JOC marker; any stream-copy->FLAC fallback silently loses Atmos object metadata.
         let sourceIsAtmos: Bool = {
@@ -116,6 +125,17 @@ extension HLSVideoEngine {
             return stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_EAC3
                 && stream.pointee.codecpar.pointee.profile == 30
         }()
+
+        // AE#462 harness (TEST-ONLY): both attempts are skipped so the video-only tail is reachable
+        // without a source this build has no decoder for. Loud, because a run that read as a real
+        // classification would be worse than no harness at all.
+        let forcedDrop = AetherEngine.forceAudioPipelineFailureForTesting
+        if forcedDrop {
+            EngineLog.emit(
+                "[HLSVideoEngine] TEST-ONLY: audio pipeline forced to fail, skipping stream-copy and bridge",
+                category: .session
+            )
+        }
 
         let sourceCodecLabel: String = {  // falls back to "audio" for codecs with no libavcodec name entry
             if let stream = sourceAudioStream,
@@ -125,7 +145,7 @@ extension HLSVideoEngine {
             return "audio"
         }()
 
-        if !preferBridge, let cfg = streamCopyAudio, let vcfg = savedVideoConfig {
+        if !forcedDrop, !preferBridge, let cfg = streamCopyAudio, let vcfg = savedVideoConfig {
             // Pre-flight avformat_write_header: makeProducer is lazy (muxer alloc on first keep-packet), so a
             // failure there (EAC3-from-MKV, missing dec3 extradata, -22 "Cannot write moov atom before EAC3
             // packets parsed") would leave the producer stuck with the bridge fallback unreachable.
@@ -178,6 +198,7 @@ extension HLSVideoEngine {
                     self.audioPipelineDescription = sourceIsAtmos
                         ? "Stream-copy (EAC3+JOC Atmos)"
                         : "Stream-copy (\(sourceCodecLabel))"
+                    self.audioDelivery = .streamCopy
                     return prod
                 } catch {
                     EngineLog.emit(
@@ -194,7 +215,7 @@ extension HLSVideoEngine {
             )
         }
 
-        if let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0 {
+        if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0 {
             // #165: cascade across bridge encoders. The encoder the configured mode resolves to for this
             // source can be absent from the FFmpeg build (custom builds without --enable-encoder=eac3);
             // AudioBridge.init then throws .encoderNotFound naming it. Rather than dropping to silent
@@ -244,7 +265,8 @@ extension HLSVideoEngine {
                     sourceStreamIndex: sourceAudioStreamIndex,
                     inputTimeBase: bridge.encoderTimeBase,
                     sourceTimeBase: audioStream.pointee.time_base,
-                    bridge: bridge
+                    bridge: bridge,
+                    language: audioLanguage
                 )
                 self.savedAudioConfig = cfg
                 self.audioBridge = bridge
@@ -258,6 +280,7 @@ extension HLSVideoEngine {
                     let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = pipelineLabel
+                    self.audioDelivery = .bridged
                     if attemptIndex > 0 {
                         EngineLog.emit(
                             "[HLSVideoEngine] audio bridge cascaded \(Self.encoderLabel(firstAttempt)) → "
@@ -290,6 +313,19 @@ extension HLSVideoEngine {
         self.audioBridge = nil
         audioHLSCodecs = nil
         self.audioPipelineDescription = nil
+        // AE#462: the drop becomes a fact the host can read, and a line that says which of the two
+        // silences this is. The ERROR lines above name a failure; this one names the outcome, which
+        // is what a reader of the log is actually looking for.
+        self.audioDelivery = Self.videoOnlyAudioDelivery(
+            hadSourceAudioStream: sourceAudioStream != nil && sourceAudioStreamIndex >= 0)
+        EngineLog.emit(
+            "[HLSVideoEngine] audio delivery = \(audioDelivery.rawValue)"
+            + (audioDelivery == .droppedNoPipeline
+               ? ": the source has audio and none of it could be delivered, the session plays "
+                 + "video-only (a host with a fallback ladder demotes here)"
+               : ": the source carries no audio to deliver"),
+            category: .session
+        )
         return try makeProducer(baseIndex: initialProducerBaseIndex)
     }
 }

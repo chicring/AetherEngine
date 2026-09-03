@@ -11,6 +11,14 @@ final class AudioOutput: @unchecked Sendable {
 
     private let lock = NSLock()
 
+    /// AE#464: the host's audio presentation offset, applied to every buffer on its way into the
+    /// renderer. Guarded because the host writes it from the main actor while the demux thread reads
+    /// it in `enqueue`.
+    private var presentationOffset: CMTime = .zero
+
+    /// One line per offset change, not per buffer. Reset by `setPresentationOffset`.
+    private var loggedOffsetInEffect = false
+
     init() {
         renderer = AVSampleBufferAudioRenderer()
         synchronizer = AVSampleBufferRenderSynchronizer()
@@ -79,10 +87,28 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.setRate(0.0, time: at)
     }
 
+    /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
+    /// this path means stamping its samples further ahead on the synchronizer's timeline: at clock
+    /// time t the renderer then plays what was recorded at t minus the offset, while the video layer
+    /// still presents t. Applied to buffers enqueued from here on; the samples already inside the
+    /// renderer keep the previous offset until something flushes them.
+    func setPresentationOffset(seconds: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        presentationOffset = seconds == 0 ? .zero : CMTime(seconds: seconds, preferredTimescale: 90000)
+        loggedOffsetInEffect = false
+    }
+
     /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
     /// isReadyForMoreMediaData dropped early samples before the synchronizer started, giving silence.
+    ///
+    /// AE#464: this is where a lip-sync offset is applied, and the position is the point. It is past
+    /// the audio tap (whose `sourceTime` is documented as the SOURCE axis and feeds transcription),
+    /// past the decoder's gapless clock (which would absorb a sub-100 ms offset as rounding), and
+    /// past the caller's `lastEnqueuedAudioPtsSec` bookkeeping (whose lead is measured against the
+    /// synchronizer clock, i.e. against the source axis too). Only the renderer sees the shift.
     func enqueue(sampleBuffer: CMSampleBuffer) {
-        renderer.enqueue(sampleBuffer)
+        renderer.enqueue(retimed(sampleBuffer))
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -107,6 +133,67 @@ final class AudioOutput: @unchecked Sendable {
     private var _loggedFirstEnqueue = false
     private var _loggedRendererError = false
     #endif
+
+    /// A copy of `sampleBuffer` shifted by the current offset, or the buffer itself when there is
+    /// none (the overwhelmingly common case, and one that must not cost an allocation). A copy that
+    /// cannot be made is delivered unshifted: an audible lip-sync error is a far better outcome than
+    /// a dropped buffer, which is silence.
+    private func retimed(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
+        lock.lock()
+        let offset = presentationOffset
+        lock.unlock()
+        guard offset != .zero else { return sampleBuffer }
+        let shifted = Self.retimed(sampleBuffer, by: offset)
+
+        // Release-visible, once per offset change: an offset that was set and an offset that is being
+        // DELIVERED are different claims, and without this line the difference is only measurable with
+        // a capture card. The two timestamps are the whole proof.
+        if !loggedOffsetInEffect, shifted !== sampleBuffer {
+            loggedOffsetInEffect = true
+            let source = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+            EngineLog.emit(
+                "[AudioOutput] AE#464 audio delay in effect: "
+                + String(format: "%+.0f ms", offset.seconds * 1000)
+                + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds),
+                category: .swPlayback
+            )
+        }
+        return shifted
+    }
+
+    /// The timing half, pure so the shift can be checked without a renderer. Every timing entry moves
+    /// by `offset`, presentation and decode alike; an entry with no valid presentation stamp is left
+    /// alone rather than given one.
+    static func retimed(_ sampleBuffer: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer {
+        guard offset != .zero else { return sampleBuffer }
+        var count: CMItemCount = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(sampleBuffer,
+                                                     entryCount: 0,
+                                                     arrayToFill: nil,
+                                                     entriesNeededOut: &count) == noErr,
+              count > 0 else { return sampleBuffer }
+        var timings = [CMSampleTimingInfo](repeating: .invalid, count: Int(count))
+        guard CMSampleBufferGetSampleTimingInfoArray(sampleBuffer,
+                                                     entryCount: count,
+                                                     arrayToFill: &timings,
+                                                     entriesNeededOut: nil) == noErr else {
+            return sampleBuffer
+        }
+        for i in timings.indices where timings[i].presentationTimeStamp.isValid {
+            timings[i].presentationTimeStamp = CMTimeAdd(timings[i].presentationTimeStamp, offset)
+            if timings[i].decodeTimeStamp.isValid {
+                timings[i].decodeTimeStamp = CMTimeAdd(timings[i].decodeTimeStamp, offset)
+            }
+        }
+        var shifted: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                    sampleBuffer: sampleBuffer,
+                                                    sampleTimingEntryCount: count,
+                                                    sampleTimingArray: &timings,
+                                                    sampleBufferOut: &shifted) == noErr,
+              let shifted else { return sampleBuffer }
+        return shifted
+    }
 
     var currentTime: CMTime {
         synchronizer.currentTime()

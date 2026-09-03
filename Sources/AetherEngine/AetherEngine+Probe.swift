@@ -216,6 +216,10 @@ extension AetherEngine {
         return try swDecodeProbeRun(demuxer: demuxer, maxPackets: maxPackets)
     }
 
+    /// #407: how many decoded picture timestamps `swDecodeProbe` retains. Enough to read a reorder
+    /// cadence off, small enough that a long probe stays a diagnostic.
+    private nonisolated static let probeFrameTimeCap = 240
+
     private nonisolated static func swDecodeProbeRun(
         demuxer: Demuxer,
         maxPackets: Int
@@ -245,12 +249,18 @@ extension AetherEngine {
             var firstFramePixelFormat: String?
             var firstFrameWidth: Int = 0
             var firstFrameHeight: Int = 0
+            /// #407: in decoder output order, i.e. presentation order. Capped so a long run stays a
+            /// diagnostic rather than an allocation.
+            var frameTimesSeconds: [Double] = []
         }
         let accum = Accum()
 
         do {
-            try decoder.open(stream: stream) { pixelBuffer, _, _ in
+            try decoder.open(stream: stream) { pixelBuffer, pts, _ in
                 accum.framesDecoded += 1
+                if accum.frameTimesSeconds.count < Self.probeFrameTimeCap {
+                    accum.frameTimesSeconds.append(pts.seconds)
+                }
                 if accum.firstFramePixelFormat == nil {
                     let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                     let bytes: [UInt8] = [
@@ -323,7 +333,8 @@ extension AetherEngine {
             firstFramePixelFormat: accum.firstFramePixelFormat,
             firstFrameWidth: accum.firstFrameWidth,
             firstFrameHeight: accum.firstFrameHeight,
-            firstError: firstError
+            firstError: firstError,
+            frameTimesSeconds: accum.frameTimesSeconds
         )
     }
 
@@ -549,8 +560,11 @@ extension AetherEngine {
         return "VideoToolbox \(name) (HW)"
     }
 
-    /// User-facing label for the active audio decoder on the SW path (libavcodec -> CoreAudio). nil when no audio track.
-    static func softwareAudioDecoderLabel(
+    /// User-facing label for the active audio decoder on the SW path (libavcodec -> CoreAudio). nil when
+    /// no audio track. AE#462: `activeIndex` is the HOST's resolved index, never the engine's pick. The
+    /// pick says which track was asked for; a session whose decoder refused to open serves none, and
+    /// this label used to name one for it.
+    nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
         activeIndex: Int32
     ) -> String? {
@@ -589,6 +603,25 @@ extension AetherEngine {
         }
         // SMPTE2084 base (P5/P7/P8.1) or unspecified trc (P5 with empty VUI): AVPlayer tonemaps via dvh1 on non-DV panel.
         return caps.supportsHDR10 ? .hdr10 : .sdr
+    }
+
+    /// The format to publish as `videoFormat`: what the panel is presenting, not what the file carries
+    /// (`sourceVideoFormat` is that). One funnel for both the load-time answer and the late one the #459
+    /// playback probe can produce seconds later, so the two cannot drift apart.
+    ///
+    /// The HDR10+ carry-over exists because the two can arrive in either order. `handleHDR10PlusDetected`
+    /// upgrades a `videoFormat` that already reads `.hdr10`, and on a panel whose answer is still pending
+    /// the label reads `.sdr` when the T.35 payload lands, so the upgrade is skipped and the evidence
+    /// survives in `sourceVideoFormat` alone. Republishing the bare effective format would then relabel a
+    /// proven HDR10+ session "HDR10+ -> HDR10", trading one wrong arrow for a quieter one.
+    nonisolated static func presentedVideoFormat(
+        effectiveFormat: VideoFormat,
+        panelPresentsHDR: Bool,
+        sourceVideoFormat: VideoFormat
+    ) -> VideoFormat {
+        guard effectiveFormat != .sdr, panelPresentsHDR else { return .sdr }
+        if effectiveFormat == .hdr10, sourceVideoFormat == .hdr10Plus { return .hdr10Plus }
+        return effectiveFormat
     }
 
     private nonisolated static func streamHasDV(stream: UnsafeMutablePointer<AVStream>) -> Bool {

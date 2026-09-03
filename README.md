@@ -185,6 +185,15 @@ player.$videoRoute     // pipeline actually serving the session: .remoteBypass (
                        // bypass and the loopback, mid-session too. Branch on this where behaviour
                        // differs per pipeline, above all who draws subtitles: on .remoteBypass
                        // AVPlayer renders the origin's renditions, elsewhere the host renders.
+player.$audioDelivery  // how the audio reaches the renderer: .streamCopy / .bridged / .decoded /
+                       // .noAudioInSource / .playerManaged (AVFoundation owns it) / .none, and
+                       // .droppedNoPipeline: the source HAS audio and none of it could be
+                       // delivered (no decoder in this build, or the bridge could not be built),
+                       // so the session plays video-only and silently. That is the value a
+                       // fallback ladder demotes on, the same way it demotes on the
+                       // PlaybackErrorKind.audioBridgeProducedNoOutput at the other end of the
+                       // cascade. Classify on this; $activeAudioDecoder is the label for a human
+                       // and cannot separate a source without audio from one that lost it.
 player.$hasFirstFrameReadyForDisplay
                        // the running path has a first frame ready for display, for the media THIS
                        // load opened: the edge a black cover comes off on. readyToPlay is not that
@@ -325,7 +334,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.58.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.66.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -528,10 +537,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.58.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.66.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.58.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.66.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

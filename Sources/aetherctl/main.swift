@@ -73,6 +73,9 @@ func printUsage() {
       aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
+                 [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]
+                 [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
+                 [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
              [--max-concurrent-requests N]
                      [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback,seekfar] <url>
@@ -86,7 +89,16 @@ func printUsage() {
                       applying a language preference just after play, default +20 ms;
                       --teletext-page fixes the caption page at load, while
                       --switch-teletext-page changes it on the playing channel
+                      --drop-audio forces the audio pipeline to fail (AE#462), so
+                      the video-only drop and its published audioDelivery can be
+                      observed without a source this build cannot decode
                       (default +20 s, i.e. after --subs has a track showing);
+                      --reload-applying corrects a LoadOption on the playing
+                      session through #460's session-preserving reload, repeatable;
+                      keys header.<Name>, audio-bridge, preferred-audio,
+                      decode-path, is-live
+                      (is-live is there to show the refusal: a field that names the
+                      session is refused, not silently ignored), default +20 s;
                       --sequential-origin declares a fake-range origin (one unranged
                       GET, no ranged probes) and needs --declared-duration on VOD
                       since the tail estimate is skipped)
@@ -558,6 +570,13 @@ if first == "play" {
     let seekCount = takeIntFlag("--seek-count", from: &rest)
     let mallocCensus = takeFlag("--malloc-census", from: &rest)
     let playForceSW = takeFlag("--sw", from: &rest)
+    // AE#462: force the audio pipeline to fail so the video-only drop is observable end to end.
+    // There is no fixture for it: the drop needs a codec this build has no decoder for (AC-4 is the
+    // realistic one), and a threshold that plausible is worth less than the real published value.
+    if takeFlag("--drop-audio", from: &rest) {
+        AetherEngine.setForceAudioPipelineFailureForTesting(true)
+        print("[aetherctl] TEST-ONLY: audio pipeline forced to fail (AE#462 video-only drop)")
+    }
     let censusThresholdMB = takeIntFlag("--census-threshold-mb", from: &rest)
     let censusHz = takeDoubleFlag("--census-hz", from: &rest)
     // Slow-CDN simulation, same hook as `serve` / `seektest`: a local file lets the producer race
@@ -622,6 +641,63 @@ if first == "play" {
         return TeletextPageSwitchRequest(page: page,
                                         delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000)
     }
+    // AE#464: `--audio-delay <ms>` is the load option, `--switch-audio-delay <ms>[@ms]` is the
+    // runtime setter. Same 20 s default as the teletext switch and for the same reason: it has to
+    // land on a session that is playing, or it only re-proves the load option.
+    let audioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
+    let audioDelaySwitch: AudioDelaySwitchRequest? = takeStringFlag("--switch-audio-delay", from: &rest).flatMap { spec in
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        guard let ms = Int(parts[0]) else {
+            print("ERROR: --switch-audio-delay takes <ms>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        return AudioDelaySwitchRequest(milliseconds: ms,
+                                       delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000)
+    }
+    // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
+    // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
+    // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
+    // a session that is already playing.
+    var optionChanges: [LoadOptionChange] = []
+    while let spec = takeStringFlag("--reload-applying", from: &rest) {
+        guard let eq = spec.firstIndex(of: "=") else {
+            print("ERROR: --reload-applying expects <key>=<value>, got '\(spec)'")
+            exit(64)
+        }
+        let key = String(spec[..<eq]).trimmingCharacters(in: .whitespaces)
+        let value = String(spec[spec.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+        if key.hasPrefix("header.") {
+            optionChanges.append(.header(name: String(key.dropFirst("header.".count)), value: value))
+        } else if key == "audio-bridge" {
+            guard let mode = AudioBridgeMode(rawValue: value) else {
+                print("ERROR: --reload-applying audio-bridge takes \(AudioBridgeMode.allCases.map(\.rawValue).joined(separator: "|")), got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.audioBridgeMode(mode))
+        } else if key == "preferred-audio" {
+            optionChanges.append(.preferredAudioLanguages(
+                value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }))
+        } else if key == "decode-path" {
+            guard let path = DecodePath(rawValue: value) else {
+                print("ERROR: --reload-applying decode-path takes \(DecodePath.allCases.map(\.rawValue).joined(separator: "|")), got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.decodePath(path))
+        } else if key == "is-live" {
+            guard let flag = Bool(value) else {
+                print("ERROR: --reload-applying is-live takes true|false, got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.isLive(flag))
+        } else {
+            print("ERROR: --reload-applying key '\(key)' is not one of header.<Name>, audio-bridge, preferred-audio, decode-path, is-live")
+            exit(64)
+        }
+    }
+    let optionCorrectionDelay = takeIntFlag("--reload-applying-at", from: &rest) ?? 20_000
+    let optionCorrection: LoadOptionCorrectionRequest? = optionChanges.isEmpty
+        ? nil
+        : LoadOptionCorrectionRequest(changes: optionChanges, delayMilliseconds: optionCorrectionDelay)
     // AE#363: LoadOptions.httpHeaders, repeatable as `--header "Name: Value"`. Header-enforcing
     // origins (IPTV STB profiles, Referer-locked CDNs) had no CLI harness at all, so neither the
     // AVPlayer bypass nor the ingest reader could be driven against one from here.
@@ -649,6 +725,8 @@ if first == "play" {
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
+                 audioDelayMs: audioDelayMs, audioDelaySwitch: audioDelaySwitch,
+                 optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders))
@@ -701,6 +779,10 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let throttleKbps = takeIntFlag("--throttle-kbps", from: &rest)
     // --start-position: anchor the first producer at a resume position like load(startPosition:) (#99); serve only.
     let startPosition = takeDoubleFlag("--start-position", from: &rest)
+    // AE#464: park the server with an audio offset already in the muxer, so the delivered offset can
+    // be read straight off the segments (ffprobe the audio and video first-packet PTS) instead of
+    // being judged by ear.
+    let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -719,7 +801,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         exit(runProbe(url: url))
     case "serve":
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
-                 nativeSubsIndex: nativeSubsIndex, startPosition: startPosition)
+                 nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
+                 audioDelayMs: serveAudioDelayMs)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV))
     case "swdecode":

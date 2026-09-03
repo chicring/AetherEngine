@@ -30,6 +30,7 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     private let condition = NSCondition()
+    private let onResidentSetChanged: (@Sendable () -> Void)?
 
     private let forwardWindow: Int
     /// 20 covers Continuous-Audio handover refetches (~7-10 segments backward); smaller values
@@ -102,10 +103,11 @@ final class SegmentCache: @unchecked Sendable {
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
-         baseDirectory: URL? = nil) {
+         baseDirectory: URL? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
+        self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
         let baseDir = baseDirectory ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -284,19 +286,24 @@ final class SegmentCache: @unchecked Sendable {
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
+        // A re-store of a resident index changes bytes, not residency; only an insertion or an
+        // eviction moves the set, and both are already known here without walking it.
+        var residentSetChanged = false
         if writeOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            entries[index] = fileURL
+            residentSetChanged = entries.updateValue(fileURL, forKey: index) == nil
             entryBytes[index] = data.count
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
         }
         let doomed = pruneOutsideWindow()
+        if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
         condition.unlock()
         for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if residentSetChanged { onResidentSetChanged?() }
     }
 
     /// Adopt a staging file via rename(2). Page cache pages stay warm; skips a Swift Data round trip.
@@ -330,11 +337,12 @@ final class SegmentCache: @unchecked Sendable {
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
+        var residentSetChanged = false
         if renameOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            entries[index] = fileURL
+            residentSetChanged = entries.updateValue(fileURL, forKey: index) == nil
             entryBytes[index] = byteCount
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
@@ -346,15 +354,18 @@ final class SegmentCache: @unchecked Sendable {
             videoReaches[index] = videoReach
         }
         let doomed = pruneOutsideWindow()
+        if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
         condition.unlock()
         for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if residentSetChanged { onResidentSetChanged?() }
     }
 
     func close() {
         condition.lock()
         closed = true
         let dir = sessionDir
+        let hadEntries = !entries.isEmpty
         entries.removeAll(keepingCapacity: false)
         entryBytes.removeAll(keepingCapacity: false)
         videoReaches.removeAll(keepingCapacity: false)
@@ -367,6 +378,9 @@ final class SegmentCache: @unchecked Sendable {
 
         releaseLiveMarker()
         try? FileManager.default.removeItem(at: dir)
+        // A closed cache holds nothing, and that is a resident-set change like any other. The engine
+        // clears its published band on teardown anyway; this keeps the cache honest on its own.
+        if hadEntries { onResidentSetChanged?() }
     }
 
     // MARK: - Reader side
@@ -382,6 +396,7 @@ final class SegmentCache: @unchecked Sendable {
         }
         condition.unlock()
         for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
     /// Must be called with condition held.
@@ -513,6 +528,7 @@ final class SegmentCache: @unchecked Sendable {
         for url in doomed {
             try? FileManager.default.removeItem(at: url)
         }
+        if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
     /// Authoritative disk footprint via fresh stat (not _totalBytes accumulator); diagnostics path.
@@ -585,6 +601,30 @@ final class SegmentCache: @unchecked Sendable {
         guard !entries.isEmpty else { return nil }
         let keys = entries.keys
         return (keys.min()!, keys.max()!)
+    }
+
+    /// Contiguous runs of segment indexes that are resident on disk. A 2026-09-02 field session
+    /// retained 64 segments across several islands, so min/max alone cannot describe the picture
+    /// a host can truthfully mark as loaded.
+    func residentIndexRanges() -> [ClosedRange<Int>] {
+        condition.lock()
+        defer { condition.unlock() }
+        let indexes = entries.keys.sorted()
+        guard let first = indexes.first else { return [] }
+        var ranges: [ClosedRange<Int>] = []
+        var lower = first
+        var upper = first
+        for index in indexes.dropFirst() {
+            if index == upper + 1 {
+                upper = index
+            } else {
+                ranges.append(lower...upper)
+                lower = index
+                upper = index
+            }
+        }
+        ranges.append(lower...upper)
+        return ranges
     }
 
     /// Monotonic across prunes; reset per restart via resetHighWaterForRestart().

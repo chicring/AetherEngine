@@ -71,17 +71,30 @@
 #   tc-bframes.mkv   AVPlayer holds the re-placed seg13 from item 61.083, picture reads -18.083
 #   tc-drought.mkv   AVPlayer holds it from item 61.000,                  picture reads -18.000
 #
-# So on the B-frame arm both placements must now print `#418 segN placement confirmed` (3 of 3 runs)
-# and none of them `placed on base ...`. The case that pays for it is the one that cannot be measured
-# at all, a seek burst that reopens backwards inside the buffer:
+# AE#418 round 6 measures that coefficient instead of carrying it, because it is NOT a constant. The
+# script writes a THIRD clip, `tc-bf1.mkv`, identical to `tc-bframes.mkv` but for `-bf 1` (one frame
+# of reorder instead of two, which is the reporter's asset at 23.976 fps). Same burst arm on all
+# three, three runs each, the reading and the picture agreeing in all nine:
+#
+#   tc-drought.mkv  lead 0.000  base = the axis           -9.000 -> -18.000 -> -23.000
+#   tc-bf1.mkv      lead 0.042  base = the axis           -9.000 -> -18.000 -> -23.000
+#   tc-bframes.mkv  lead 0.083  base = axis - one lead    -9.000 -> -18.083 -> -23.166
+#
+# So a session starts with no coefficient, composes without one, and the first placement it can read
+# back states it (`#418 segN says a lead counts 1.00x on this source`). Under round 5 the middle row
+# was composed at -18.042 and corrected back on every measurable placement, and its unmeasurable one
+# kept -23.042, one lead over the picture. The case that pays for all of it is the placement that
+# cannot be measured at all, a seek burst that reopens backwards inside the buffer:
 #
 #   swift run aetherctl play --seconds 30 --start-position 53 --picture-probe \
 #       --seek-every 2 --seek-count 4 --seek-pattern 65,60,70,58 file:///tmp/tc-bf-cues-lie.mkv
 #
 # It ends on `#418 segN opened no run of its own to measure`, so whatever the composition said is
-# what the session keeps. Measured, two shapes, both matching the picture exactly: `-23.166` after two
-# compositions and `-27.166` after three. Under round 4 those were kept at -23.083 and -27.000, i.e.
-# one lead per composition, which is why an unmeasured chain drifts and a measured one does not.
+# what the session keeps. Measured on tc-bframes.mkv, two shapes, both matching the picture exactly:
+# `-23.166` after two compositions and `-27.166` after three. Under round 4 those were kept at
+# -23.083 and -27.000, i.e. one lead per composition, which is why an unmeasured chain drifts and a
+# measured one does not. Run the same line against `tc-bf1-cues-lie.mkv` for the other geometry: the
+# coefficient reads 0.00x and the chain must end on -23.000 / -27.000, with the picture agreeing.
 #
 # For magnitudes this fixture cannot reach, engineer the droughts: a key 3 s below a boundary gives
 # -3, 5 s gives -5, and a key under a second below one gives an axis AVPlayer THROWS AWAY at the
@@ -125,3 +138,17 @@ ffmpeg -hide_banner -loglevel error -y \
   -c:a aac -b:a 128k -shortest \
   "$OUT_DIR/tc-bframes.mkv"
 echo "wrote $OUT_DIR/tc-bframes.mkv (same, has_b_frames=2)"
+
+# AE#418 round 6: one frame of reorder instead of two, which is what the reporter's asset carries and
+# what falsified round 5's constant. Everything else identical again, so the three clips differ in
+# reorder depth alone.
+ffmpeg -hide_banner -loglevel error -y \
+  -f lavfi -i "color=c=black:s=640x360:r=${FPS}:d=${DUR}" \
+  -f lavfi -i "sine=frequency=440:duration=${DUR}" \
+  -vf "$filters" \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 1000 -sc_threshold 0 \
+  -bf 1 -x264-params "b-pyramid=none:open-gop=0" \
+  -force_key_frames "$KEYS" -b:v 2M \
+  -c:a aac -b:a 128k -shortest \
+  "$OUT_DIR/tc-bf1.mkv"
+echo "wrote $OUT_DIR/tc-bf1.mkv (same, has_b_frames=1)"

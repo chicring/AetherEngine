@@ -119,3 +119,19 @@ jobs:
             -destination 'generic/platform=visionOS Simulator' \
             -derivedDataPath .build/xcode-visionos \
             CODE_SIGNING_ALLOWED=NO
+
+  # The docs site (aetherengine-website) validates every heading anchor at build time, but it
+  # lives in another repo and only builds AFTER a push to main, so a broken anchor ships first
+  # and is found second: `docs/api.md` linked `formats.md#dolby-vision` against a heading that
+  # slugs to `#dolby-vision-signaling`, and the site build failed on every dispatch from 6.58.0
+  # until someone looked. Same check, here, before the merge. Ubuntu on purpose: it needs no
+  # toolchain and no network, so it reports in seconds while the macOS jobs are still starting.
+  docs-links:
+    name: docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate relative links and heading anchors in the published docs
+        run: python3 Scripts/check-doc-links.py

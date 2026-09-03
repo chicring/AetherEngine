@@ -204,6 +204,11 @@ public final class Demuxer: @unchecked Sendable {
     private var compositionRepair: H264CompositionOffsetRepairSession?
     private var compositionRepairEvaluated = false
 
+    /// #407: video streams whose PTS `+genpts` invented out of decode order, because the container
+    /// carries none of its own. Cleared on the way out of `readPacketLocked` so the decoder's reorder
+    /// owns the presentation axis. Decided once at open, see `armGeneratedPTSSuppression`.
+    private var generatedPTSStreams: Set<Int32> = []
+
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
     /// duration). The side reader caps the timestamp-seek attempt tight when this is true, because the
     /// verified estimate is a cheaper, bounded way to position on an index-less source.
@@ -569,6 +574,7 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
+        unresolvableAudioStreams = []
         // #87: the subtitle side demuxer opts out of find_stream_info. avformat_open_input already
         // carries codec_id / codec_type for every subtitle track (container header / PMT), and
         // reclassifyAttachedPictures only exists to bound the find_stream_info cost, so both are skipped.
@@ -578,11 +584,130 @@ public final class Demuxer: @unchecked Sendable {
             return
         }
         reclassifyAttachedPictures(ctx)
+        let parked = parkUnresolvableAudio(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
+        unparkUnresolvableAudio(ctx, parked)
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
         logStreams(ctx)
+        armGeneratedPTSSuppression(ctx)
+    }
+
+    /// An audio stream this build can never resolve, named so a report can say why a source came up
+    /// without sound. Recorded per open by `parkUnresolvableAudio`. (#466)
+    struct UnresolvableAudioStream: Equatable, Sendable {
+        let index: Int
+        /// Lower-case libavcodec name, e.g. "ac4".
+        let codec: String
+    }
+
+    /// Audio streams parked out of the way of the most recent `find_stream_info`. (#466)
+    private(set) var unresolvableAudioStreams: [UnresolvableAudioStream] = []
+
+    /// Whether `find_stream_info` can ever resolve this audio stream in THIS build, given what the
+    /// container already declared. (#466)
+    ///
+    /// `has_codec_parameters` fails an audio stream with no sample rate or no channel count, and both
+    /// can only arrive from the container or from opening a decoder. With no decoder compiled in,
+    /// `try_decode_frame` gives up on the first packet (`found_decoder` goes negative) and the outer
+    /// loop keeps reading anyway, because its only exit is every stream satisfying
+    /// `has_codec_parameters`. One such stream therefore costs the whole probe budget, and on a live
+    /// source that budget is spent at the wire rate (#466, Sodalite#100: an ATSC 3.0 channel whose
+    /// audio is AC-4, most of a minute of tuning indicator and then a silent fail-open).
+    ///
+    /// Three deliberate exclusions. `AV_CODEC_ID_NONE` is a stream still being identified, which is
+    /// what the probe is for. A codec whose parameters the container already carries is never chased,
+    /// so it is none of this decision's business. And video is out of scope: the native path decodes
+    /// formats libavcodec was not built with (ProRes is the standing example), while every container
+    /// that describes a video stream at all carries its size, so the case does not arise.
+    static func audioCannotResolve(
+        codecID: AVCodecID, codecType: AVMediaType, sampleRate: Int32, channels: Int32
+    ) -> Bool {
+        guard codecType == AVMEDIA_TYPE_AUDIO, codecID != AV_CODEC_ID_NONE else { return false }
+        guard sampleRate == 0 || channels == 0 else { return false }
+        return avcodec_find_decoder(codecID) == nil
+    }
+
+    /// Reclassify audio streams that can never resolve to ATTACHMENT for the duration of the probe,
+    /// the same lever `reclassifyAttachedPictures` uses: `has_codec_parameters` asks nothing of an
+    /// ATTACHMENT stream, so the pass can take its "all info found" exit as soon as the real streams
+    /// are known. (#466)
+    ///
+    /// Parked FOR the probe, not permanently, because the stream is not an attachment and every
+    /// consumer downstream is entitled to see it. `find_stream_info` writes its internal context back
+    /// over `codecpar` on the way out, so the restore has to follow it rather than being skipped as
+    /// redundant. What the caller ends up with is exactly the state a full-budget probe would have
+    /// left (audio stream present, parameters unresolved), reached without paying for it.
+    private func parkUnresolvableAudio(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int] {
+        var parked: [Int] = []
+        var found: [UnresolvableAudioStream] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  Self.audioCannotResolve(codecID: codecpar.pointee.codec_id,
+                                          codecType: codecpar.pointee.codec_type,
+                                          sampleRate: codecpar.pointee.sample_rate,
+                                          channels: codecpar.pointee.ch_layout.nb_channels)
+            else { continue }
+            found.append(UnresolvableAudioStream(
+                index: i, codec: String(cString: avcodec_get_name(codecpar.pointee.codec_id))))
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
+            parked.append(i)
+        }
+        unresolvableAudioStreams = found
+        if !found.isEmpty {
+            let listed = found.map { "\($0.index)=\($0.codec)" }.joined(separator: " ")
+            EngineLog.emit(
+                "[Demuxer] no decoder for audio stream(s) \(listed); not probed, source plays without them",
+                category: .demux)
+        }
+        return parked
+    }
+
+    private func unparkUnresolvableAudio(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
+        for i in parked where i < Int(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        }
+    }
+
+    /// #407: find the video streams whose PTS `+genpts` is inventing out of decode order, so
+    /// `readPacketLocked` can clear it and leave the axis to the decoder's own reorder. Needs the
+    /// stream parameters `avformat_find_stream_info` fills in, hence the call site right below it.
+    /// See `VFWDecodeOrderPTSRepair` for why the gate is an equivalence rather than a heuristic.
+    private func armGeneratedPTSSuppression(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        generatedPTSStreams.removeAll()
+        guard let nameC = ctx.pointee.iformat?.pointee.name else { return }
+        let formatName = String(cString: nameC)
+        guard VFWDecodeOrderPTSRepair.isMatroska(formatName) else { return }
+        for index in 0..<Int32(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[Int(index)],
+                  let par = stream.pointee.codecpar,
+                  par.pointee.codec_type == AVMEDIA_TYPE_VIDEO else { continue }
+            let shape = VFWDecodeOrderPTSRepair.StreamShape(
+                codecTag: par.pointee.codec_tag,
+                videoDelay: par.pointee.video_delay,
+                codecID: par.pointee.codec_id
+            )
+            guard VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(formatName: formatName, shape: shape)
+            else { continue }
+            generatedPTSStreams.insert(index)
+            EngineLog.emit(
+                "[Demuxer] AE#407 stream=\(index) is VFW-carried (tag=\(fourCC(par.pointee.codec_tag)) "
+                + "videoDelay=\(par.pointee.video_delay)); the container carries no PTS, so the "
+                + "+genpts axis is decode order. Clearing PTS, the decoder's reorder owns presentation.",
+                category: .demux
+            )
+        }
+    }
+
+    /// A `codec_tag` printed the way the VFW header spells it, for the diagnostic above.
+    private func fourCC(_ tag: UInt32) -> String {
+        let bytes = [tag, tag >> 8, tag >> 16, tag >> 24].map { UInt8($0 & 0xFF) }
+        let text = String(decoding: bytes, as: UTF8.self)
+        return text.allSatisfy { $0.isASCII && !$0.isNewline && $0 != "\0" }
+            ? text
+            : String(format: "0x%08X", tag)
     }
 
     /// Run a bounded `avformat_find_stream_info` on an already-open context (#87). Used by the subtitle
@@ -1185,6 +1310,13 @@ public final class Demuxer: @unchecked Sendable {
                 return nil
             }
             throw DemuxerError.readFailed(code: ret)
+        }
+        // #407: before anything reads a timestamp off this packet. The PTS on these streams was
+        // invented by `+genpts` out of decode order and transposes every B/P pair; dropping it leaves
+        // the decoder's own reorder to place the picture. See `VFWDecodeOrderPTSRepair`.
+        if !generatedPTSStreams.isEmpty, let pkt = packet,
+           generatedPTSStreams.contains(pkt.pointee.stream_index) {
+            pkt.pointee.pts = Int64.min
         }
         if !clipTimeline.isEmpty, let pkt = packet {
             let si = Int(pkt.pointee.stream_index)

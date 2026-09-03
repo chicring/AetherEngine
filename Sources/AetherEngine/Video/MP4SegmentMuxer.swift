@@ -93,6 +93,16 @@ final class MP4SegmentMuxer {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
+        /// AE#458: ISO 639-2/T for the track's `mdhd`. Nil writes nothing, leaving movenc's `und`.
+        let language: String?
+
+        init(codecpar: UnsafePointer<AVCodecParameters>,
+             timeBase: AVRational,
+             language: String? = nil) {
+            self.codecpar = codecpar
+            self.timeBase = timeBase
+            self.language = language
+        }
     }
 
     /// Result of a segment cut. `deferredAwaitingAudioSampleEntry` is a THIRD state, distinct from both
@@ -179,6 +189,17 @@ final class MP4SegmentMuxer {
     private(set) var muxerAudioTimeBase: AVRational = AVRational(num: 1, den: 1)
     private let haveAudio: Bool
 
+    /// AE#464: host audio offset for this muxer, in seconds. Fixed for the muxer's life on purpose:
+    /// two offsets inside one output track are not splicable (the seam gains a gap or an overlap of
+    /// exactly the change, and a change that moves audio earlier is eaten by
+    /// `OutputTimestampSanitizer`'s strictly-increasing DTS rule), so a new offset has to be a new
+    /// muxer, which the producer restart provides.
+    private let audioDelaySeconds: Double
+
+    /// The same offset in the muxer's OUTPUT audio time base, latched once the header has rewritten
+    /// it. Packets reach `writePacket` already rescaled, so this is the base the shift must be in.
+    private var audioDelayTicks: Int64 = 0
+
     /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
     /// an explicit segment cut; a degenerate plan (sparse-keyframe TS index) or any very long segment
     /// would otherwise buffer the whole span in libavformat's interleaver until the cut, growing RAM
@@ -209,11 +230,13 @@ final class MP4SegmentMuxer {
         audio: AudioConfig?,
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
+        audioDelaySeconds: Double = 0,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
+        self.audioDelaySeconds = audioDelaySeconds
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
 
@@ -295,6 +318,21 @@ final class MP4SegmentMuxer {
         muxerVideoTimeBase = ctx.pointee.streams.advanced(by: 0).pointee!.pointee.time_base
         if haveAudio {
             muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
+            // AE#464: same reason as the bound below. Latched after write_header rewrote the stream
+            // time_base, because that is the base the packets arrive in.
+            audioDelayTicks = Self.audioDelayTicks(seconds: audioDelaySeconds,
+                                                   audioTimeBase: muxerAudioTimeBase)
+            if audioDelayTicks != 0 {
+                // Release-visible: which muxer carries which offset is the only way to tell "the host
+                // set it" from "the segments being served were cut with it", and a restart is what
+                // moves the session from one to the other.
+                EngineLog.emit(
+                    "[MP4SegmentMuxer] AE#464 cutting seg\(initialSegmentIndex)+ with audio delay "
+                    + String(format: "%+.0f ms", audioDelaySeconds * 1000)
+                    + " (\(audioDelayTicks) ticks @ \(muxerAudioTimeBase.den)/\(muxerAudioTimeBase.num))",
+                    category: .session
+                )
+            }
         }
         // Bound is in the muxer's rewritten output video TB: packets reach writePacket already rescaled
         // to muxerVideoTimeBase, so the window math must use it (not the source TB). Latched here, after
@@ -314,6 +352,18 @@ final class MP4SegmentMuxer {
     }
 
     private let byteCounter: ByteCounter
+
+    // MARK: - Audio delay conversion (pure, AE#464)
+
+    /// The host's audio offset in `audioTimeBase` ticks. Rounded rather than truncated so a nudge
+    /// smaller than one tick still moves in the direction it was asked for instead of vanishing.
+    static func audioDelayTicks(seconds: Double, audioTimeBase: AVRational) -> Int64 {
+        guard seconds != 0, seconds.isFinite,
+              audioTimeBase.num > 0, audioTimeBase.den > 0 else { return 0 }
+        let ticks = seconds * Double(audioTimeBase.den) / Double(audioTimeBase.num)
+        guard ticks.isFinite, abs(ticks) < Double(Int64.max) else { return 0 }
+        return Int64(ticks.rounded())
+    }
 
     // MARK: - Buffered-fragment bound math (pure, #64)
 
@@ -440,6 +490,12 @@ final class MP4SegmentMuxer {
                 throw MuxerError.copyParametersFailed(code: aCopy)
             }
             audioStream.pointee.time_base = audio.timeBase
+            // AE#458: movenc reads this in mov_init, so it has to be set before write_header. With one
+            // muxed audio track and no EXT-X-MEDIA rendition, mdhd is the only place AVFoundation can
+            // read a track language from.
+            if let language = audio.language {
+                av_dict_set(&audioStream.pointee.metadata, "language", language, 0)
+            }
             // AE#382: a source-container codec_tag (MPEG-TS stream type / registration descriptor) makes
             // movenc refuse the header, which the audio cascade reads as "cannot stream-copy" and bridges.
             Self.dropForeignAudioCodecTag(ctx: ctx, codecpar: audioStream.pointee.codecpar)
@@ -489,6 +545,17 @@ final class MP4SegmentMuxer {
     @discardableResult
     func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> (rc: Int32, written: WrittenTimestamps) {
         guard let ctx = formatContext else { return (-1, .none) }
+
+        // AE#464: the host's lip-sync offset, applied to the audio track only and BEFORE the
+        // sanitizer, so the invariants it enforces hold for the timestamps that actually land in the
+        // segment. Video is left alone deliberately: its timestamps are what the playlist timeline,
+        // the segment boundaries and every seek are expressed in, so moving them would move the
+        // session's reported position and the subtitle axis along with the sound.
+        if audioDelayTicks != 0, packet.pointee.stream_index == audioOutputStreamIndex {
+            if packet.pointee.pts != Int64.min { packet.pointee.pts &+= audioDelayTicks }
+            if packet.pointee.dts != Int64.min { packet.pointee.dts &+= audioDelayTicks }
+        }
+
         let clean = timestampSanitizer.sanitize(
             streamIndex: packet.pointee.stream_index,
             pts: packet.pointee.pts,
