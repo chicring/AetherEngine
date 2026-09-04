@@ -163,10 +163,16 @@ extension AetherEngine {
     /// Round 5: the measurement below is the FALLBACK. Where the engine serves the playlist it also
     /// knows the axis exactly, and it states it (see `noteServedLiveItemAxis`); the difference used
     /// to be reconstructed for every item except the one a rejoin placed, which left the session's
-    /// own first item on the reconstruction as well. Measured against a device on 6.60.0: a start
-    /// item whose playlist begins at exactly 0.00s reconstructed 0.05s and then carried it for the
-    /// session (AE#446, cmcpherson274). The same construction read 0 for an item whose playlist began
-    /// 6.76s in on 6.57.0, which is the same defect with a bigger number.
+    /// own first item on the reconstruction as well. The reading that shows the cost: on 6.57.0 it
+    /// read 0 for an item whose playlist began 6.76s in (AE#454 round 2).
+    ///
+    /// Round 6: the 0.05s a device reconstructed on 6.60.0 was published here as a defect and is not
+    /// one. That item's playlist really does begin at 0.050s, because a live item's zero is the
+    /// PRESENTATION time of its first frame while the axis anchor pins the first DECODE time to 0, so
+    /// a source with frame reordering starts one presentation lead above zero (AE#446,
+    /// cmcpherson274). What that reading does show is the branch in
+    /// `liveItemStatedAxisReconstructionError`: the reconstruction had nothing at the instant of the
+    /// statement, so it could only latch from a later sample.
     @MainActor
     func measureLiveItemAxisOffset() {
         guard isLive, let host = nativeHost else { return }
@@ -289,21 +295,31 @@ extension AetherEngine {
     /// where the statement is made.
     ///
     /// The error was only ever visible where the two samples were far enough apart to notice, which
-    /// is why it survived from 6.56.5 to 6.60.0 as a 0.05 s reading nobody could attribute (and, on
-    /// one device, as a 6.76 s one that was attributed to something else first). Both terms are known
-    /// at this instant and neither costs anything to take, so the difference is stated rather than
-    /// left to be inferred from a later disagreement between two logs.
+    /// is why it survived from 6.56.5 to 6.60.0 (on one device as a 6.76 s reading that was
+    /// attributed to something else first). Both terms are known at this instant and neither costs
+    /// anything to take, so the difference is stated rather than left to be inferred from a later
+    /// disagreement between two logs.
     ///
     /// One line per item attach, and the case where the reconstruction has nothing yet is itself the
     /// answer: it means the measurement would have been taken from a sample this item had not
     /// produced.
+    ///
+    /// AE#446 round 6: which term is missing is named, because the branch is TIMING and not the item
+    /// kind. A start item usually takes it and a rejoin usually does not, but a source that delivers
+    /// fast enough wins the race on a start item too (cmcpherson274 measured one; here, the same
+    /// harness command takes opposite branches on two seeds that differ only in frame reordering,
+    /// gate-open at 0.11 s against 0.39 s). Naming the term is what separates "the item has not
+    /// reported yet" from "the producer holds nothing yet" without reading this file.
     @MainActor
     private func liveItemStatedAxisReconstructionError(stated: Double, host: NativeAVPlayerHost) {
-        guard host.seekableEnd > host.seekableStart,
-              let producerFloor = residentLiveFloorSessionSeconds() else {
+        let floor = residentLiveFloorSessionSeconds()
+        guard host.seekableEnd > host.seekableStart, let producerFloor = floor else {
+            let gap = Self.liveAxisReconstructionGap(
+                itemReportsRange: host.seekableEnd > host.seekableStart,
+                hasProducerFloor: floor != nil) ?? ""
             EngineLog.emit(
-                "[AetherEngine] #446 the reconstruction this replaces had nothing to say yet, so it "
-                + "would have been latched from a later sample",
+                "[AetherEngine] #446 the reconstruction this replaces had nothing to say yet "
+                + "(\(gap)), so it would have been latched from a later sample",
                 category: .engine)
             return
         }
@@ -315,6 +331,22 @@ extension AetherEngine {
             + "\(String(format: "%.2f", reconstructed))s, \(String(format: "%.2f", reconstructed - stated))s "
             + "off the axis the manifest states",
             category: .engine)
+    }
+
+    /// AE#446 round 6: which of the reconstruction's two terms is missing, for the line above.
+    ///
+    /// nil is "neither", which the caller never reaches: it is here so the case is stated rather than
+    /// left as an unreachable branch, and so the mapping can be tested without a session.
+    nonisolated static func liveAxisReconstructionGap(
+        itemReportsRange: Bool, hasProducerFloor: Bool
+    ) -> String? {
+        switch (itemReportsRange, hasProducerFloor) {
+        case (true, true): return nil
+        case (false, true): return "the item reports no seekable range yet"
+        case (true, false): return "the producer holds no resident floor yet"
+        case (false, false):
+            return "the item reports no seekable range yet and the producer holds no resident floor yet"
+        }
     }
 
     /// AE#446 round 5: whether an axis a build stated describes the item under the host right now.

@@ -127,12 +127,18 @@ explicit subtitle authority (subtitles explicitly OFF included) and the live rej
 re-derives them by auto-selection. This reload keeps all of it, at the same teardown cost the plain
 `reloadAtCurrentPosition()` already pays.
 
+`autoplay` is the one listed field this cannot change. The rebuild comes back in the transport state
+the session is actually in (AE#464 round 2), so a correction that sets it is overwritten rather than
+refused; use `play()` / `pause()` around the correction if the rebuild should change the transport.
+
 Two refusals, both raised BEFORE any teardown, so a refused correction leaves the session playing:
 
 | Thrown | When |
 | --- | --- |
 | `AetherEngineError.loadIdentityNotCorrectable(fields:)` | the closure changed `isLive`, `audioOnly`, `nativeRemoteHLS` or `sequentialOrigin`. These name the session rather than tune it (each opens the source on a different pipeline, and the engine writes the last two itself), so changing one is a different item, not a correction of this one. Load the source again. |
 | `AetherEngineError.sessionNotReloadable(_:)` | there is no session, or the source is a custom `IOReader` that reported itself non-seekable and cannot be reopened at the current position. It carries a `SessionReloadRefusal` (`.noActiveSession` / `.customSourceNotSeekable`) saying which. |
+| `AetherEngineError.sessionNotReloadable(.softwarePathCannotRepresentSource)` | the correction moves a native session onto the software path, and this source's only signal is IPT-PQ-c2 (Dolby Vision HEVC Profile 5, AV1 Profile 10.0). The software decoders hand that on as YCbCr, so the picture would render green/purple. |
+| `AetherEngineError.sessionNotReloadable(.demuxedAudioLiveIsNativeOnly)` | the correction moves a demuxed-audio live session onto the software path, where the side-audio merge does not exist, so it would play silent. |
 
 Both are all-or-nothing: a correction refused for one field installs none of it.
 
@@ -145,10 +151,25 @@ the four consumed by `load` itself (`preferredAudioLanguages`, `externalSubtitle
 custom reload carries the session's explicit audio pick and its own subtitle re-arm, so the two
 language lists have nothing to decide on that path anyway.
 
+`preferredDecodePath` is in the first group and was briefly in neither: the reopen picked its host
+from the backend the session was already on, so a decode-path correction on a custom source was
+accepted, named in the log and then ignored. It now asks the same routing policy `load` asks, seeded
+with that backend, so the correction lands on both source shapes. The direction is what makes that
+safe: `DecodePath` has no `.native`, so the only flip the reopen can make is native to software, and
+the software path is the general one. What the software path cannot REPRESENT is refused before any
+teardown instead (the two rows above), because the guards that catch it inside `load` run after the
+routing decision, and reaching them on a correction would mean failing a session already torn down.
+
 Unlike `reloadAtCurrentPosition()`, which returns silently when there is nothing to rebuild, this one
 throws, because a host correcting a session has to tell "corrected" from "did nothing" to decide
 whether to fall through to a fresh load. `sessionReloadRefusal` returns the same `SessionReloadRefusal` for
 either reload without attempting one, and nil when a rebuild would happen.
+
+A rebuild that FAILS also throws, on both source shapes. The custom-source branch used to publish its
+error and return as if the session had come back, so a correction could report success while the
+session sat in `.error`; it now throws what the rebuild threw, the way the URL branch always has. A
+rebuild superseded by a newer `load` or `stop` is not a failure and still returns normally, because
+the newer load owns the session.
 
 ### Overriding the decode path
 
@@ -190,6 +211,13 @@ Three properties worth knowing:
 - **`nativeRemoteHLS` is a different route.** AVPlayer plays the remote playlist and the engine
   demuxes and decodes nothing, so there is no decode path to prefer. The engine logs that it
   ignored the preference rather than letting it look applied.
+- **A mid-play correction lands on both source shapes**, URL and custom `IOReader` alike, and moves
+  the session at its own playhead without a restart. On a source the software path cannot represent
+  the correction is refused before any teardown, with `SessionReloadRefusal`
+  `.softwarePathCannotRepresentSource` or `.demuxedAudioLiveIsNativeOnly`, so the session it refuses
+  is still the session that was playing. Measured on the Dolby browser test kit, which carries the
+  discriminator: the Profile 5 cut of a clip is refused and left playing on VideoToolbox, while the
+  Profile 8.1 cut of the SAME material and grading is honoured and rebuilds on `libavcodec HEVC (SW)`.
 
 ### Reading whether the audio was delivered
 
@@ -339,7 +367,7 @@ try await player.reloadAtCurrentPosition()
 | --- | --- |
 | `load(url:startPosition:options:audioSourceStreamIndex:discTitleID:)` | `async throws -> SourceProbe?`. Discardable. Tears down any running session first. |
 | `load(source:startPosition:options:audioSourceStreamIndex:discTitleID:)` | Same, for `MediaSource.url` or `.custom(IOReader, formatHint:)`. A custom source whose initial probe fails throws, since it cannot be reopened by URL. |
-| `reloadAtCurrentPosition()` | `async throws`. Background reopen at the current position, preserving options. Session-preserving: it finishes an installed audio tap and keeps the native host where it can. |
+| `reloadAtCurrentPosition()` | `async throws`. Background reopen at the current position, preserving options. Session-preserving: it finishes an installed audio tap and keeps the native host where it can. It also preserves the session's TRANSPORT rather than replaying `autoplay`, so a session that was playing comes back playing and one that was paused comes back paused, whatever the mount was given (AE#464 round 2). The one exception is the resume after a background teardown, which has no transport left to read and is the host's call, so there the mount flag still decides. |
 | `stop(resetDisplayCriteria:finalTeardown:)` | Ends the session, `state` becomes `.idle`, `startupProgress` becomes nil. `resetDisplayCriteria: false` keeps the panel in its current mode across an item handoff. |
 | `AetherEngine.probe(url:options:)` / `probe(source:options:)` | `nonisolated static throws -> SourceProbe`. Demux-only metadata read, no decoders, no session. `options` is read for `httpHeaders` only. For a custom reader the caller keeps ownership, `close()` is not called, and the cursor is left unspecified. |
 | `AetherEngine.probeDetectingAtmos(url:options:atmosDetection:)` | `probe` plus a bounded decode pass that authoritatively resolves E-AC-3 JOC for an Atmos badge. Strictly more expensive; never on the playback-start path. Decode-side failures degrade to "not confirmed" rather than throwing. |
@@ -644,7 +672,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `sequentialOrigin` | false | Declare an origin that fabricates range answers: one long-lived unranged GET, no ranged probes, non-seekable pb. **Seeking is unavailable**; re-request the archive at a shifted start instead. |
 | `declaredDurationSeconds` | nil | Trusted duration, overriding the container's. Required alongside `sequentialOrigin` on VOD, where the tail read is gone. |
 | `maxConcurrentSourceRequests` | nil | Most requests the reader may have open against this origin at once, across every path it fetches on (pump ranges, detour blocks, size probes, tail prefetch, subtitle side reader). nil counts without capping and lowers the ceiling on its own after a 429/503/509. Set it when the provider states a limit; `1` also switches off the speculative parallel paths, which exist only to overlap with the pump. Counts **requests**, not TCP connections, because over HTTP/2 a session multiplexes every request onto one connection while the origin still counts each one (AE#377). It is also the only ceiling: several engines playing from one origin are bounded by this value and by what the origin refuses, not by a transport pool underneath it (AE#450). |
-| `autoplay` | true | False mounts paused: the load skips the terminal `play()` and settles at `.paused` for a host that resumes later. |
+| `autoplay` | true | False mounts paused: the load skips the terminal `play()` and settles at `.paused` for a host that resumes later. It describes THIS MOUNT and nothing after it: the rebuilds a session makes on its own (`reloadAtCurrentPosition`, an option correction, the AirPlay LAN swap, an audio-delay nudge) come back in the transport state the session is in, not in this one. Correcting it through `reloadAtCurrentPosition(applying:)` therefore does nothing; call `play()` or `pause()` instead. |
 
 ## Value types
 

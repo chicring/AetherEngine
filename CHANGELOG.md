@@ -10,6 +10,51 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [6.67.2] - 2026-09-03
+
+### Changed
+
+- **Every AE#418 placement reading now says what it taught the standing distance.** 6.67.0 learns
+  how far below its axis a placement sits from every own-run reading, confirmations included, and
+  prints only the readings that MOVE the value. Two different outcomes were silent under that: a
+  reading that taught the value already standing, and a reading taken off a timeline AVPlayer
+  rebuilt, which is refused the parameter on purpose because where a rebuilt timeline puts a segment
+  is a statement about the rebuild. The second is the one that mattered: such a reading corrects the
+  axis like any other, by 28.000 s on the `tc-wide-cues-lie.mkv` fixture, so its correction line was
+  indistinguishable from one that had just taught a 28 s lesson. Every verdict line now ends in
+  `taught the distance Xs`, `taught the standing distance Xs again`, or `taught nothing, read off a
+  rebuilt timeline; the distance stays Xs`. Reported by @rrgomes.
+
+## [6.67.1] - 2026-09-03
+
+### Fixed
+
+- **The `[SWDiag]` line no longer reports a pre-seek audio PTS against the post-seek clock
+  (AE#479, from the AE#407 thread).** `aLead` is the newest audio PTS the software pump has
+  enqueued minus the clock. A seek flushes that audio on the main actor while the pump is still on
+  the pre-seek generation: after a playing seek it republished its stale local once more before
+  noticing the seek, and a seek that landed PAUSED parked it in its pause wait, where it wrote
+  nothing until `play()`. Both left the line reading old PTS minus re-anchored clock, `aLead=475.49`
+  on a backward scrub in the field, `-23.89` for five paused ticks on the harness. The seek path now
+  clears the marker when it flushes, and the pump's writes carry the generation they were produced
+  under, so a write from before the flush cannot republish the flushed queue's PTS. `parkedPkts`
+  and `rebuf` are unchanged: they are the pump's own state and were never stale.
+  `aetherctl play --host-calls pauseseek` (pause at t=12, seek at t=15 while paused, resume at
+  t=20) reproduces the paused shape. Reported by @classicjazz.
+
+### Changed
+
+- **The `[SWDiag]` line names its corrupted-frame counter `corrupt=`, not `corr=` (AE#407 side
+  finding).** The field is `AVSampleBufferDisplayLayer.videoPerformanceMetrics.numberOfCorruptedFrames`
+  and nothing else. `corr` read as a correction count and was taken for one in the AE#407 thread, where
+  a `corr=0` was cited as evidence that no drift correction had run. There is no drift correction on
+  that path, so the token carried no information about pacing; now it does not look like it does.
+  Reported by @classicjazz.
+
+## [6.67.0] - 2026-09-03
+
 ### Added
 
 - **The segment cache states where it holds picture (AE#468, PR by @sitepilotusa).**
@@ -25,6 +70,157 @@ the public-API contract.
   promise that a seek inside a span is instant.
 
 ### Fixed
+
+- **An audio language ICU can name but not map keeps its label (AE#458 follow-up, found by
+  @htrung14).** `cnr` (Montenegrin) lost its `LANGUAGE` and its master, and so did 55 other
+  three-letter tags, 56 in all: `identifier(.alpha3)` maps only the ISO 639-1 / 639-2 pairs, and CLDR does not
+  alias these to anything, so neither the direct route nor the 6.61.0 canonicalization fallback
+  reached them, although the tag already IS the ISO 639 code. Such a tag now passes through as
+  itself, gated on ICU having a display name for it in a fixed reference locale: that is the
+  validity signal canonicalization does not give, since `canonicalLanguageIdentifier` echoes `dub`
+  and `xyz` back unchanged just as it echoes `cnr`. The locale is fixed rather than the device's,
+  because ICU names `cnr` in English and not in German, and a file must not resolve on one Apple TV
+  and not on the next. Measured end to end on a `cnr`-tagged SDR H.264 fixture: media-direct with
+  `audioLang=none` before, `master.m3u8` with `LANGUAGE="cnr"` after, and a real `AVPlayerItem`
+  reports one audible option reading `Montenegrin`. The same fixture tagged `dub` still serves
+  media-direct with no audible group, which is what failing closed on a track NAME means.
+
+- **A session-preserving reload preserves the transport, and keeps the playhead when one is stacked
+  behind another (AE#464 round 2, reported and measured by @cmcpherson274).** `reloadAtCurrentPosition`
+  replayed `LoadOptions.autoplay` verbatim, and that flag describes the FIRST mount rather than the
+  session. A host that owns transport and mounts with `autoplay = false` therefore got a frozen picture
+  and no error out of every rebuild the engine raises on its own (the AirPlay LAN swap, a #460
+  correction, an audio-delay nudge): the rebuilt host settled `paused`, the producer parked on a
+  consumer that would never ask for a segment, and the host went on reporting progress. The rebuild now
+  comes back in the state the session is in, read from the native host's durable #122 intent where there
+  is one, so it survives a rebuild raised mid-scrub. A resume after a background teardown has no
+  transport left to read and is still the host's call, so that path is unchanged. Second half: the
+  reload's position snapshot read `currentTime`, which `load` zeroes at its start, so a reload raised
+  while another was still in flight rebuilt the session at its head. The position each load was handed
+  is parked across that window instead. Measured on a 300 s H.264 + AAC fixture: before, item #2 settled
+  `timeControlStatus=paused t+0.00s` and never left it, and three stepper presses in one runloop turn
+  came back `startPos=nil` cutting `seg0+` on a session 14.90 s in; after, `playing t+0.06s` and
+  `startPos=14.90s` cutting `seg3+`. `autoplay` is consequently not correctable through
+  `reloadAtCurrentPosition(applying:)`; call `play()` / `pause()` instead.
+
+- **The audio-delay re-anchor gate reads the field that carries the distinction, and states what it
+  actually did (AE#464 round 2).** The gate asked `liveWindow != nil`, which is true for every live
+  session (`load` builds one for each), so its own documented branch, that a live source without a DVR
+  window keeps the value for the next seam rather than paying a rebuild, was unreachable: a live-only
+  `.loopback` session took a reload that rejoins at the edge, and a live-only `.software` session issued
+  a seek the engine then refused as `liveWithoutDVR`. `windowSeconds` is what carries it, exactly as the
+  seek path reads it, and the gate takes the window itself now so there is no derivation left at a call
+  site to get wrong. The loopback re-anchor also ran under `try?` beneath a line that had already
+  announced the re-cut; it asks `sessionReloadRefusal` before the teardown and names the outcome after
+  it, so a re-cut that could not happen no longer reads as one that did.
+
+- **A placement's distance below its axis is measured in seconds, not modelled as a multiple of
+  the lead (AE#418).** Rounds 5, 6 and 7 read that distance as a coefficient on the epoch's
+  presentation lead: shipped as arithmetic, then measured per source, then held as the median of the
+  readings. The premise under all three was that the distance is a geometry of the source, and it is
+  not. Measured with `play --picture-probe` over a throttled origin on three clips identical but for
+  their reorder depth, the same burst arm, 2 runs each and every run identical: a clip with
+  `has_b_frames=0` opens every gate with a lead of exactly zero and still puts its third placement one
+  frame below its axis, which no coefficient can express, and one source placed the same segment twice
+  at 0.000 and then 0.083. So the session carries the distance in the unit it corrects and reads it
+  off the placement reading that already measures the base. Every reading teaches it, a confirmation
+  included, which is what fixes the starvation the reporter measured: before, only a placement
+  carrying a lead could teach, and on his wide-cues asset 13 of 13 placements across two runs carried
+  `lead 0.000s` (an AE#412 re-cut is recorded worth 0 and lead 0, and an item's first placement
+  composes onto nothing), so three arms produced six readings and one sample. An item's first
+  placement is no longer a case of its own: with nothing measured the distance is zero, which is what
+  AVPlayer does there. The gate-open line still prints `lead=` as a source fact. Verified against the
+  picture on 13 arms, 3 runs each, before and after: no arm leaves a fifth of a second the other build
+  does not, both re-aim arms keep their one seam-crossing tick per run, and the mean |capErr| over the
+  eleven frame-scale arms goes 0.0381 to 0.0373. Reported and measured by @rrgomes.
+
+- **The live axis diagnostic names the term it was missing, and the reading it was published with is
+  corrected (AE#446).** The line that reports what the replaced reconstruction WOULD have said takes
+  its "nothing to say yet" exit on two separate signals, the item not having reported a seekable
+  range yet and the producer not holding a resident floor yet, and which one it was could only be
+  established by reading the source. It is named in the line now. The exit is also timing rather
+  than the item kind: measured on two seeds differing only in frame reordering, the same command
+  takes opposite branches on a START item (gate open at 0.11 s against 0.39 s). The premise
+  published with the round-5 fix does not survive that pair either. A live item's zero is the
+  PRESENTATION time of its first frame while the shift anchors the first DECODE time at 0, so a
+  source with frame reordering begins one presentation lead above zero: `-bf 3` at 60 fps gives
+  `lead=3000` (90 kHz), `live seg-0 finalized: start=0.033s` and a stated axis of 0.03 s, `-bf 0`
+  gives 0.000 s and 0.00 s. So the 0.050 s a device reconstructed was that source's own lead and not
+  an error, and the bundled seed's zero is what made zero look like a rule. The engine's behaviour is
+  unchanged; the source comments and the test suite's stated premise are corrected with it. Measured
+  and reported by @cmcpherson274.
+
+- **The silent-bridge ERROR no longer announces a failure during a healthy start-up (AE#474).**
+  `AudioBridge`'s AE#396 detector was counted in source packets (64) while the thing that bounds
+  it is one encoder frame: `drainFIFOIntoEncoder(requireFull:)` cannot encode below `frame_size`,
+  so no output is POSSIBLE until that many samples have been enqueued. Its threshold was derived
+  from the lossy pair alone (an E-AC-3 frame of 1536 against a DTS packet of 512), and the FLAC arm
+  breaks both constants: a FLAC frame is 4608 samples and a TrueHD access unit is 40, so the first
+  output needs 116 packets and the line fired at 64. Every TrueHD session therefore printed
+  `the bridge has produced no encoded audio at all ... enqueued=2560 emitted=0` and then played to
+  the end, and not only under the opt-in `.lossless` mode: `.surroundCompat` encodes any source of
+  two channels or fewer to FLAC, so a stereo TrueHD file reproduces it on the default setting. The
+  gate now counts each arm in the unit that bounds it, the encoder's own `frame_size` where PCM
+  reached the FIFO and packets only where the FIFO never moved, and the latter counts from the last
+  accepted sample rather than from the start, so a decoder that answers for a while and then stops
+  is caught by the same arm. The line arrives sooner than it used to on the arm it was written for
+  (about 128 ms of source audio on E-AC-3 against 64 packets), and it now names the encoder it is
+  talking about and the frame boundary it judged. Nothing else read the old threshold: both
+  decision sites that classify a silent bridge are gated on an actual failure, and `$audioDelivery`
+  is derived independently and read `bridged` correctly throughout. Reported by @cmcpherson274.
+
+- **A decode-path correction reaches a custom `IOReader` session instead of being quietly dropped
+  (AE#461 follow-up).** `LoadOptions.preferredDecodePath` was read only inside `load`, while the
+  rebuild that keeps a retained reader picks its host from the backend the session was already on.
+  A host correcting a playing custom source onto the software path was therefore told the correction
+  had been applied, and stayed on the native one: accepted, named in the log, ignored, which is the
+  one outcome the reload's own rules forbid. The rebuild now asks the same routing policy `load`
+  asks, seeded with that backend, so the correction lands on both source shapes. Measured on a live
+  spool reader and on a seekable custom VOD source: `backend native -> software`, decoder
+  `libavcodec H264 (SW)`, session preserved at its own playhead, and no reach-back on the live arm.
+  The one-way type is what makes re-routing the reopen safe, since the only flip it can make is
+  native to software.
+
+  What the software path cannot represent is now refused BEFORE any teardown, with two new
+  `SessionReloadRefusal` cases: `.softwarePathCannotRepresentSource` for a source whose only signal
+  is IPT-PQ-c2 (Dolby Vision HEVC Profile 5, AV1 Profile 10.0), and `.demuxedAudioLiveIsNativeOnly`
+  for a live source whose audio is merged on the native path. Inside `load` both guards run after
+  the routing decision, so on a correction they would have failed a session that was already down.
+  Verified on the Dolby browser test kit, which carries its own control: the Profile 5 cut is
+  refused and left playing on VideoToolbox, the Profile 8.1 cut of the same material and grading is
+  honoured and rebuilds in software. Reported by @cmcpherson274.
+
+- **A live custom source is rebuilt where the session left it, not where the host started
+  (AE#460 follow-up).** An in-place rebuild on a retained `IOReader` (`reloadAtCurrentPosition`,
+  with or without an option correction, plus an audio-track switch, a disc-title switch and a
+  background return) reopened the source from byte 0, because a fresh `AVIOContext` starts its byte
+  axis there. For a VOD reader that is correct and load-bearing: the reopen has to re-read the
+  container header. For a LIVE reader it is a rewind of the host's spool to its base. Measured on
+  `aetherctl customio --live`: the playhead fell from 41.5 s to 1.9 s and the host was asked to
+  re-deliver every byte it had already delivered, 15 MB and a 61 s window, at I/O speed. A live
+  reopen now leaves the reader alone and moves the axis to its cursor instead, which is the same
+  invariant satisfied from the other end and makes the rebuild the edge rejoin `LiveReloadPolicy`
+  already performs on the URL branch. Reach-back across the rebuild went from 15.0 MB to 0.0 MB. A
+  live reader that will not answer `seek(0, SEEK_CUR)` cannot be aligned to and is rewound as
+  before, with a log line saying so. Reported as a read of the branch by @cmcpherson274 while
+  confirming #460; the rewind was worse than the read, and two further defects sat underneath it.
+
+- **A reader the engine is about to reuse is cancelled once, not twice (AE#460 follow-up).**
+  `CustomIOReaderBridge.markClosed()` forwards to `IOReader.cancel()` and was not idempotent, so the
+  torn-down bridge's own `close()` fired a second cancel a moment later, by which time the engine
+  had already handed the same reader to the successor bridge. That second cancel lands in the
+  rebuilt pump's read, and on a live source that read is parked at the edge and comes back -1: the
+  session reported itself playing and then died with `live custom-source pump exited
+  (reason=readError(-1))`. Intermittent before, because a VOD-shaped reader answers from a backlog
+  and is almost never parked. One cancel is also all that is ever needed: after the first, no read
+  reaches the host, so nothing new can park.
+
+- **A failed rebuild of a custom source no longer reports success (AE#460 follow-up).** The
+  custom-source branch of `reloadAtCurrentPosition` published its error and returned as if the
+  session had come back, so `reloadAtCurrentPosition(applying:)` told a host its correction had
+  landed while the session sat in `.error`. That distinction is the reason the throwing overload
+  exists. It now throws what the rebuild threw, the way the URL branch always has; a rebuild
+  superseded by a newer `load` or `stop` still returns normally, because that is not a failure.
 
 - **An origin that refuses is asked less often, not just less concurrently (AE#465, PR by
   @sitepilotusa).** A refusal used to halve the concurrency budget only, which on the measured CDN

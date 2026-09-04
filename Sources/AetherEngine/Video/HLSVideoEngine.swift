@@ -468,27 +468,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// index rewrites it axis-true, which is what `recordingEpochAt` drops the entries above for.
     private let anchorShiftLock = NSLock()
     private var epochShiftByIndex: [Int: Double] = [:]
-    /// AE#418 round 5: what each recorded epoch's gating sample is presented AFTER its own decode
-    /// time. Kept beside the offsets rather than inside them so the same rewrite rule governs both,
-    /// and read only when a placement composes onto a run that is already in AVPlayer's timeline.
-    private var epochLeadByIndex: [Int: Double] = [:]
-    /// AE#418 round 6: what one presentation lead is WORTH to a composition on THIS source, read out
-    /// of a placement rather than assumed. Round 5 published `1` as a law from one fixture pair, and
-    /// the reporter's content falsified its sign. Measured with the picture as witness on two clips
-    /// identical but for their reorder depth, three runs each: a source whose gating sample is
-    /// presented TWO frames after it is decoded lands a whole lead below its base, and one presented a
-    /// SINGLE frame after it lands ON its base. nil until a placement carrying a lead has been read
-    /// back, and a composition invents nothing before then.
-    /// Round 7: every reading, because ONE of them is a sample and not a measurement. The readings on
-    /// a source are whole frames apart (the reporter's nine, in frames of his own 0.0417 s: 0, +2,
-    /// +1, -2, +1, +1, 0, and two of 8 ms), and where a lead is one frame that noise is a whole unit
-    /// of coefficient. Round 6 let the last of them set the value, so a settled source was one stray
-    /// placement away from swinging the full clamp, three leads in a step.
-    private var leadCoefficientSamples: [Double] = []
-    /// What the samples agree on, which is what a composition uses.
-    private var measuredLeadCoefficient: Double? {
-        return Self.leadCoefficientEstimate(from: leadCoefficientSamples)
-    }
+    /// AE#418 round 8: how far below the axis it composed on the last measured placement actually
+    /// landed, in seconds. Zero until a placement has been read back, which is also what makes an
+    /// item's FIRST placement compose onto the axis itself.
+    ///
+    /// Rounds 5 to 7 carried this as a multiple of the epoch's presentation lead, on the premise that
+    /// the distance is a geometry of the source. It is not: `tc-cues-lie.mkv` has no frame reordering
+    /// at all, so every gate opens with a lead of exactly zero, and its third placement still sits a
+    /// frame below its axis (2 runs of 2). No coefficient can express that, and on `tc-bf1-cues-lie`
+    /// one source places twice and reads 0.000 then 0.083. So the distance is measured in the units
+    /// it corrects, and every reading teaches it, including the ones that confirm.
+    private var lastPlacementDisplacement: Double = 0
     /// AE#418 round 7: what the local server did with the request each placement was counted from,
     /// stamped with the serial of the answer. `true` once its bytes went out, `false` when the
     /// response failed. A placement is a request that was ANSWERED, and until it is answered there is
@@ -497,13 +487,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// request still in flight.
     private var segmentDeliveryByIndex: [Int: (serial: Int, delivered: Bool)] = [:]
     private var segmentDeliverySerial = 0
-    /// AE#418 round 5: whether any placement has established a mapping in this item's timeline. The
-    /// first one does not compose onto anything (AVPlayer anchors the item on its first PRESENTED
-    /// sample, measured base 0.000 on every arm of the fixture), every later one does.
-    private var hasComposedPlacement = false
     /// AE#418 round 3: the placement this session last published an axis for, so the prediction can be
     /// checked against where AVPlayer actually put those bytes.
     private var lastPublishedPlacement: PublishedPlacement?
+    /// AE#481: the first segment the local server answered after the most recent seek, which is the one
+    /// whose content opens the run that landing sits in. Identifying it is what makes the landing
+    /// reading a question about ONE segment: asked of the whole plan, "does this run open on a playlist
+    /// position" is a coincidence 31 boundaries wide.
+    private var firstDeliveredIndexSinceSeek: Int?
     /// The last index a fetch declared. A cold fetch reaches the provider BEFORE the producer has
     /// opened its gate, so the placement can precede the offset it is worth; this is what lets the
     /// gate publish for a placement that already happened.
@@ -2492,9 +2483,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
         }
-        prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts, presentationLeadPts in
+        prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts in
             self?.handleVideoShiftKnown(
-                shiftPts, firstItemTfdtPts: firstItemTfdtPts, presentationLeadPts: presentationLeadPts)
+                shiftPts, firstItemTfdtPts: firstItemTfdtPts)
         }
         prod.onLiveTimelineRebase = { [weak self] shiftPts, seamOutputSeconds in
             self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds)
@@ -2557,10 +2548,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var lastMuxerRebuildSegmentCount = -1
     static let maxLiveMuxerRebuildCycles = 3
 
-    private func handleVideoShiftKnown(_ shiftPts: Int64, firstItemTfdtPts: Int64, presentationLeadPts: Int64) {
+    private func handleVideoShiftKnown(_ shiftPts: Int64, firstItemTfdtPts: Int64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
         let seamItemSeconds = Double(firstItemTfdtPts) * sourceVideoTbSeconds
-        let leadSeconds = Double(presentationLeadPts) * sourceVideoTbSeconds
         // Live rebases the whole timeline at a program boundary and nothing older comes back on
         // screen, so its axis is the epoch's own and it publishes here as it always has.
         guard !isLiveSession else {
@@ -2578,10 +2568,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let isRecut = recutIndices.remove(index) != nil
         epochShiftByIndex = Self.epochShiftTable(
             epochShiftByIndex, recordingEpochAt: index, shift: isRecut ? 0 : seconds)
-        // A re-cut is placed at its own tfdt inside a timeline AVPlayer is already building (AE#412,
-        // measured `axisErr` 0.000 at three offsets), so it composes nothing and carries no lead.
-        epochLeadByIndex = Self.epochShiftTable(
-            epochLeadByIndex, recordingEpochAt: index, shift: isRecut ? 0 : leadSeconds)
         let placementAlreadyHappened = lastPlacedIndex == index
         anchorShiftLock.unlock()
         gateOpenCondition.lock()
@@ -2616,11 +2602,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Every other index is cut on its own boundary inside a run that already carries an axis, and
         // has nothing to say about where that run begins.
         let epochShift = epochShiftByIndex[index]
-        // AE#418 round 5: the lead of the epoch being PLACED, and only once this item's timeline
-        // already holds a placement to compose onto.
-        let lead = hasComposedPlacement ? (epochLeadByIndex[index] ?? 0) : 0
-        let learnedCoefficient = measuredLeadCoefficient
-        let coefficient = learnedCoefficient ?? 0
+        // AE#418 round 8: how far below its axis the last measured placement landed. Zero until one
+        // has been read back, which is what makes an item's first placement compose onto the axis.
+        let displacement = lastPlacementDisplacement
         anchorShiftLock.unlock()
         guard let epochShift else { return }
         restartLock.lock()
@@ -2629,12 +2613,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.unlock()
         guard let plannedStart else { return }
         let current = playlistShiftSeconds
-        // The base this placement lands on is the axis in force LESS the epoch's presentation lead,
-        // which is where AVPlayer puts a segment it composes into a timeline it already has.
-        let base = Self.placementBase(
-            axis: current, presentationLead: lead, coefficient: coefficient)
+        // The base this placement lands on is the axis in force LESS however far below it the last
+        // placement was measured to sit, which is where AVPlayer puts a segment it composes into a
+        // timeline it already has.
+        let base = Self.placementBase(axis: current, displacement: displacement)
         let composed = Self.axisShift(
-            after: current, placing: epochShift, presentationLead: lead, coefficient: coefficient)
+            after: current, placing: epochShift, displacement: displacement)
         let seam = Self.seamItemSeconds(advertisedStart: plannedStart, currentShift: base)
         // AE#418 round 3: keep what this composition assumed, so the placement can be checked against
         // AVPlayer's own account of where it put the bytes.
@@ -2642,9 +2626,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let superseded = lastPublishedPlacement
         lastPublishedPlacement = PublishedPlacement(
             index: index, advertisedStart: plannedStart, worth: epochShift, assumedBase: base,
-            axisInForce: current, presentationLead: lead,
-            deliverySerialAtCompose: segmentDeliverySerial)
-        hasComposedPlacement = true
+            axisInForce: current, deliverySerialAtCompose: segmentDeliverySerial)
         anchorShiftLock.unlock()
         if let superseded {
             // AE#418 round 4: named rather than left silent. A placement whose successor arrives before
@@ -2659,9 +2641,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         EngineLog.emit(
             "[HLSVideoEngine] #418 seg\(index) placed (advertised \(String(format: "%.3f", plannedStart))s, "
-            + "worth \(String(format: "%.3f", epochShift))s, lead \(String(format: "%.3f", lead))s "
-            + "x\(String(format: "%.2f", coefficient))\(learnedCoefficient == nil ? " unmeasured" : "")"
-            + "): axis shift "
+            + "worth \(String(format: "%.3f", epochShift))s, sitting "
+            + "\(String(format: "%.3f", displacement))s below its axis): axis shift "
             + "\(String(format: "%.3f", current))s -> \(String(format: "%.3f", composed))s "
             + "from item \(String(format: "%.3f", seam))s",
             category: .session
@@ -2673,82 +2654,74 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// because AVPlayer puts the placed segment's advertised start where its CURRENT mapping says
     /// that position is, not where the playlist says it is.
     ///
-    /// AE#418 round 5: and it composes onto a BASE, which can sit below the axis by the epoch's
-    /// presentation lead. Round 6: by HOW MUCH is a property of the source, not a constant, so it is
-    /// measured. Three clips identical but for their reorder depth, same arm, three runs each, the
-    /// picture agreeing with the reading in every one:
+    /// AE#418 round 5: and it composes onto a BASE, which can sit below the axis. Rounds 5 to 7 read
+    /// that distance as a multiple of the epoch's presentation lead: round 5 shipped the multiple as
+    /// arithmetic, round 6 measured it per source, round 7 took the median of its readings. Round 8
+    /// measured the distance itself with `play --picture-probe` over a throttled origin, on three
+    /// clips identical but for their reorder depth and the same burst arm, 2 runs each, every run
+    /// identical:
     ///
-    /// | gating sample presented | base a composition lands on | coefficient |
-    /// | --- | --- | --- |
-    /// | at its decode time (no reordering) | the axis | 0 |
-    /// | one frame after it (`-bf 1`) | the axis | 0 |
-    /// | two frames after it (`-bf 3`, pyramid) | one lead below the axis | 1 |
+    /// | fixture | reorder | lead | placement 2 | placement 3 |
+    /// | --- | --- | --- | --- | --- |
+    /// | `tc-cues-lie.mkv` | none | 0.000 | 0.000 | **0.042** |
+    /// | `tc-bf1-cues-lie.mkv` | one frame | 0.042 | 0.000 | 0.083 |
+    /// | `tc-bf-cues-lie.mkv` | two frames | 0.083 | 0.083 | 0.125 |
     ///
-    /// Round 5 shipped the third row as the rule for all of them, which put a 1-frame-reorder source
-    /// two frames out on every composition (the reporter's asset is one, at 23.976 fps). The
-    /// coefficient now comes from the reading that checks it. See
-    /// [[reference_an_offset_about_presentation_is_measured_at_the_pts]].
+    /// The bold cell is what retires the model: that clip has `has_b_frames=0` and every gate opens
+    /// with `lead=0`, yet its third placement sits a frame below its axis. A quantity that is nonzero
+    /// where the lead is exactly zero is not a multiple of the lead. The middle row retires the
+    /// source-law premise separately: one source, two placements, 0.000 then 0.083.
+    ///
+    /// So the distance is carried in the units it corrects, and the reading that already measures the
+    /// base measures it. See [[reference_an_offset_about_presentation_is_measured_at_the_pts]].
     static func axisShift(
-        after currentShift: Double, placing epochShift: Double, presentationLead: Double,
-        coefficient: Double
+        after currentShift: Double, placing epochShift: Double, displacement: Double
     ) -> Double {
-        return placementBase(
-            axis: currentShift, presentationLead: presentationLead, coefficient: coefficient
-        ) + epochShift
+        return placementBase(axis: currentShift, displacement: displacement) + epochShift
     }
 
-    /// The base a placement lands on: the axis in force, less as much of its gating sample's
-    /// presentation lead as this source has been MEASURED to place below it. This is the value the
-    /// reading takes back out of AVPlayer's buffer, so the coefficient is checkable against it on
-    /// every placement that opens a run of its own.
-    static func placementBase(axis: Double, presentationLead: Double, coefficient: Double) -> Double {
-        return axis - coefficient * presentationLead
+    /// The base a placement lands on: the axis in force, less how far below it the last placement was
+    /// measured to sit. This is the value the reading takes back out of AVPlayer's buffer, so the
+    /// prediction is checkable against it on every placement that opens a run of its own.
+    static func placementBase(axis: Double, displacement: Double) -> Double {
+        return axis - displacement
     }
 
-    /// AE#418 round 6: what the reading says one lead was worth, or nil when this placement carried
-    /// no lead to learn from.
+    /// AE#418 round 8: how far below the axis it composed on a placement actually landed.
     ///
-    /// Round 5 measured `1` on a fixture with a two-frame reorder depth and shipped it for every
-    /// source. On the same arm, on a clip identical but for `-bf 1`, AVPlayer places the composition
-    /// on the axis itself and the picture agrees: `0`. Both are geometries of the content, so the
-    /// session reads this one off its own placements instead of carrying either as a law.
-    static func leadCoefficient(
-        axis: Double, measuredBase: Double, presentationLead: Double
-    ) -> Double? {
-        guard presentationLead > leadCoefficientMinimumLeadSeconds else { return nil }
-        let raw = (axis - measuredBase) / presentationLead
-        guard raw.isFinite else { return nil }
-        return min(max(raw, -maxLeadCoefficient), maxLeadCoefficient)
-    }
-
-    /// AE#418 round 7: what the readings AGREE on, which is the median of them.
+    /// Every reading produces one, a confirmation included, which is what the lead coefficient could
+    /// not do: it needed a placement carrying a lead, and on a source with no frame reordering, or a
+    /// session whose placements are AE#412 re-cuts (worth 0 and lead 0 by construction), there is
+    /// never one. Measured on `tc-wide-cues-lie.mkv`, 13 of 13 placements across two runs carried
+    /// `lead 0.000s`; the reporter's three arms produced a single sample between them.
     ///
-    /// A reading resolves the base to whole frames, and on a source whose lead is one frame that makes
-    /// every frame of reading noise a whole unit of coefficient. The reporter's run 2 read -1.00, then
-    /// 2.00, then -1.00 on one asset; under round 6 the middle one took a settled session three leads
-    /// in a single step, because the last reading replaced the one before it. A median cannot be moved
-    /// by a single stray, and it never invents a value no reading took: an even count holds what the
-    /// odd count before it settled on, rather than averaging two samples that disagree.
-    static func leadCoefficientEstimate(from samples: [Double]) -> Double? {
-        guard !samples.isEmpty else { return nil }
-        guard samples.count % 2 == 1 else {
-            return leadCoefficientEstimate(from: Array(samples.dropLast()))
-        }
-        return samples.sorted()[samples.count / 2]
+    /// AE#418 round 9: the distance is a MEASUREMENT of a session, and a session's readings can
+    /// disagree by a frame. Reproduced on a ten-placement chain (`--seek-count 24` over a throttled
+    /// origin, 3 of 3 runs byte-identical): nine placements read 0.000 and `seg5` reads 0.042, so the
+    /// composition after it is one frame out and the reading after THAT puts it back. That is the
+    /// reporter's arm 1 exactly (`-0.036`, then `+0.004`, then a placement a frame out). What the two
+    /// disagree on is which reading is the outlier: on the fixture the standing value is 0.000 and one
+    /// reading deviates, on his 23.976 fps asset it is -0.041 and holds to 2 ms across two arms and
+    /// two placements. So neither a median (round 7's rule, which lags a genuine step by one reading
+    /// and would have cost him 0.041 s at `seg589`) nor a hold-until-confirmed rule is right on both,
+    /// and last-wins is kept: the deviation is one frame, it is undone by the next measurable
+    /// placement, and no instrument here resolves better than the frame it would be chasing. The
+    /// picture probe quantises at one frame too.
+    static func placementDisplacement(axis: Double, measuredBase: Double) -> Double {
+        let raw = axis - measuredBase
+        guard raw.isFinite else { return 0 }
+        // Below the epsilon a re-publish moves nothing anyone can see, so the placement is ON its
+        // axis rather than a signed hair off it. This is also what keeps a chain of confirmations
+        // from printing `-0.000s` at a reader.
+        guard abs(raw) > axisRepublishEpsilonSeconds else { return 0 }
+        return min(max(raw, -maxPlacementDisplacementSeconds), maxPlacementDisplacementSeconds)
     }
 
-    /// Below one millisecond a lead divides into noise, and the coefficient it produces describes the
-    /// reading's own resolution rather than the placement.
-    static let leadCoefficientMinimumLeadSeconds = 0.001
-
-    /// A reading can be wrong once (round 4 accepts that on purpose), so what it teaches the NEXT
-    /// composition is bounded by the geometry any reorder depth could produce. Two leads is already
-    /// past every case measured.
-    static let maxLeadCoefficient = 2.0
-
-    /// Worth saying out loud only when it moves: a coefficient restated every placement is noise, and
-    /// one that changes is the source contradicting what the session learned from it.
-    static let leadCoefficientReportEpsilon = 0.05
+    /// A reading can be wrong once (round 4 accepts that on purpose), so what it carries into the NEXT
+    /// composition is bounded. The widest placement measured is three frames at 24 fps; this is well
+    /// past that and well inside `placementSeamToleranceSeconds`, so a stray can never move a
+    /// composition by anything a reader would call a seam.
+    static let maxPlacementDisplacementSeconds = 0.25
 
     /// The item position the placed segment's content begins at: its advertised start, read through
     /// the axis that was in effect before it landed. Everything below that is still the old epoch's.
@@ -2788,6 +2761,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// leaves everything below the landing on the axis its bytes were placed with.
     func snapAxisAfterSeek(landingItemSeconds: Double) {
         guard !isLiveSession else { return }
+        // AE#481: the landing reading asks about the segment that opens the run it lands in, so the
+        // record starts empty at every seek. A stale one would describe the run before this seek.
+        anchorShiftLock.lock()
+        firstDeliveredIndexSinceSeek = nil
+        anchorShiftLock.unlock()
         let current = playlistShiftSeconds
         let snapped = Self.axisShiftAfterSeek(current)
         guard snapped != current else { return }
@@ -2806,6 +2784,102 @@ public final class HLSVideoEngine: @unchecked Sendable {
         publishPlaylistShift(snapped, seamItemSeconds: landingItemSeconds)
     }
 
+    /// AE#481: what the run holding a seek landing carries, read off the playlist instead of inherited
+    /// from a composition measured somewhere else.
+    ///
+    /// The #418 axis is published once, at the advertised start of the segment whose gate re-aimed, and
+    /// it stands for everything after that seam. Measured with `play --picture-probe` on the #418 chain
+    /// with the re-anchoring seek LAST (`--seek-count 5 --seek-pattern 65,60,70,58,75`, `slowrange.py`
+    /// at 600 kbps / 300 ms), the picture says the axis is narrower than that:
+    ///
+    /// | item | 53.000 | 67.833 | 79.000 | 84.917 | ... | 119.958 |
+    /// | --- | --- | --- | --- | --- | --- | --- |
+    /// | `pic - picItem` | **-9.000** | 0.000 | 0.000 | 0.000 | | 0.000 |
+    ///
+    /// The offset belongs to the run `seg13` opened. A seek that opens a NEW run at a segment the
+    /// producer wrote at its planned position lands on a source-true stretch, and nothing tells this
+    /// side: `capErr` reads `+9.017` from the landing to the end of the session (2 of 2 runs at
+    /// 600 kbps / 300 ms, 1 of 1 at 1200 kbps / 200 ms, and not at 3200 kbps / 100 ms, where the
+    /// landing stays inside the run already playing). Ten rounds of #418 never saw it standing because
+    /// a seek burst heals it inside a second: the next seek composes a placement, and its reading comes
+    /// off the changed timeline.
+    ///
+    /// **The discriminator is where the run OPENS, asked of ONE segment.** A segment advertised at A
+    /// goes into a timeline carrying an axis at the seam that axis predicts, and into a timeline
+    /// carrying nothing at A itself, which is round 7's pair of admissible answers. The segment to ask
+    /// is the first one the local server answered after the seek, because that is the one whose content
+    /// opens the run the landing sits in. Asked of the PLAN instead ("does this run open on some
+    /// playlist position"), the same rule publishes on a coincidence: 31 boundaries over 120 s against a
+    /// half-second tolerance, and measured on the #418 chain it wrote a 0.000 axis into a timeline
+    /// carrying -27.875 s, taking `capErr` from +0.092 to -27.883 in one tick. A wrong candidate now
+    /// costs silence rather than an axis: neither answer matches and nothing is published.
+    static func landingAxisReading(
+        landingItemSeconds: Double,
+        ranges: [(Double, Double)],
+        openingSegmentStart: Double,
+        worth: Double,
+        assumedBase: Double,
+        standingAxis: Double
+    ) -> (axis: Double, runStart: Double)? {
+        guard let holding = ranges.first(where: {
+            $0.0.isFinite && $0.1.isFinite && $0.0 <= landingItemSeconds && landingItemSeconds <= $0.1
+        }) else { return nil }
+        let predicted = seamItemSeconds(advertisedStart: openingSegmentStart, currentShift: assumedBase)
+        // Round 7's two admissible answers, asked at a landing instead of at a placement: a run opens
+        // where the timeline this session knows would put this segment, or at the segment's own
+        // playlist position, which is what a timeline carrying nothing there does.
+        //
+        // Both halves are load-bearing. Asking only "does the run open on SOME playlist position"
+        // publishes on a coincidence: the plan has 31 boundaries over 120 s and the tolerance is half a
+        // second, and measured on the #418 chain that read a 0.000 axis into a timeline carrying
+        // -27.875 s (`capErr` +0.092 to -27.883 in one tick). One segment can be asked; the plan cannot.
+        guard abs(holding.0 - predicted) > placementSeamToleranceSeconds,
+              abs(holding.0 - openingSegmentStart) <= placementSeamToleranceSeconds else { return nil }
+        let base = measuredPlacementBase(
+            advertisedStart: openingSegmentStart, observedItemStart: holding.0)
+        let axis = base + worth
+        guard abs(axis - standingAxis) > axisRepublishEpsilonSeconds else { return nil }
+        return (axis, holding.0)
+    }
+
+    /// AE#481: read the axis where a seek landed and publish it when the timeline disagrees with the
+    /// composition it inherited. Returns whether anything was published.
+    func applyLandingAxisReading(landingItemSeconds: Double, ranges: [(Double, Double)]) -> Bool {
+        guard !isLiveSession else { return false }
+        anchorShiftLock.lock()
+        let pending = lastPublishedPlacement
+        let shifts = epochShiftByIndex
+        let displacement = lastPlacementDisplacement
+        let opening = firstDeliveredIndexSinceSeek
+        anchorShiftLock.unlock()
+        // A placement awaiting measurement has the more specific reading (round 7) and measures the
+        // same ranges; two writers on one axis would race, and the placement knows what it composed.
+        guard pending == nil, let opening else { return false }
+        restartLock.lock()
+        let advertisedStart = opening >= 0 && opening < segmentPlan.count
+            ? segmentPlan[opening].startSeconds : nil
+        restartLock.unlock()
+        guard let advertisedStart else { return false }
+        let standing = playlistShiftSeconds
+        guard let reading = Self.landingAxisReading(
+            landingItemSeconds: landingItemSeconds, ranges: ranges,
+            openingSegmentStart: advertisedStart, worth: shifts[opening] ?? 0,
+            assumedBase: Self.placementBase(axis: standing, displacement: displacement),
+            standingAxis: standing)
+        else { return false }
+        EngineLog.emit(
+            "[HLSVideoEngine] #481 the run holding the landing at item "
+            + "\(String(format: "%.3f", landingItemSeconds))s opens at "
+            + "\(String(format: "%.3f", reading.runStart))s, which is seg\(opening)'s own playlist "
+            + "position \(String(format: "%.3f", advertisedStart))s, so it carries "
+            + "\(String(format: "%.3f", reading.axis))s and not the "
+            + "\(String(format: "%.3f", standing))s this session was mapping with",
+            category: .session
+        )
+        publishPlaylistShift(reading.axis, seamItemSeconds: reading.runStart)
+        return true
+    }
+
     /// AE#418 round 3: one placement, kept so the composition that was published for it can be checked
     /// against AVPlayer's own account of where those bytes landed.
     struct PublishedPlacement: Sendable {
@@ -2816,11 +2890,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let worth: Double
         /// The axis the composition assumed AVPlayer's timeline was carrying when it placed this.
         let assumedBase: Double
-        /// The axis in force when it was composed. With the lead below, this is what turns a reading
-        /// into the coefficient the next composition uses.
+        /// The axis in force when it was composed. This is what turns a reading into the displacement
+        /// the next composition uses, and what a rollback returns to.
         let axisInForce: Double
-        /// What this epoch's gating sample is presented after its own decode time.
-        let presentationLead: Double
         /// AE#418 round 7: how many segment responses this session had completed when the placement
         /// was composed, so a later answer can be told from the one before it.
         let deliverySerialAtCompose: Int
@@ -2963,12 +3035,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 advertisedStart: placement.advertisedStart, worth: placement.worth,
                 assumedBase: placement.assumedBase, observedItemStart: observedItemStart)
         else { return }
-        // Round 7: only the run this placement opened says anything about what a lead is worth. A
-        // timeline AVPlayer rebuilt puts the segment on a base that has nothing to do with the lead,
-        // and round 6 let exactly those readings set the coefficient (the reporter's 2.00x, and a
-        // 21 s residual on the fixture teaching the same value).
+        // Round 7: only the run this placement opened says anything about where a placement sits. A
+        // timeline AVPlayer rebuilt puts the segment on a base that is a statement about the rebuild,
+        // and round 6 let exactly those readings set the parameter (the reporter's 2.00x, and a 21 s
+        // residual on the fixture teaching the same value).
+        let teaching: DisplacementTeaching
         if source == .ownRun {
-            learnLeadCoefficient(from: placement, measuredBase: reading.base)
+            teaching = learnPlacementDisplacement(from: placement, measuredBase: reading.base)
+        } else {
+            anchorShiftLock.lock()
+            let standing = lastPlacementDisplacement
+            anchorShiftLock.unlock()
+            teaching = .notTaught(standing: standing)
         }
         guard abs(reading.residual) > Self.axisRepublishEpsilonSeconds else {
             // Said out loud, because a check that only speaks when it disagrees cannot be told from one
@@ -2976,7 +3054,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             EngineLog.emit(
                 "[HLSVideoEngine] #418 seg\(placement.index) placement confirmed: AVPlayer holds it "
                 + "from item \(String(format: "%.3f", observedItemStart))s, base "
-                + "\(String(format: "%.3f", reading.base))s as published",
+                + "\(String(format: "%.3f", reading.base))s as published; \(teaching.clause)",
                 category: .session
             )
             return
@@ -2987,41 +3065,72 @@ public final class HLSVideoEngine: @unchecked Sendable {
             + "\(String(format: "%.3f", observedItemStart))s, clock \(String(format: "%.3f", itemClock))s, "
             + "residual \(String(format: "%+.3f", reading.residual))s): axis "
             + "\(String(format: "%.3f", placement.assumedBase + placement.worth))s -> "
-            + "\(String(format: "%.3f", reading.axis))s",
+            + "\(String(format: "%.3f", reading.axis))s; \(teaching.clause)",
             category: .session
         )
         publishPlaylistShift(reading.axis, seamItemSeconds: reading.seam)
     }
 
-    /// AE#418 round 6: a placement that opened a run of its own says what a presentation lead is
-    /// worth on this source, which is the one thing about the composition this side had been
-    /// assuming. Learned from every reading, the confirmations included: a confirmation is the
-    /// coefficient in force being right, and saying so is what keeps it from drifting unchallenged.
-    private func learnLeadCoefficient(from placement: PublishedPlacement, measuredBase: Double) {
-        guard let sample = Self.leadCoefficient(
-            axis: placement.axisInForce, measuredBase: measuredBase,
-            presentationLead: placement.presentationLead)
-        else { return }
+    /// AE#418 round 8: a placement that opened a run of its own says how far below the axis it
+    /// composed on AVPlayer actually put it, and the next composition starts there.
+    ///
+    /// Learned from every reading, the confirmations included: a confirmation is the standing value
+    /// being right, and recording it is what keeps it from drifting unchallenged. Round 6 and 7
+    /// learned instead from the subset of placements carrying a presentation lead, which on a source
+    /// without frame reordering, and on any session whose placements are AE#412 re-cuts, is none of
+    /// them.
+    @discardableResult
+    private func learnPlacementDisplacement(
+        from placement: PublishedPlacement, measuredBase: Double
+    ) -> DisplacementTeaching {
+        let sample = Self.placementDisplacement(
+            axis: placement.axisInForce, measuredBase: measuredBase)
         anchorShiftLock.lock()
-        let previous = measuredLeadCoefficient
-        leadCoefficientSamples.append(sample)
-        let standing = measuredLeadCoefficient
-        let count = leadCoefficientSamples.count
+        let previous = lastPlacementDisplacement
+        lastPlacementDisplacement = sample
         anchorShiftLock.unlock()
-        let moved = previous == nil
-            || abs((standing ?? 0) - (previous ?? 0)) > Self.leadCoefficientReportEpsilon
-        // Round 7: the sample is printed whether or not it moves the session, because a reading that
-        // is outvoted is the evidence for holding, and silence there reads as a check that never ran.
+        guard abs(sample - previous) > Self.axisRepublishEpsilonSeconds else {
+            return .taught(sample: sample, moved: false)
+        }
         EngineLog.emit(
-            "[HLSVideoEngine] #418 seg\(placement.index) reads a lead at "
-            + "\(String(format: "%.2f", sample))x (sample \(count)); the session holds "
-            + "\(standing.map { String(format: "%.2fx", $0) } ?? "none")"
-            + (moved ? "" : ", unmoved")
-            + " (axis \(String(format: "%.3f", placement.axisInForce))s, base measured "
-            + "\(String(format: "%.3f", measuredBase))s, lead "
-            + "\(String(format: "%.3f", placement.presentationLead))s)",
+            "[HLSVideoEngine] #418 seg\(placement.index) sat "
+            + "\(String(format: "%.3f", sample))s below the axis it composed on, not "
+            + "\(String(format: "%.3f", previous))s; the next composition starts there "
+            + "(axis \(String(format: "%.3f", placement.axisInForce))s, base measured "
+            + "\(String(format: "%.3f", measuredBase))s)",
             category: .session
         )
+        return .taught(sample: sample, moved: true)
+    }
+
+    /// AE#418 round 9: what a reading did to the standing distance, said on the reading's own line.
+    ///
+    /// Round 8 taught from every own-run reading and printed only the moves, so a reading that taught
+    /// the value it already had and a reading that was not allowed to teach at all printed the same
+    /// verdict. The reporter's round-8 retest ends on exactly that: three `placement confirmed` lines
+    /// with no `sat` line under them, and no way from the log to tell which of the two had happened.
+    /// A standing value that every later `placed` line quotes needs its provenance on the line that
+    /// sets it, not in the reader's head.
+    enum DisplacementTeaching: Equatable {
+        /// An own-run reading. `moved` is false when it taught the value already standing, which is a
+        /// confirmation of the distance rather than silence about it.
+        case taught(sample: Double, moved: Bool)
+        /// A reading off a timeline AVPlayer rebuilt, which is a statement about the rebuild and not
+        /// about where a placement sits below its axis (round 7). It corrects the axis and teaches
+        /// nothing.
+        case notTaught(standing: Double)
+
+        var clause: String {
+            switch self {
+            case .taught(let sample, let moved):
+                return moved
+                    ? "taught the distance \(String(format: "%.3f", sample))s"
+                    : "taught the standing distance \(String(format: "%.3f", sample))s again"
+            case .notTaught(let standing):
+                return "taught nothing, read off a rebuilt timeline; the distance stays "
+                    + "\(String(format: "%.3f", standing))s"
+            }
+        }
     }
 
     /// AE#418 round 7: the window closed with no run this placement could be read from, so the
@@ -3087,6 +3196,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentDeliveryByIndex = segmentDeliveryByIndex.filter { abs($0.key - index) <= 64 }
         }
         segmentDeliveryByIndex[index] = (segmentDeliverySerial, delivered)
+        if delivered, firstDeliveredIndexSinceSeek == nil { firstDeliveredIndexSinceSeek = index }
         anchorShiftLock.unlock()
     }
 

@@ -40,6 +40,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
 - [KSKPix](https://ksktech.dev/kskpix): KSKPix is a premium IPTV player for Live TV, Movies & Series.
 - [Syravo](https://syravo.app): Xtream Codes, Jellyfin and radio client for iPhone, iPad and Apple TV.
+- [KIPTV](https://kiptv.app): Premium, cross-platform IPTV Player.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -140,7 +141,7 @@ try await player.load(url: videoURL, options: .init(
     httpHeaders: headers,              // attached to every demux + segment fetch
     matchContentEnabled: matchContent  // tvOS Match Content master toggle
 ))
-try await player.reloadAtCurrentPosition()                      // background reopen, preserves options
+try await player.reloadAtCurrentPosition()                      // background reopen, preserves options + transport
 try await player.load(url: trackURL, options: .init(audioOnly: true))   // lean audio path
 
 // Transport
@@ -334,7 +335,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.66.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.67.2")
 ```
 
 Three samples ship in `Examples/`:
@@ -537,10 +538,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.66.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.67.2")
 ```
 
-Pin to `.upToNextMinor(from: "6.66.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.67.2")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

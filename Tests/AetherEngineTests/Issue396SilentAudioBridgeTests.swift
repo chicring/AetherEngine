@@ -223,4 +223,159 @@ struct Issue396SilentAudioBridgeTests {
                 "a bridge that produced audio is not the reason the moov could not be written")
         #expect(surfaced.snapshot?.reason == "Source audio cannot be muxed")
     }
+
+    // MARK: - AE#474: the gate's unit
+
+    /// Raw stereo PCM at 48 kHz. `.surroundCompat` encodes 2 channels or fewer to FLAC, so this is
+    /// the FLAC arm on the DEFAULT mode, and raw PCM lets a packet carry any number of samples.
+    private func makePCMCodecpar() -> UnsafeMutablePointer<AVCodecParameters> {
+        let par = avcodec_parameters_alloc()!
+        par.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        par.pointee.codec_id = AV_CODEC_ID_PCM_S16LE
+        par.pointee.sample_rate = 48_000
+        par.pointee.format = AV_SAMPLE_FMT_S16.rawValue
+        par.pointee.bits_per_coded_sample = 16
+        par.pointee.block_align = 4
+        av_channel_layout_default(&par.pointee.ch_layout, 2)
+        return par
+    }
+
+    /// One packet per TrueHD access unit: 40 samples at 48 kHz, the smallest source packet the bridge
+    /// is fed anywhere. 64 of them are 2560 samples, which is what the reporter's device log carried.
+    private func makeTrueHDShapedPCMPackets(count: Int, samplesPerPacket: Int = 40)
+        -> [UnsafeMutablePointer<AVPacket>] {
+        (0..<count).compactMap { i in
+            guard let pkt = trackedPacketAlloc() else { return nil }
+            let bytes = samplesPerPacket * 2 * 2
+            guard av_new_packet(pkt, Int32(bytes)) >= 0 else { return nil }
+            for n in 0..<samplesPerPacket {
+                let global = i * samplesPerPacket + n
+                let v = Int16(9000 * sin(2 * .pi * 440 * Double(global) / 48_000)).littleEndian
+                for ch in 0..<2 {
+                    let off = (n * 2 + ch) * 2
+                    withUnsafeBytes(of: v) { raw in
+                        pkt.pointee.data!.advanced(by: off).update(from: raw.baseAddress!
+                            .assumingMemoryBound(to: UInt8.self), count: 2)
+                    }
+                }
+            }
+            pkt.pointee.pts = Int64(i * samplesPerPacket)
+            pkt.pointee.dts = pkt.pointee.pts
+            return pkt
+        }
+    }
+
+    @Test("start-up on the FLAC arm is not silence: 64 small packets are half of one encoder frame")
+    func flacArmStartUpIsNotReportedAsSilence() throws {
+        let codecpar = makePCMCodecpar()
+        defer {
+            var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+            avcodec_parameters_free(&p)
+        }
+        let bridge = try AudioBridge(srcCodecpar: codecpar,
+                                     srcTimeBase: AVRational(num: 1, den: 48_000),
+                                     mode: .surroundCompat)
+        defer { bridge.close() }
+        #expect(bridge.outputCodecID == AV_CODEC_ID_FLAC,
+                "precondition: the default mode encodes a stereo source to FLAC")
+
+        var packets = makeTrueHDShapedPCMPackets(count: 64)
+        defer { freeAll(&packets) }
+        var outputs: [UnsafeMutablePointer<AVPacket>] = []
+        defer { freeAll(&outputs) }
+        for p in packets { outputs.append(contentsOf: try bridge.feed(packet: p)) }
+
+        let stats = bridge.feedStats
+        #expect(stats.packetsFed == 64)
+        #expect(stats.samplesEnqueued == 2560, "the reporter's own counters, reproduced")
+        #expect(stats.packetsEmitted == 0,
+                "requireFull declines below frame_size, so no output is POSSIBLE yet")
+        #expect(stats.isSilent, "silent in the counter's sense, which is not the same as structural")
+        #expect(!bridge.silentFeedReported,
+                "AE#474: 2560 samples is short of FLAC's 4608, so nothing could have been emitted")
+    }
+
+    @Test("the same feed continued past the encoder's frame produces audio and still reports nothing")
+    func flacArmProducesOnceTheFrameIsFull() throws {
+        let codecpar = makePCMCodecpar()
+        defer {
+            var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+            avcodec_parameters_free(&p)
+        }
+        let bridge = try AudioBridge(srcCodecpar: codecpar,
+                                     srcTimeBase: AVRational(num: 1, den: 48_000),
+                                     mode: .surroundCompat)
+        defer { bridge.close() }
+
+        var packets = makeTrueHDShapedPCMPackets(count: 400)
+        defer { freeAll(&packets) }
+        var outputs: [UnsafeMutablePointer<AVPacket>] = []
+        defer { freeAll(&outputs) }
+        for p in packets { outputs.append(contentsOf: try bridge.feed(packet: p)) }
+
+        #expect(bridge.feedStats.packetsEmitted > 0)
+        #expect(!bridge.silentFeedReported,
+                "a bridge that went on to produce audio must never have announced a failure")
+    }
+
+    @Test("a source the decoder rejects still names itself, from the packet arm")
+    func decoderArmStillReports() throws {
+        let codecpar = makeMP3Codecpar()
+        defer {
+            var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+            avcodec_parameters_free(&p)
+        }
+        let bridge = try AudioBridge(srcCodecpar: codecpar,
+                                     srcTimeBase: AVRational(num: 1, den: 1000),
+                                     mode: .surroundCompat)
+        defer { bridge.close() }
+
+        var packets = makeUndecodablePackets(count: 80)
+        defer { freeAll(&packets) }
+        for p in packets { _ = try? bridge.feed(packet: p) }
+
+        #expect(bridge.feedStats.samplesEnqueued == 0)
+        #expect(bridge.silentFeedReported,
+                "nothing ever reached the FIFO, which is the arm packets are the only unit for")
+    }
+
+    // MARK: - The gate itself
+
+    @Test("the encoder's frame is the bound on the encoder arm, not a packet count")
+    func structuralSilenceIsBoundedByTheEncoderFrame() {
+        var startUp = AudioBridge.FeedStats()
+        startUp.packetsFed = 64
+        startUp.framesDecoded = 64
+        startUp.samplesEnqueued = 2560
+        startUp.packetsFedSinceLastEnqueue = 0
+        #expect(!AudioBridge.silenceIsStructural(stats: startUp, encoderFrameSize: 4608),
+                "AE#474: below one FLAC frame the encoder has not been asked yet")
+        #expect(AudioBridge.silenceIsStructural(stats: startUp, encoderFrameSize: 512),
+                "the same counters ARE structural against an encoder whose frame they cleared")
+
+        var fed = startUp
+        fed.samplesEnqueued = 4608 * 4
+        #expect(AudioBridge.silenceIsStructural(stats: fed, encoderFrameSize: 4608))
+
+        var healthy = fed
+        healthy.packetsEmitted = 1
+        #expect(!AudioBridge.silenceIsStructural(stats: healthy, encoderFrameSize: 4608),
+                "a bridge that emitted anything is never silent")
+    }
+
+    @Test("a decoder that stops answering is caught by the packet arm, from where it stopped")
+    func decoderThatStopsAnsweringIsStillCaught() {
+        var trickle = AudioBridge.FeedStats()
+        trickle.packetsFed = 900
+        trickle.framesDecoded = 3
+        trickle.samplesEnqueued = 120
+        trickle.packetsFedSinceLastEnqueue = 897
+        #expect(AudioBridge.silenceIsStructural(stats: trickle, encoderFrameSize: 4608),
+                "120 samples will never reach a FLAC frame, and the FIFO stopped moving 897 packets ago")
+
+        var stillFilling = trickle
+        stillFilling.packetsFedSinceLastEnqueue = 1
+        #expect(!AudioBridge.silenceIsStructural(stats: stillFilling, encoderFrameSize: 4608),
+                "a FIFO that is still accepting samples is a bridge that has not been asked yet")
+    }
 }

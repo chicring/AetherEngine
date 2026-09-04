@@ -8,6 +8,8 @@ import AetherLibavutil
 /// only needs to eventually observe it); context written once under teardown ordering.
 final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     private let reader: IOReader
+    /// AE#460 follow-up: whether this open must leave the reader's cursor alone. See `open()`.
+    private let preservesSourcePosition: Bool
     private static let bufferSize: Int32 = 256 * 1024  // matches AVIOReader.avioBufferSize
     private var buffer: UnsafeMutablePointer<UInt8>?
     private(set) var context: UnsafeMutablePointer<AVIOContext>?
@@ -62,8 +64,9 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         autoreleasepool { body() }
     }
 
-    init(reader: IOReader) {
+    init(reader: IOReader, preservesSourcePosition: Bool = false) {
         self.reader = reader
+        self.preservesSourcePosition = preservesSourcePosition
     }
 
     func open() throws {
@@ -88,12 +91,56 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         }
         context = ctx
 
-        // SEEK_SET to 0 is a no-op for seekable, refused by forward-only (returns negative).
-        isSeekable = timeSeekableReader != nil
-            || callingHost { reader.seek(offset: 0, whence: 0) } >= 0
+        // A fresh AVIOContext always starts its byte axis at 0, so the reader's cursor and that
+        // axis have to be made to agree. There are two ways to do it and the source decides which:
+        //
+        //  - Ordinary opens rewind the reader to 0. Load-bearing, not incidental: a VOD reopen
+        //    (the probe pass, an audio-track switch) has to re-read the container header, and the
+        //    reader is wherever the previous open left it.
+        //  - A LIVE open leaves the reader where it is and `Demuxer.openWithProvider` moves the
+        //    axis to the cursor instead. Same invariant from the other end, and the only one that
+        //    is right for a source that has kept receiving: the rewind put a host's live spool
+        //    back to its base and asked it to re-deliver the whole delivered window (AE#460
+        //    follow-up, measured: playhead 41.5 s -> 1.9 s, 15 MB re-read).
+        //
+        // Either way the seek doubles as the seekability probe: seeking a source to where it is
+        // already meant to be is a no-op for a seekable reader and refused by a forward-only one.
+        // A time-seekable reader is repositioned by time, never by bytes, and is not probed at all.
+        if timeSeekableReader != nil {
+            isSeekable = true
+            return
+        }
+        let here = preservesSourcePosition
+            ? callingHost { reader.seek(offset: 0, whence: 1) }  // SEEK_CUR 0: report position
+            : -1
+        isSeekable = callingHost { reader.seek(offset: max(0, here), whence: 0) } >= 0
     }
 
+    /// AE#460 follow-up: where the host's reader currently sits, or nil when it will not say.
+    ///
+    /// A fresh `AVIOContext` starts its byte axis at 0 no matter where the reader is, which is
+    /// right for a first open and wrong for a live reopen: it makes libavformat read the source
+    /// from the host's base. `Demuxer.openWithProvider` aligns the axis to this instead, so a live
+    /// rebuild resumes where the session already was.
+    var currentSourceOffset: Int64? {
+        let here = callingHost { reader.seek(offset: 0, whence: 1) }  // SEEK_CUR 0
+        return here >= 0 ? here : nil
+    }
+
+    /// The bridge does not own the reader (see `close()`), so a rebuild reopens onto a source that
+    /// has kept reading position, and on a live host has kept receiving.
+    var sourceSurvivesReopen: Bool { true }
+
     func markClosed() {
+        // AE#460 follow-up: cancel the reader ONCE. The bridge does not own it, and on an in-place
+        // rebuild the engine hands the same reader to a successor bridge while this one is still
+        // being torn down (`stopInternal` marks it closed, the demuxer's own `close()` marks it
+        // again a moment later, sometimes after the new pump is already reading). A second cancel
+        // can therefore only reach the successor's read, which on a live source is parked at the
+        // edge and comes back -1: the rebuilt pump exits with `readError(-1)` and the session dies
+        // just after reporting itself playing. One cancel is also all that is needed: after
+        // `isClosed` no further read reaches the host, so nothing new can park.
+        guard !isClosed else { return }
         isClosed = true
         callingHost { reader.cancel() }
     }

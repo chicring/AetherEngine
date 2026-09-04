@@ -73,12 +73,12 @@ func printUsage() {
       aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
-                 [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]
+                 [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
              [--max-concurrent-requests N]
-                     [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback,seekfar] <url>
+                     [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback,seekfar,pauseseek] <url>
                      (full load+play session smoke test; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
                       --audio-stats taps decoded PCM and prints per-second audio lead
@@ -111,8 +111,8 @@ func printUsage() {
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
-      aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] <file>
-      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] <file.ts>
+      aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
+      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
                           never EOF, unknown size; prints physFP and its slope against that rate)
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
@@ -645,15 +645,21 @@ if first == "play" {
     // runtime setter. Same 20 s default as the teletext switch and for the same reason: it has to
     // land on a session that is playing, or it only re-proves the load option.
     let audioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
-    let audioDelaySwitch: AudioDelaySwitchRequest? = takeStringFlag("--switch-audio-delay", from: &rest).flatMap { spec in
+    // Round 2: repeatable, so a run can press the stepper more than once. The `@ms` suffixes are
+    // what put two presses inside one runloop turn.
+    var audioDelaySwitches: [AudioDelaySwitchRequest] = []
+    while let spec = takeStringFlag("--switch-audio-delay", from: &rest) {
         let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
         guard let ms = Int(parts[0]) else {
             print("ERROR: --switch-audio-delay takes <ms>[@ms], got '\(spec)'")
             exit(64)
         }
-        return AudioDelaySwitchRequest(milliseconds: ms,
-                                       delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000)
+        audioDelaySwitches.append(AudioDelaySwitchRequest(
+            milliseconds: ms,
+            delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
+    // AE#464 round 2: mount with `autoplay = false`, the shape of a host that owns transport.
+    let pausedMount = takeFlag("--paused", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -725,7 +731,8 @@ if first == "play" {
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
-                 audioDelayMs: audioDelayMs, audioDelaySwitch: audioDelaySwitch,
+                 audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
+                 pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  declaredDuration: declaredDuration,
@@ -762,6 +769,23 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // AE#445 round 3: a positive control for the reporter's own shape. removeFirst puts an
     // ingest-side Data carry back on the delivery path (bounded count, unbounded backing store);
     // subdata is the same carry re-based, i.e. the fix. Default none measures the engine alone.
+    // AE#460 follow-up: fire an in-place option correction on the live spool N seconds in, so the
+    // custom-source reload branch can be watched on a reader that has run past its base.
+    let customReloadAt = takeDoubleFlag("--reload-at", from: &rest)
+    // The non-conforming arm: a reader that reads `cancel()` as terminal, which is what a network
+    // reader's in-flight-request cancel becomes. Contract says unblock only; this measures the cost
+    // of the other reading rather than leaving it to be discovered on a host.
+    let customCancelLatches = takeFlag("--cancel-latches", from: &rest)
+    // AE#461 follow-up: drive the decode-path correction on a CUSTOM source. `--reload-at`'s own
+    // correction (an httpHeaders probe) is inert on this shape by design, so it measures the rebuild
+    // and cannot measure this field; this one is the field.
+    let customReloadDecodePath: DecodePath? = takeStringFlag("--reload-decode-path", from: &rest).flatMap { value in
+        guard let path = DecodePath(rawValue: value) else {
+            print("ERROR: --reload-decode-path takes \(DecodePath.allCases.map(\.rawValue).joined(separator: "|")), got '\(value)'")
+            exit(64)
+        }
+        return path
+    }
     let customHostCarry = takeStringFlag("--host-carry", from: &rest) ?? "none"
     guard let customCarryTrim = HostCarryTrim(rawValue: customHostCarry) else {
         print("ERROR: --host-carry expects none|removeFirst|subdata, got '\(customHostCarry)'")
@@ -823,9 +847,11 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                                     dvrWindow: customDvrWindow, reportsSize: customReportsSize,
                                     wraps: !customNoWrap, mallocCensus: customMallocCensus,
                                     foundationReader: customFoundationReader,
-                                    carryTrim: customCarryTrim))
+                                    carryTrim: customCarryTrim, reloadAt: customReloadAt,
+                                    cancelLatches: customCancelLatches,
+                                    reloadDecodePath: customReloadDecodePath))
         }
-        exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex))
+        exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex, reloadDecodePath: customReloadDecodePath))
     default:
         printUsage()
         exit(64)

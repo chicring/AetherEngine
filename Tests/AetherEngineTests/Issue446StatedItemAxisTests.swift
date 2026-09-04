@@ -14,10 +14,19 @@ import Testing
 /// session's own first item, the #130 media fallback (documented to run after the window slid), the
 /// #35 gate reloads, an AirPlay hop, and the rejoin branch whose target had been evicted.
 ///
-/// Both readings that made this measurable came from the field: on 6.60.0 a start item whose playlist
-/// begins at exactly 0.00 s reconstructed 0.05 s and carried it for the session (cmcpherson274,
-/// Apple TV 4K gen 3 and the simulator, identical); on 6.57.0 the same construction read 0 for an
-/// item whose playlist began 6.76 s in, which is the same defect with a bigger number.
+/// The reading that made this measurable came from the field: on 6.57.0 the construction read 0 for
+/// an item whose playlist began 6.76 s in.
+///
+/// AE#446 round 6 retires the other one. The 0.05 s a start item reconstructed on 6.60.0
+/// (cmcpherson274, Apple TV 4K gen 3 and the simulator, identical) was published here as a playlist
+/// beginning at exactly 0.00 s reading nonzero, and it was not: his first segment really does begin
+/// at 0.050 s. A live item's zero is the PRESENTATION time of its first frame while the axis anchor
+/// pins the first DECODE time to 0, so on a source with frame reordering every session's first item
+/// starts exactly one presentation lead above zero. Measured on the harness, two seeds differing
+/// only in that: `lead=3000` (90 kHz) gives `live seg-0 finalized: start=0.033s` and a stated axis of
+/// 0.03 s, `-bf 0` gives 0.000 s and 0.00 s. The bundled seed carries no reordering, which is why
+/// the harness read 0.00 and the premise survived. What the field reading does show is the branch
+/// below it: at the instant of the statement the reconstruction had nothing at all.
 @Suite("AE#446 the playlist states every item's axis")
 struct Issue446StatedItemAxisTests {
 
@@ -136,6 +145,36 @@ struct Issue446StatedItemAxisTests {
         let provider = ScriptedAxisProvider(count: 20, live: false)
         _ = HLSLocalServer.buildMediaPlaylistText(provider: provider)
         #expect(provider.statedFirstVisible.isEmpty)
+    }
+
+    // MARK: - What the reconstruction was missing
+
+    /// AE#446 round 6: the "nothing to say yet" branch is timing, not the item kind, so the line says
+    /// which term was absent. cmcpherson274 had to read the source to establish that, which is the
+    /// cost this pays off.
+    @Test("an item that has not reported its range yet is named as the gap")
+    func gapNamesTheItem() {
+        #expect(AetherEngine.liveAxisReconstructionGap(
+            itemReportsRange: false, hasProducerFloor: true) == "the item reports no seekable range yet")
+    }
+
+    @Test("a producer holding nothing yet is named as the gap")
+    func gapNamesTheProducer() {
+        #expect(AetherEngine.liveAxisReconstructionGap(
+            itemReportsRange: true, hasProducerFloor: false) == "the producer holds no resident floor yet")
+    }
+
+    @Test("both missing names both, because they are separate signals")
+    func gapNamesBoth() {
+        let gap = AetherEngine.liveAxisReconstructionGap(itemReportsRange: false, hasProducerFloor: false)
+        #expect(gap?.contains("the item reports no seekable range yet") == true)
+        #expect(gap?.contains("the producer holds no resident floor yet") == true)
+    }
+
+    @Test("nothing missing is not a gap")
+    func noGapWhenBothTermsAreThere() {
+        #expect(AetherEngine.liveAxisReconstructionGap(
+            itemReportsRange: true, hasProducerFloor: true) == nil)
     }
 
     // MARK: - Which item a statement describes

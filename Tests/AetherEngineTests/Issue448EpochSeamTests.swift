@@ -59,7 +59,7 @@ struct Issue448EpochSeamTests {
     func zeroWorthKeepsTheAxis() {
         // Its content begins exactly at its advertised start, so the placement adds nothing. The
         // picture agrees: axisErr read -10.709 before and after that epoch took over.
-        #expect(HLSVideoEngine.axisShift(after: -10.667, placing: 0, presentationLead: 0, coefficient: 1) == -10.667)
+        #expect(HLSVideoEngine.axisShift(after: -10.667, placing: 0, displacement: 0) == -10.667)
     }
 
     @Test("the seam belongs at the placement, which is below the newest one after a backward seek")

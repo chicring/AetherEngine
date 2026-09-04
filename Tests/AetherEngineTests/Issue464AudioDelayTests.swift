@@ -204,20 +204,41 @@ struct Issue464RecutEligibilityTests {
 
     @Test("a session with a playhead re-anchors; one without keeps the value for the next seam")
     func stateMatrix() {
-        #expect(AetherEngine.audioDelayRecutIsPossible(state: .playing, isLive: false, hasLiveWindow: false))
-        #expect(AetherEngine.audioDelayRecutIsPossible(state: .paused, isLive: false, hasLiveWindow: false))
-        #expect(AetherEngine.audioDelayRecutIsPossible(state: .seeking, isLive: false, hasLiveWindow: false))
+        #expect(AetherEngine.audioDelayRecutIsPossible(state: .playing, isLive: false, liveWindow: nil))
+        #expect(AetherEngine.audioDelayRecutIsPossible(state: .paused, isLive: false, liveWindow: nil))
+        #expect(AetherEngine.audioDelayRecutIsPossible(state: .seeking, isLive: false, liveWindow: nil))
         // The states seek() itself refuses. Setting the value is still honoured; only the re-anchor
         // is skipped, and the next load reads it out of the options.
-        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .idle, isLive: false, hasLiveWindow: false))
-        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .loading, isLive: false, hasLiveWindow: false))
-        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .ended, isLive: false, hasLiveWindow: false))
+        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .idle, isLive: false, liveWindow: nil))
+        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .loading, isLive: false, liveWindow: nil))
+        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .ended, isLive: false, liveWindow: nil))
     }
 
     @Test("live without a DVR window has no position to come back to")
     func liveWithoutDVR() {
-        #expect(!AetherEngine.audioDelayRecutIsPossible(state: .playing, isLive: true, hasLiveWindow: false))
-        #expect(AetherEngine.audioDelayRecutIsPossible(state: .playing, isLive: true, hasLiveWindow: true))
+        // Round 2: these are the windows `load` actually builds, not a Bool a call site derives. The
+        // gate used to be handed `liveWindow != nil`, which is true for BOTH of these, so the whole
+        // live-only branch was unreachable and a live session took the re-anchor either way.
+        #expect(!AetherEngine.audioDelayRecutIsPossible(
+            state: .playing, isLive: true, liveWindow: LiveWindow(windowSeconds: nil)))
+        #expect(AetherEngine.audioDelayRecutIsPossible(
+            state: .playing, isLive: true, liveWindow: LiveWindow(windowSeconds: 1800)))
+        // The remote-HLS live shape: `load` gives it an unbounded window, and it does rewind.
+        #expect(AetherEngine.audioDelayRecutIsPossible(
+            state: .playing, isLive: true, liveWindow: LiveWindow(windowSeconds: .greatestFiniteMagnitude)))
+    }
+
+    @Test("the gate agrees with the one the seek path uses, which is where the sessions actually meet")
+    func agreesWithTheSeekRefusal() {
+        // A live `.software` re-anchor is a `seek(origin: .host)`, so a gate that lets one through
+        // that `seek` then refuses as `liveWithoutDVR` costs a teardown to change nothing. The two
+        // rules have to read the same field, and this is what pins that they do.
+        for window in [Double?.none, 1800, .greatestFiniteMagnitude] {
+            let seekRefuses = AetherEngine.liveSeekRefusedWithoutDVR(origin: .host, windowSeconds: window)
+            let gateAllows = AetherEngine.audioDelayRecutIsPossible(
+                state: .playing, isLive: true, liveWindow: LiveWindow(windowSeconds: window))
+            #expect(gateAllows == !seekRefuses)
+        }
     }
 }
 

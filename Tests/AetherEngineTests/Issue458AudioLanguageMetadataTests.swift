@@ -63,6 +63,49 @@ struct Issue458AudioLanguageMetadataTests {
         #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "nan") == "nan")
     }
 
+    /// htrung14, AE#458 retest: `cnr` (Montenegrin) survived fail-closed, because ICU has a display name
+    /// for it and no alpha3 entry, and CLDR does not alias it either, so neither route above reaches it.
+    /// 57 three-letter tags are in that state on macOS 26; these are the ones a real library carries.
+    /// The tag IS the ISO 639 code, so it passes through unchanged rather than resolving to anything.
+    @Test("three-letter tags ICU names but cannot map pass through as themselves")
+    func resolvesNamedThreeLetterTags() {
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "cnr") == "cnr")
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "prs") == "prs")
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "npi") == "npi")
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "ory") == "ory")
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "quz") == "quz")
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "crs") == "crs")
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "CNR-ME") == "cnr")
+    }
+
+    /// The pass-through gate is the DISPLAY NAME, not canonicalization, and this is why:
+    /// `Locale.canonicalLanguageIdentifier(from:)` echoes anything it does not know, so it answers "cnr"
+    /// for "cnr" and "dub" for "dub" alike. `localizedString(forLanguageCode:)` separates them.
+    @Test("three-letter labels ICU cannot name stay unresolved even though canonicalization echoes them")
+    func namelessThreeLetterLabelsStayClosed() {
+        for label in ["dub", "com", "sub", "org", "sfx", "ost", "xyz", "zzz"] {
+            #expect(Locale.canonicalLanguageIdentifier(from: label) == label)
+            #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: label) == nil)
+        }
+    }
+
+    /// "und" has a display name ("Unknown language") and must still write nothing: it is the muxer's
+    /// default, so writing it is the same as writing nothing.
+    @Test("und stays unresolved although ICU names it")
+    func undefinedStaysClosed() {
+        #expect(Locale(identifier: "en_US").localizedString(forLanguageCode: "und") != nil)
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "und") == nil)
+    }
+
+    /// The name lookup runs against a FIXED reference locale. Reading `Locale.current` instead would
+    /// resolve the same file on an English Apple TV and not on a German one: ICU has "Montenegrin" for
+    /// `cnr` in en and no display name for it in de (measured macOS 26, 2026-09-03). This assertion
+    /// therefore fails on a de_DE machine if that gate ever moves to the device language.
+    @Test("resolution does not depend on the device UI language")
+    func referenceLocaleIsFixed() {
+        #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: "cnr") == "cnr")
+    }
+
     /// Canonicalization resolves "English" to "en" and "Japanese" to "jpn", so the fallback is gated on
     /// a well-formed BCP-47 primary subtag (2 or 3 letters). Free text in a language field is a NAME,
     /// not a tag, and guessing at it is how a commentary track ends up labelled as its own language.
@@ -105,7 +148,7 @@ struct Issue458AudioLanguageMetadataTests {
     /// on the floor there instead of here.
     @Test("every resolved value is three lowercase ASCII letters")
     func outputIsMuxerSafe() {
-        for tag in ["en", "ger", "pt-BR", "yue", "zh-Hans", "fa", "tl", "nb"] {
+        for tag in ["en", "ger", "pt-BR", "yue", "zh-Hans", "fa", "tl", "nb", "cnr", "prs", "cmn"] {
             guard let resolved = AudioLanguageMap.iso639_2T(forSourceLanguage: tag) else {
                 Issue.record("\(tag) unexpectedly unresolved")
                 continue

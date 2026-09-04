@@ -9,7 +9,7 @@ import Foundation
 ///
 /// ICU resolves ISO 639-1, ISO 639-2/T and BCP-47 subtags ("pt-BR" -> "por"), but NOT the twenty ISO 639-2/B
 /// bibliographic codes, and Matroska writes exactly those ("ger", "fre", "cze"), so they are mapped first.
-/// Everything else fails closed: a label ICU cannot resolve to a three-letter code writes no language at all,
+/// Everything else fails closed: a label ICU can neither resolve nor name writes no language at all,
 /// which leaves the unlabelled-track behaviour untouched.
 enum AudioLanguageMap {
     /// The twenty ISO 639-2 languages whose bibliographic code differs from the terminological one.
@@ -41,9 +41,36 @@ enum AudioLanguageMap {
         // tag. Guessing at it is how a commentary track ends up labelled as a language.
         guard hasLanguageSubtagShape(raw) else { return nil }
         let canonical = Locale.canonicalLanguageIdentifier(from: raw)
-        guard canonical != raw else { return nil }
-        return alpha3(of: canonical)
+        if canonical != raw, let aliased = alpha3(of: canonical) { return aliased }
+        return namedThreeLetterTag(raw)
     }
+
+    /// A three-letter tag ICU can NAME but has no alpha3 entry for is already the ISO 639 code, so it
+    /// passes through unchanged: `cnr` (Montenegrin), `prs` (Dari), `npi`, `ory`, `quz`, `crs`, `pis`
+    /// and 49 more measured on macOS 26 (56 tags in all). Neither route above reaches them, because `identifier(.alpha3)`
+    /// only maps the 639-1/639-2 pairs and CLDR does not alias these to anything (`canonicalLanguageIdentifier`
+    /// returns them unchanged). htrung14 found the class through `cnr` on the AE#458 retest.
+    ///
+    /// **The display name is the validity gate that canonicalization is not.** `canonicalLanguageIdentifier`
+    /// echoes its input for ANYTHING it does not know, so "cnr" -> "cnr" and "dub" -> "dub" are the same
+    /// answer and pass-through on that signal alone would label a track tagged `dub` or `com` as a language.
+    /// `localizedString(forLanguageCode:)` returns nil for those and "Montenegrin" for `cnr`.
+    ///
+    /// The reference locale is FIXED, not `Locale.current`: `cnr` has an English display name and no German
+    /// one, so a device-language gate would resolve the same file on one Apple TV and not on the next.
+    /// Two-letter tags are excluded (only `bh` reaches here, and it is not a three-letter code to write).
+    private static func namedThreeLetterTag(_ raw: String) -> String? {
+        let primary = String(raw.prefix { $0 != "-" && $0 != "_" })
+        guard primary.count == 3, primary != "und" else { return nil }
+        guard let name = languageNameReferenceLocale.localizedString(forLanguageCode: primary),
+              name != primary
+        else { return nil }
+        return primary
+    }
+
+    /// ICU display data, not app resources, so this resolves on any device regardless of installed
+    /// localizations. See `namedThreeLetterTag`.
+    private static let languageNameReferenceLocale = Locale(identifier: "en_US")
 
     private static func alpha3(of identifier: String) -> String? {
         guard let alpha3 = Locale.Language(identifier: identifier).languageCode?.identifier(.alpha3),

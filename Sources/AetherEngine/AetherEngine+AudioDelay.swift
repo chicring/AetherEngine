@@ -94,11 +94,39 @@ extension AetherEngine {
             // makes the next producer the session builds for its own reasons cut with the new value.
             nativeVideoSession?.audioDelaySeconds = clamped
             EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the loopback path, "
-                + "re-cutting from the playhead",
+                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the loopback path",
                 category: .engine
             )
-            reanchorForAudioDelay(clamped) { _ in try? await self.reloadAtCurrentPosition() }
+            reanchorForAudioDelay(clamped) { _ in
+                // Round 2 (cmcpherson274): this was `try? await reloadAtCurrentPosition()`, under a
+                // line that had already announced the re-cut. Two claims, one of them unverified: a
+                // rebuild the session cannot make is not a rebuild, and a rebuild that threw is not
+                // one either, so both used to read as a re-cut that happened. The refusal is asked
+                // for BEFORE the rebuild, where it still costs nothing (#460 rule 2).
+                if let refusal = self.sessionReloadRefusal {
+                    EngineLog.emit(
+                        "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) stands, but this "
+                        + "session cannot be rebuilt in place (\(refusal.rawValue)); it arrives at "
+                        + "the next seam the session makes on its own",
+                        category: .engine
+                    )
+                    return
+                }
+                do {
+                    try await self.reloadAtCurrentPosition()
+                    EngineLog.emit(
+                        "[AetherEngine] AE#464: re-cut at the playhead with audio delay "
+                        + "\(Self.ms(clamped))",
+                        category: .engine
+                    )
+                } catch {
+                    EngineLog.emit(
+                        "[AetherEngine] AE#464: the re-cut at the playhead failed (\(error)); the "
+                        + "audio delay \(Self.ms(clamped)) stands and arrives at the next seam",
+                        category: .engine
+                    )
+                }
+            }
         }
     }
 
@@ -113,7 +141,7 @@ extension AetherEngine {
     /// second seek ticket aimed at the re-cut segment's START and left it stalled for the rest of the
     /// session, with `phase` stuck at `seeking`.
     private func reanchorForAudioDelay(_ delay: Double, _ reanchor: @escaping (Double) async -> Void) {
-        guard Self.audioDelayRecutIsPossible(state: state, isLive: isLive, hasLiveWindow: liveWindow != nil) else {
+        guard Self.audioDelayRecutIsPossible(state: state, isLive: isLive, liveWindow: liveWindow) else {
             EngineLog.emit(
                 "[AetherEngine] AE#464: audio delay = \(Self.ms(delay)) stands, but this session cannot "
                 + "re-anchor at the playhead (state=\(state), live=\(isLive)); it arrives at the next seam",
@@ -130,12 +158,23 @@ extension AetherEngine {
     /// Whether the session has a playhead to come back to. Pure so the rule is testable without a
     /// session: the states that carry no position are the same ones `seek` refuses, and a live source
     /// without a DVR window has no seekable range at all.
-    static func audioDelayRecutIsPossible(state: PlaybackState, isLive: Bool, hasLiveWindow: Bool) -> Bool {
+    ///
+    /// Round 2 (cmcpherson274): this used to take the answer as a `Bool` and the call site derived it
+    /// as `liveWindow != nil`, which is true for EVERY live session (`load` builds one for each; the
+    /// engine's own field comment says so) and made the live-only branch above unreachable. The
+    /// distinction is carried by `windowSeconds`, exactly as `liveSeekRefusedWithoutDVR` reads it. It
+    /// takes the window itself now, so there is no derivation left at the call site to get wrong: a
+    /// pure gate can only be as right as its arguments, and this one was tested only through its
+    /// parameters.
+    static func audioDelayRecutIsPossible(state: PlaybackState, isLive: Bool, liveWindow: LiveWindow?) -> Bool {
         switch state {
         case .idle, .loading, .ended, .error: return false
         default: break
         }
-        return !isLive || hasLiveWindow
+        // Live-only (`windowSeconds == nil`): no rewind range, so no position to come back to. The
+        // software route's `seek(origin: .host)` would be refused as `liveWithoutDVR` and the loopback
+        // route's reload would rejoin at the edge, which throws the viewer's place away to move audio.
+        return !isLive || liveWindow?.windowSeconds != nil
     }
 
     /// Milliseconds, for log lines. The unit the correction is actually reasoned about in.

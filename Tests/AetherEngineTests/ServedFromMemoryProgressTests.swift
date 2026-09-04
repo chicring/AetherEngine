@@ -103,12 +103,20 @@ struct ServedFromMemoryProgressTests {
 
         // The parse's return to the head, repeatedly. Every one of these is a memcpy out of bytes
         // fetched during open.
+        let headSpanEnd = Int64(16 * 64 * 1024)
         let requestsBefore = server.requestLog.count
         for step in 0..<16 {
             #expect(Self.readOnce(reader, at: Int64(step) * 64 * 1024, bytes: 32 * 1024) > 0)
         }
-        #expect(server.requestLog.count == requestsBefore,
-                "the run must come out of the retained head: \(server.requestLog.suffix(4))")
+        // Only requests for the bytes the loop READ say anything here. The ladder goes on retrying
+        // the refused frontier for as long as this test wants it charged, and that retry is paced,
+        // so a raw count of the log is a race: it landed inside the loop once on CI and read as a
+        // head fetch it never was (log said 8388608..41943039, twice).
+        let fetchedTheHead = server.requestLog.dropFirst(requestsBefore).filter {
+            $0.start < headSpanEnd
+        }
+        #expect(fetchedTheHead.isEmpty,
+                "the run must come out of the retained head: \(fetchedTheHead)")
         #expect(reader.rateLimitStreakForTesting >= charged,
                 "a span serve costs no request and must not clear the ladder")
     }

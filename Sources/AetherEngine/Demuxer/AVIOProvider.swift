@@ -38,6 +38,16 @@ protocol AVIOProvider: AnyObject {
     /// seek fallback when a timestamp seek times out on an index-less container.
     var resolvedByteSize: Int64? { get }
 
+    /// AE#460 follow-up: whether the byte source behind this provider outlives the provider, so a
+    /// rebuild reopens onto a source that is already positioned. True only for the custom-reader
+    /// bridge, which does not own its reader; a provider that opens its own transport per session
+    /// starts at the beginning because there is nothing older to be at.
+    var sourceSurvivesReopen: Bool { get }
+
+    /// AE#460 follow-up: where the underlying source's cursor sits, or nil when it will not say.
+    /// Only meaningful together with `sourceSurvivesReopen`. See `openWithProvider`.
+    var currentSourceOffset: Int64? { get }
+
     /// Free the `AVIOContext` and release the underlying source. Idempotent.
     func close()
 
@@ -50,4 +60,6 @@ protocol AVIOProvider: AnyObject {
 
 extension AVIOProvider {
     func markOpenPhaseFinished() {}
+    var currentSourceOffset: Int64? { nil }
+    var sourceSurvivesReopen: Bool { false }
 }

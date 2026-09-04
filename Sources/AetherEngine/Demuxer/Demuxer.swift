@@ -427,12 +427,12 @@ public final class Demuxer: @unchecked Sendable {
         if reader.discImageProbeEnabled,
            let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
             adoptDiscInfo(discInfo)
-            let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+            let bridge = CustomIOReaderBridge(reader: discInfo.reader, preservesSourcePosition: isLive)
             let inputFormat = av_find_input_format(discInfo.formatHint)
             try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
             return
         }
-        let bridge = CustomIOReaderBridge(reader: reader)
+        let bridge = CustomIOReaderBridge(reader: reader, preservesSourcePosition: isLive)
         let inputFormat: UnsafePointer<AVInputFormat>? = formatHint.flatMap { av_find_input_format($0) }
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
     }
@@ -486,6 +486,38 @@ public final class Demuxer: @unchecked Sendable {
         try provider.open()
         avioProvider = provider
         onOpenProgress?(.sourceOpened)   // #361
+
+        // AE#460 follow-up: a live source rebuilt on a RETAINED reader resumes where that reader
+        // is, not at the host's base. A fresh AVIOContext starts its byte axis at 0 regardless, so
+        // without this the rebuild reads the spool from the beginning: the playhead jumps back to
+        // the join and the host is asked to re-deliver every byte it has already delivered
+        // (measured on `customio --live`: playhead 41.5 s -> 1.9 s, 15 MB re-read). Aligning the
+        // axis to the cursor makes the rebuild the edge rejoin the live contract already promises
+        // on the URL branch. A first open has the cursor at 0 and takes no action; a reader that
+        // will not report its position keeps the old behaviour and says so.
+        switch LiveReopenAlignment.decision(
+            isLive: isLive,
+            isSeekable: provider.isSeekable,
+            sourceSurvivesReopen: provider.sourceSurvivesReopen,
+            currentSourceOffset: provider.currentSourceOffset
+        ) {
+        case .alignTo(let offset):
+            let landed = avio_seek(provider.context, offset, SEEK_SET)
+            EngineLog.emit(
+                landed == offset
+                    ? "[Demuxer] live reopen aligned to the reader's cursor at \(offset) bytes"
+                    : "[Demuxer] live reopen could not align to \(offset) bytes (avio_seek -> \(landed))",
+                category: .demux
+            )
+        case .cannotAlignReaderSilentOnPosition:
+            EngineLog.emit(
+                "[Demuxer] live reopen: the retained reader does not report its position, "
+                + "so the source is read from its base",
+                category: .demux
+            )
+        case .readFromCurrentPosition:
+            break
+        }
 
         guard let ctx = avformat_alloc_context() else {
             avioProvider?.close()

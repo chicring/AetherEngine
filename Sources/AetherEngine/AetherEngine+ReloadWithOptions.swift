@@ -1,4 +1,5 @@
 import Foundation
+import AetherLibavcodec
 
 /// AE#460: a session-preserving reload that changes a `LoadOption`.
 ///
@@ -74,6 +75,27 @@ extension AetherEngine {
             throw AetherEngineError.sessionNotReloadable(refusal)
         }
 
+        // AE#461: the decode-path escape is the one correction that can move the session to a host
+        // that cannot serve this source. `load` catches both such sources, but only after the
+        // routing decision, which on a correction is after the teardown; decide it here instead so
+        // a refused correction still costs nothing (rule 2 above).
+        if let refusal = SessionOptionCorrection.decodePathRefusal(
+            routedSoftware: playbackBackend == .software,
+            preferred: proposed.preferredDecodePath,
+            codecID: lastDetectedVideoCodec,
+            dvProfile: sourceDVProfile,
+            dvBLCompatID: sourceDVBLCompatID,
+            isLive: loadedOptions.isLive,
+            hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] #461: decode-path correction refused, the software path cannot serve "
+                + "this session: \(refusal.rawValue)",
+                category: .engine
+            )
+            throw AetherEngineError.sessionNotReloadable(refusal)
+        }
+
         // Stating the no-op matters for the same reason #364's teletext switch states it: a host
         // that corrected an option and saw a plain reload cannot otherwise tell "the correction was
         // already in force" from "the correction did not arrive".
@@ -112,11 +134,25 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// A custom `IOReader` source that reported itself non-seekable. The rebuild reopens the
     /// retained reader at the current position, which a forward-only origin cannot serve.
     case customSourceNotSeekable
+    /// AE#461: the correction would move the session onto the software path, and this source's only
+    /// signal is IPT-PQ-c2 (HEVC Profile 5, AV1 Profile 10.0), which has no compatible base layer.
+    /// The software decoders hand that signal on as YCbCr, so the picture would render green/purple.
+    /// Reached only from `reloadAtCurrentPosition(applying:)`, and only when the proposal moves a
+    /// native session across; a session already on the software path is not moved by it.
+    case softwarePathCannotRepresentSource
+    /// AE#461: the correction would move a demuxed-audio live session onto the software path. The
+    /// side-audio merge lives in the native path's segment producer, so the session would play
+    /// silent. Same reachability as `softwarePathCannotRepresentSource`.
+    case demuxedAudioLiveIsNativeOnly
 
     public var description: String {
         switch self {
         case .noActiveSession: return "no active session"
         case .customSourceNotSeekable: return "the custom source is not seekable"
+        case .softwarePathCannotRepresentSource:
+            return "the software path cannot represent this source's Dolby Vision signal"
+        case .demuxedAudioLiveIsNativeOnly:
+            return "this live source's audio is delivered separately and merged on the native path only"
         }
     }
 }
@@ -148,6 +184,46 @@ enum SessionOptionCorrection {
         if proposed.nativeRemoteHLS != current.nativeRemoteHLS { refused.append("nativeRemoteHLS") }
         if proposed.sequentialOrigin != current.sequentialOrigin { refused.append("sequentialOrigin") }
         return refused
+    }
+
+    /// AE#461: why a decode-path correction cannot be honoured for this session, or nil when it can.
+    ///
+    /// The escape moves a session onto `SoftwarePlaybackHost`, and two sources cannot be served
+    /// there. `load` fails both of them, but it fails them AFTER the routing decision, which on a
+    /// correction means after `stopInternal` has already taken the session down. #460's second rule
+    /// is that a refusal costs nothing, so the same two facts are decided here, before any teardown,
+    /// off state the session already carries (its codec and Dolby Vision configuration from the
+    /// load-time probe, its live flag, its reader's companion audio reader).
+    ///
+    /// Only a FLIP is refusable. A session already on the software path is not moved by a software
+    /// preference, so it is not asked to represent anything new, and an `.automatic` preference
+    /// moves nothing at all: refusing on the source facts alone would start throwing on every
+    /// ordinary audio-track switch of a Dolby Vision source.
+    static func decodePathRefusal(
+        routedSoftware: Bool,
+        preferred: DecodePath,
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dvBLCompatID: Int?,
+        isLive: Bool,
+        hasCompanionAudioReader: Bool
+    ) -> SessionReloadRefusal? {
+        let flipsToSoftware = !routedSoftware
+            && VideoRoutingPolicy.usesSoftwarePath(routedSoftware: routedSoftware, preferred: preferred)
+        guard flipsToSoftware else { return nil }
+
+        if VideoRoutingPolicy.softwarePathCannotRepresent(
+            codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBLCompatID) {
+            return .softwarePathCannotRepresentSource
+        }
+        // The companion reader exists only for a video-only live variant (the resolver spins one up
+        // for exactly that shape), so this is the demuxed-audio population rather than a superset of
+        // it. `load`'s own guard re-checks that the main container carries no audio; erring towards
+        // the refusal here is the safe direction, because the session it leaves alone is playing.
+        if isLive, hasCompanionAudioReader {
+            return .demuxedAudioLiveIsNativeOnly
+        }
+        return nil
     }
 
     /// Every field the proposal changed, for the log line. Reflection is right here and wrong

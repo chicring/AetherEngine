@@ -96,6 +96,22 @@
 # measured one does not. Run the same line against `tc-bf1-cues-lie.mkv` for the other geometry: the
 # coefficient reads 0.00x and the chain must end on -23.000 / -27.000, with the picture agreeing.
 #
+# AE#418 round 9 needs a LONG chain, which is what the reporter's session had and the arms above do
+# not: three placements cannot separate a standing quantity from a one-off reading. Serve the fixture
+# over a throttled origin (Scripts/slowrange.py is that origin: a delay on every response and a
+# rate shared across them) and drive twenty-four seeks through the drought:
+#
+#   aetherctl play --seconds 62 --start-position 53 --picture-probe --seek-every 2 --seek-count 24 \
+#     --seek-pattern 65,60,70,58,75,50,85,45,90,40,95,35,100,30,105,25,110,22,64,59,69,57,74,49 \
+#     http://127.0.0.1:8871/tc-cues-lie.mkv
+#
+# Ten placements, byte-identical across three runs: seg13, seg13, seg12, seg10, seg9, seg8, seg7,
+# seg5, seg4, seg3, composing to -34.334 with the picture agreeing. Nine of them read a distance of
+# 0.000 and `seg5` reads 0.042, so the composition after it is one frame out and the reading after
+# THAT puts it back. That is the reporter's arm 1 in miniature, and it is the arm to run before
+# proposing any smoothing rule for the standing distance: the fixture wants the deviation ignored and
+# his asset wants it followed, so a rule that is right on one is wrong on the other.
+#
 # For magnitudes this fixture cannot reach, engineer the droughts: a key 3 s below a boundary gives
 # -3, 5 s gives -5, and a key under a second below one gives an axis AVPlayer THROWS AWAY at the
 # next seek (measured: -0.500 and -0.875 snap to 0, -1.000 and above survive).

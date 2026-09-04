@@ -983,6 +983,9 @@ final class SoftwarePlaybackHost {
         // background-return still clear via the default.
         renderer.flush(removingDisplayedImage: false)
         audioOutput?.flush()
+        // AE#479: the flush just emptied the queue the diag marker describes, and the pump learns of
+        // this seek only at its next iteration, which a paused landing never reaches until play().
+        demuxDiag.audioFlushed(generation: generation)
 
         // Live source is forward-only; DVR rewind reseeds decoders from the ring without touching the live demuxer's read position.
         if isLive, let ring = dvrRing {
@@ -1963,7 +1966,8 @@ final class SoftwarePlaybackHost {
                 armFromParkedVideoIfStuck()
                 drainParkedVideoNonblocking()
                 diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
-                             parked: parkedVideo.count, rebuffering: rebuffering)
+                             parked: parkedVideo.count, rebuffering: rebuffering,
+                             generation: parkedSeekGeneration)
                 if stillWaiting() { Thread.sleep(forTimeInterval: 0.005) }
             }
         }
@@ -2322,7 +2326,8 @@ final class SoftwarePlaybackHost {
             }
             diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
                          parked: parkedVideo.count,
-                         rebuffering: rebuffering)
+                         rebuffering: rebuffering,
+                         generation: parkedSeekGeneration)
             if !keepGoing { break }
         }
         freeParkedVideo()
@@ -2473,7 +2478,7 @@ final class SoftwarePlaybackHost {
                 + "dpts=\(spacing) layerDrop=\(dropped)(\(dDrop >= 0 ? "+" : "")\(dDrop)) "
                 + "delay=\(delay >= 0 ? String(format: "%.2f", delay) : "-")"
                 + "(\(dDelay >= 0 ? "+" : "")\(String(format: "%.2f", dDelay))) "
-                + "corr=\(m?.corrupted ?? -1) "
+                + "corrupt=\(m?.corrupted ?? -1) "
                 + "status=\(self.renderer.diagStatusName) surf=\(surface) "
                 + "r4d=\(r4d)",
                 category: .swPlayback
@@ -2509,15 +2514,34 @@ func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
 final class SWPlaybackDiagState: @unchecked Sendable {
     private let lock = NSLock()
     private var _lastAudioPts = Double.nan
+    private var _audioFlushGeneration: UInt64 = 0
     private var _parked = 0
     private var _rebuffering = false
     private var _sourceExhausted = false
 
-    func update(lastAudioPts: Double, parked: Int, rebuffering: Bool) {
+    /// `lastAudioPts` names the newest audio the pump has enqueued, and the pump is the only writer.
+    /// AE#479: a seek flushes that audio on the main actor while the pump is still on the pre-seek
+    /// generation, so its next write (one more after a playing seek, none at all while a paused
+    /// landing parks it until `play()`) republished a PTS the queue no longer held, and the line read
+    /// `aLead` as old PTS minus re-anchored clock (475 s in the field). The write carries the
+    /// generation the pump produced it under and is refused for the marker when the flush is newer;
+    /// `parked` and `rebuffering` are the pump's own state and stay unconditional.
+    func update(lastAudioPts: Double, parked: Int, rebuffering: Bool, generation: UInt64) {
         lock.lock()
-        _lastAudioPts = lastAudioPts
+        if generation >= _audioFlushGeneration { _lastAudioPts = lastAudioPts }
         _parked = parked
         _rebuffering = rebuffering
+        lock.unlock()
+    }
+
+    /// The seek path emptied the audio queue: nothing is enqueued, so there is no newest PTS, and
+    /// writes from before `generation` describe the queue that was flushed.
+    func audioFlushed(generation: UInt64) {
+        lock.lock()
+        if generation >= _audioFlushGeneration {
+            _audioFlushGeneration = generation
+            _lastAudioPts = .nan
+        }
         lock.unlock()
     }
 

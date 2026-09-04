@@ -478,6 +478,11 @@ final class AudioBridge: @unchecked Sendable {
         /// produced nothing.
         var framesDroppedBeforeFIFO = 0
         var samplesEnqueued: Int64 = 0
+        /// Source packets fed since the FIFO last accepted a sample, reset by every accepted write.
+        /// The decoder arm of `silenceIsStructural` is counted on this rather than on `packetsFed`,
+        /// so a decoder that answers for a while and then stops is the same shape as one that never
+        /// answered at all, and neither has to be told apart from a bridge that is merely young.
+        var packetsFedSinceLastEnqueue = 0
         var packetsEmitted = 0
         /// `avcodec_receive_packet` answers that were neither a packet nor EAGAIN/EOF.
         var encodeErrors = 0
@@ -519,12 +524,29 @@ final class AudioBridge: @unchecked Sendable {
     var feedStats: FeedStats { stats }
 
     /// One-shot: a bridge that stays silent for an hour costs one line, not one per packet.
-    private var silentFeedReported = false
+    private(set) var silentFeedReported = false
 
-    /// Enough source that no start-up latency explains the silence. The largest encoder frame the
-    /// bridge builds is 1536 samples (E-AC-3) and the smallest source packet it is fed is 512 (DTS),
-    /// so three packets is the honest worst case before the first output and 64 is two orders past it.
+    /// AE#474: the DECODER arm's unit, and only its unit. Source went in and the FIFO got nothing
+    /// back, so there is no sample count to bound anything with and packets are all there is.
     private static let silentFeedPacketThreshold = 64
+
+    /// AE#474: the ENCODER arm's unit. `drainFIFOIntoEncoder(requireFull: true)` cannot encode below
+    /// `frame_size`, so nothing can be emitted until that many samples have been enqueued, and the
+    /// figure is not a constant of the bridge: 1536 on E-AC-3, 4608 on FLAC. A source packet is not
+    /// a constant either, 1536 samples on E-AC-3 down to 40 on a TrueHD access unit, so the ratio
+    /// between the two spans a factor of 100 across arms this bridge already builds and no packet
+    /// count can express one encoder frame. The old 64-packet threshold was derived from the lossy
+    /// pair alone (1536 against 512) and fired at 2560 of FLAC's 4608 samples on TrueHD, announcing
+    /// a failure on sessions that then played to the end. Four frames rather than one: the first is
+    /// when output becomes POSSIBLE, the second covers an encoder that holds it, and four is still
+    /// inside the first half second of source audio on every arm (128 ms on E-AC-3, 384 ms on FLAC
+    /// at 48 kHz), which is sooner in wall-clock than the packet threshold it replaces.
+    private static let silentFeedEncoderFrameMultiple: Int64 = 4
+
+    /// What to assume for `frame_size` before the encoder has resolved one. Shared with
+    /// `drainFIFOIntoEncoder`, which chunks the FIFO by the same figure: a gate that used a
+    /// different fallback than the drain it is judging would be judging a boundary nobody uses.
+    private static let assumedEncoderFrameSize: Int32 = 4096
 
     /// Snapshot of bytes live in the bridge's growable buffers, for the engine memory probe. Both fields grow on
     /// the FFmpeg side (FIFO reallocs upward, swr delay buffer reallocates on rate/layout shift), so a
@@ -755,6 +777,7 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         stats.packetsFed += 1
+        stats.packetsFedSinceLastEnqueue += 1
 
         var results: [UnsafeMutablePointer<AVPacket>] = []
 
@@ -839,24 +862,42 @@ final class AudioBridge: @unchecked Sendable {
             throw error
         }
 
-        noteSilentFeedIfNeeded()
+        noteSilentFeedIfNeeded(encoderFrameSize: enc.pointee.frame_size)
         return results
     }
 
-    /// AE#396: say it once, the moment enough source has gone in for the silence to be structural
-    /// rather than start-up latency. Without this the only downstream evidence is movenc's -22 on a
-    /// moov it cannot build, which names the muxer and the source and never the bridge. `EngineLog`
-    /// has no error level, so the `ERROR:` prefix carries it, as in the #165 cascade line.
-    private func noteSilentFeedIfNeeded() {
+    /// AE#396 / AE#474: is this silence structural, or has the bridge simply not been asked yet?
+    /// The two ways a bridge stays quiet end at different subsystems and are bounded by different
+    /// quantities, so each arm is counted in the unit that actually bounds it and neither is
+    /// expressed in the other's (see `silentFeedPacketThreshold` and the frame multiple above).
+    ///
+    /// Pure and static so the boundary can be pinned against the frame sizes this bridge really
+    /// opens instead of against whichever one the fixtures happen to reach.
+    static func silenceIsStructural(stats: FeedStats, encoderFrameSize: Int32) -> Bool {
+        guard stats.isSilent else { return false }
+        let frame = Int64(encoderFrameSize > 0 ? encoderFrameSize : assumedEncoderFrameSize)
+        // The encoder arm: enough PCM to build several frames went in and none came back.
+        if stats.samplesEnqueued >= frame * silentFeedEncoderFrameMultiple { return true }
+        // The decoder arm: the FIFO has stood still for longer than any source explains.
+        return stats.packetsFedSinceLastEnqueue >= silentFeedPacketThreshold
+    }
+
+    /// AE#396: say it once, the moment the silence is structural. Without this the only downstream
+    /// evidence is movenc's -22 on a moov it cannot build, which names the muxer and the source and
+    /// never the bridge. `EngineLog` has no error level, so the `ERROR:` prefix carries it, as in
+    /// the #165 cascade line.
+    private func noteSilentFeedIfNeeded(encoderFrameSize: Int32) {
         guard !silentFeedReported,
-              stats.isSilent,
-              stats.packetsFed >= Self.silentFeedPacketThreshold else { return }
+              Self.silenceIsStructural(stats: stats, encoderFrameSize: encoderFrameSize)
+        else { return }
         silentFeedReported = true
+        let encoder = avcodec_get_name(outputCodecID).map { String(cString: $0) } ?? "the encoder"
+        let frame = encoderFrameSize > 0 ? encoderFrameSize : Self.assumedEncoderFrameSize
         EngineLog.emit(
             "[AudioBridge] ERROR: AE#396 the bridge has produced no encoded audio at all "
-            + "(mode=\(mode.rawValue)): \(stats.summary). The mp4 muxer can only build an "
-            + "AC-3/E-AC-3 sample entry from a packet that was written, so this session will fail "
-            + "its first segment cut unless output starts.",
+            + "(mode=\(mode.rawValue), encoder=\(encoder), frame=\(frame)): \(stats.summary). "
+            + "The mp4 muxer can only build a \(encoder) sample entry from a packet that was "
+            + "written, so this session will fail its first segment cut unless output starts.",
             category: .session
         )
     }
@@ -998,7 +1039,10 @@ final class AudioBridge: @unchecked Sendable {
                 av_audio_fifo_write(fifo, rebound, producedSamples)
             }
         }
-        if written > 0 { stats.samplesEnqueued += Int64(written) }
+        if written > 0 {
+            stats.samplesEnqueued += Int64(written)
+            stats.packetsFedSinceLastEnqueue = 0
+        }
     }
 
     /// Pull frame_size chunks from the FIFO and encode each. requireFull true stops below frame_size (streaming);
@@ -1009,7 +1053,7 @@ final class AudioBridge: @unchecked Sendable {
         requireFull: Bool,
         results: inout [UnsafeMutablePointer<AVPacket>]
     ) throws {
-        let frameSize = enc.pointee.frame_size > 0 ? enc.pointee.frame_size : 4096
+        let frameSize = enc.pointee.frame_size > 0 ? enc.pointee.frame_size : Self.assumedEncoderFrameSize
         let nChannels = enc.pointee.ch_layout.nb_channels
 
         while true {

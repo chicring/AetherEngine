@@ -986,15 +986,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return actualFirstPts &- desiredTfdtPts
     }
 
-    /// AE#418 round 5: how far after its own decode time the gating sample is PRESENTED.
+    /// AE#418 round 5: how far after its own decode time the gating sample is PRESENTED, named on the
+    /// gate-open line so a log says what reorder depth the gate opened at.
     ///
-    /// Measured with `play --picture-probe` on the fixture pair (`tc-bframes.mkv` against
-    /// `tc-drought.mkv`, identical but for `-bf 3`): the FIRST placement into an item's timeline puts
-    /// the segment's first presented sample at its advertised start, and every later placement puts
-    /// its first DECODED sample there instead, so the picture arrives this much later than the
-    /// advertised start read through the axis. Without B-frames the two are one number and no
-    /// composition moves; with them, a second placement of a segment worth -9.000 s read -18.083 s
-    /// off the picture where the composition predicted -18.000 s, on every run.
+    /// Rounds 5 to 7 also composed with it, on the premise that a placement sits below its axis by
+    /// some multiple of this. Round 8 measured a clip with no frame reordering at all, whose every
+    /// gate opens with a lead of zero, sitting a frame below its axis on its third placement, which
+    /// no multiple of zero describes. The composition measures that distance directly now; this stays
+    /// a source fact worth printing.
     static func presentationLeadPts(actualFirstPts: Int64, actualFirstDts: Int64) -> Int64 {
         guard actualFirstPts != Int64.min, actualFirstDts != Int64.min else { return 0 }
         return Swift.max(0, actualFirstPts &- actualFirstDts)
@@ -1120,12 +1119,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `firstItemTfdtPts` is this producer's planned first tfdt, i.e. the item-axis position (same TB) from which
     /// its shift applies. Everything below it on the item axis was muxed by an earlier producer under an earlier
     /// shift and may still be in AVPlayer's buffer, so a consumer needs the pair, not the shift alone (#260).
-    /// AE#418 round 5: `presentationLeadPts` is what the gating sample is presented AFTER it is
-    /// decoded (its composition offset). A placement composed onto a run that is already in the
-    /// timeline lands exactly that much later than the advertised start read through the axis, so the
-    /// consumer needs it alongside the shift; on a source without reordering it is zero and nothing
-    /// about the composition changes.
-    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64, _ presentationLeadPts: Int64) -> Void)?
+    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64) -> Void)?
 
     /// Fires at live program boundary with updated videoShiftPts and seamOutputSeconds (AVPlayer clock position of the seam).
     /// Distinct from onVideoShiftKnown: the new shift is at the producer edge, AVPlayer renders it buffer+holdback later.
@@ -1492,6 +1486,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Returns absolute segment index for a live video packet; cuts on keyframes past targetSegmentDurationSeconds.
+    ///
+    /// AE#446 round 6: seg-0's recorded start is a PRESENTATION time, and the shift anchors the first
+    /// DECODE time at 0, so on a source with frame reordering the first segment of a live session
+    /// begins one presentation lead above zero rather than at 0.000 (`lead=` on the gate-open line).
+    /// That is the number the item's stated axis carries, and it is a property of the source: 0.033s
+    /// on a 60 fps `-bf 3` seed here, 0.050s on the reporter's broadcast TS, 0.000s on the bundled
+    /// seed, which is why a harness that only ran the bundled seed made zero look like a rule.
     private func liveVideoSegmentIndex(pts: Int64, isKeyframe: Bool) -> Int {
         let ptsSeconds = Double(pts) * sourceVideoTbSeconds
         if !liveFirstSegmentOpened {
@@ -3499,10 +3500,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             Self.presentedShiftPts(
                                 actualFirstPts: firstActualVideoPts,
                                 desiredTfdtPts: desiredFirstVideoTfdtPts),
-                            desiredFirstVideoTfdtPts,
-                            Self.presentationLeadPts(
-                                actualFirstPts: firstActualVideoPts,
-                                actualFirstDts: firstActualVideoDts))
+                            desiredFirstVideoTfdtPts)
                         // #133 follow-up: the gating IDR's in-band SPS/PPS back this epoch's muxer avcC. Establish
                         // the baseline so a later same-PID parameter-set change (encoder restart / regional splice)
                         // is detected against it. joinConfig is non-nil only in the liveH264AnnexBJoin scope.

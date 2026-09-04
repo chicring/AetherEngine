@@ -1737,9 +1737,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// one party that knows the number exactly. The alternative is a difference between two
     /// independently sampled quantities (the cache's resident floor and the item's own reported
     /// seekable start), which is only as good as the older sample and is latched for the item's whole
-    /// life: measured against a device on 6.60.0 it read 0.05s for an item whose playlist began at
-    /// exactly 0.00s (AE#446, cmcpherson274), and on 6.57.0 the same construction read 0 for an item
-    /// whose playlist began 6.76s in (AE#454 round 2).
+    /// life: on 6.57.0 it read 0 for an item whose playlist began 6.76s in (AE#454 round 2), and it
+    /// cannot tell "no offset" from "the sample did not belong to this item".
     ///
     /// First build wins, because an item's zero is the FIRST playlist it loaded and later builds of a
     /// sliding window state a smaller offset against the very same content.

@@ -152,8 +152,18 @@ group its segments do not carry (AE#458).
 Source labels are resolved to ISO 639-2/T through ICU, which covers every language it knows plus
 BCP-47 subtags (`pt-BR` becomes `por`) and rejects free text such as `English` or a track title, in
 front of a twenty-row table for the ISO 639-2/B bibliographic codes ICU does not resolve and
-Matroska routinely writes (`ger`, `fre`, `cze`). A label that resolves to nothing writes nothing, so
-an untagged source keeps the master it had before.
+Matroska routinely writes (`ger`, `fre`, `cze`). Two ISO 639-3 classes need more than that lookup.
+The members CLDR aliases to a macrolanguage (`cmn`, `arb`, `pes`, `swh`, `uzn`, `kmr`) have no alpha3
+entry at all, so the tag is canonicalized where the direct route came back empty, which resolves the
+alias without moving any tag that already resolved (`no` stays `nor`, not `nob`). The members CLDR
+does NOT alias (`cnr`, `prs`, `npi`, `ory`, `quz`, `crs` and 50 more, 56 measured on macOS 26) have neither
+an alpha3 entry nor a canonical form, and there is nothing to convert: the tag already IS the ISO 639
+code, so it passes through as itself. That last step is gated on ICU having a display NAME for the
+tag in a fixed reference locale, which is the validity signal canonicalization cannot give
+(`canonicalLanguageIdentifier` echoes `dub` and `xyz` back unchanged exactly as it echoes `cnr`).
+The locale is fixed rather than the device's, or a file would resolve on an English Apple TV and not
+on a German one. A label that resolves to nothing writes nothing, so an untagged source keeps the
+master it had before.
 
 ### Dolby Atmos
 
@@ -334,6 +344,21 @@ Both: no decryption (CSS / AACS retail discs must be ripped decrypted first), no
 **Chapters.** `engine.discChapters` (`@Published [ChapterInfo]`) carries the selected title's chapters; `engine.selectChapter(id:)` seeks to one (a thin `seek` wrapper, no pipeline rebuild). For Blu-ray they come from the playlist's PlayListMark entries (entry marks only; link points dropped), each mark's timestamp on its clip's STC offset by the clip's in_time and the cumulative duration of preceding play items. For DVD they come from the main program chain's program map plus the cumulative cell playback times. Chapter starts are title-relative (0-based); `selectChapter` adds the title's content-start base (the native playlist shift, or the software path's container start PTS) so the seek lands on the source-PTS playback axis.
 
 **Container chapters.** `engine.mediaChapters` (`@Published [ChapterInfo]`) carries the chapters a Matroska or MP4 container declares, read off the probe demuxer at load. It is empty for disc sources, which publish `discChapters` instead, so exactly one of the two is populated. Unlike disc chapters these need no base: a non-disc source plays on the container's own PTS axis on both backends, so `startSeconds` is a timestamp a host hands straight to `seek(to:)`. `selectChapter(id:)` resolves against `discChapters` only and no-ops for a container chapter id. Ids are assigned sequentially in start order, so they stay usable as list indices, and untitled entries are numbered "Chapter N". A chapter's duration runs to the next chapter's start rather than to its declared end, because muxers routinely write `end == start`; the last entry falls back to its declared end, then to the container duration.
+
+## Custom byte sources (`IOReader`)
+
+`MediaSource.custom(reader, formatHint:)` hands the engine a host-owned byte source: a memory buffer, an encrypted container, a tuner spool, anything that is not a plain URL. `read`, `seek` and `close` are required; `cancel()`, `makeIndependentReader()` and `discImageProbeEnabled` have defaults. Every call arrives on the engine's demux thread, never main, and inside an autorelease pool the engine opens, so a reader built on `FileHandle` or `NSData` does not strand one autoreleased object per read on a pump thread that runs for the length of a session (#445).
+
+**`cancel()` unblocks, it does not invalidate.** Its whole job is to wake a `read` that is parked so teardown does not hang; a memory or file reader leaves it at the default no-op. A reader the engine may rebuild in place must be able to serve again immediately afterwards, because the rebuild reuses it. Reading `cancel()` as terminal (the way a socket's in-flight-request cancel is terminal) is the difference between a rebuilt session and a dead one: the reopen fails on its first read and the session lands in `.error` carrying libavformat's `Operation not permitted`. The engine cancels a reader it intends to reuse exactly once, before the successor opens.
+
+**In-place rebuilds reuse the reader.** `reloadAtCurrentPosition()` and `reloadAtCurrentPosition(applying:)`, an audio-track switch, a disc-title switch and a background return all tear the pipeline down and reopen on the retained reader instead of reopening a URL, so a custom source gets the same session-preserving rebuild a URL source does. A reader that reports itself non-seekable is refused instead (`SessionReloadRefusal.customSourceNotSeekable`), since the rebuild cannot reposition it.
+
+**Where the reopen starts depends on whether the source is live.** A fresh `AVIOContext` always starts its byte axis at 0, so the reader's cursor and that axis have to agree, and there are two ways to make them:
+
+- **VOD.** The reader is rewound to 0 and the axis starts there. The reopen has to re-read the container header, and the backend seeks to the resume position afterwards.
+- **Live.** The reader is left exactly where the session left it and the axis is moved to the cursor instead (`[Demuxer] live reopen aligned to the reader's cursor at N bytes`). A live source has kept receiving during the rebuild, so rewinding it would replay the host's whole delivered window: measured on `aetherctl customio --live`, the rewind dropped the playhead from 41.5 s to 1.9 s and asked the host to re-deliver 15 MB, a 61 s window, at I/O speed. Aligning instead makes the rebuild the edge rejoin `LiveReloadPolicy` already performs on the URL branch.
+
+  This costs one thing worth knowing: the reopen re-probes the container from a mid-stream byte offset, so it needs a source that can be joined there. MPEG-TS resyncs on its own sync bytes and recovers within a GOP. A live reader that will not answer `seek(0, SEEK_CUR)` cannot be aligned to, so it is rewound as a VOD source would be, and the engine says so rather than doing it silently.
 
 ## Network sources (SMB)
 

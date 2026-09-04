@@ -159,19 +159,29 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
     func stop() {
         lock.lock()
-        let fds = _connFDs
-        _connFDs = []
         let alreadyStopped = _stopped
         _stopped = true
+        // shutdown unblocks a recv or a write parked on this fd and fails every later one; it
+        // does not free the descriptor number. The serving thread owns that number until it
+        // exits and closes it under this lock (`closeConnection`), so no write of its own can
+        // land on a number the kernel has handed to someone else in between. Closing here did
+        // exactly that on 2026-09-03: a write in `writeFully` hit a recycled guarded fd and
+        // EXC_GUARD took the whole test process with it, 20 tests into 2475.
+        let fds = alreadyStopped ? [] : _connFDs
+        for fd in fds { shutdown(fd, SHUT_RDWR) }
         lock.unlock()
         guard !alreadyStopped else { return }
-        // shutdown unblocks a write parked on a full socket buffer; close alone may not.
-        for fd in fds {
-            shutdown(fd, SHUT_RDWR)
-            close(fd)
-        }
         shutdown(listenFD, SHUT_RDWR)
         close(listenFD)
+    }
+
+    /// The one place a connection fd is closed. Deregistering and closing under the lock is
+    /// what keeps `stop()` from shutting down a number this thread has already given back.
+    private func closeConnection(_ fd: Int32) {
+        lock.lock()
+        _connFDs.removeAll { $0 == fd }
+        close(fd)
+        lock.unlock()
     }
 
     private func acceptLoop() {
@@ -197,6 +207,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// same socket, so serving exactly one and hanging up would force a new connection per
     /// range and make the pooling measurement meaningless.
     private func serve(_ fd: Int32) {
+        defer { closeConnection(fd) }
         while !stopped {
             if !serveOneRequest(fd) { return }
         }
@@ -283,15 +294,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 + "Connection: keep-alive\r\n\r\n"
             return writeFully(fd, Array(header.utf8))
         case .dropConnection:
-            // `serve` leaves closing to `stop()`, which closes every fd still in `_connFDs`.
-            // Closing here without deregistering first frees a descriptor number the process
-            // can hand straight to the next socket, and `stop()` would then shut down whatever
-            // took it over. Deregister under the lock, then close exactly once.
-            lock.lock()
-            _connFDs.removeAll { $0 == fd }
-            lock.unlock()
+            // Returning false ends `serve`, which closes the fd exactly once.
             shutdown(fd, SHUT_RDWR)
-            close(fd)
             return false
         }
 
@@ -331,10 +335,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
             // the peer has not handed to its application yet. The bytes this origin says it served
             // would silently stop being the bytes the reader can see, and a test asserting on the
             // amount delivered would be measuring the machine's scheduling (the 2026-08-11 CI
-            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable; `stop()`
-            // closes the descriptor, which is why it stays registered in `_connFDs`.
+            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable, so this
+            // thread parks on the half-closed socket until `stop()` and closes it only then.
             if let dropAfter, served >= dropAfter {
                 shutdown(fd, SHUT_WR)
+                while !stopped { usleep(200_000) }
                 return false
             }
             var n = Int(min(Int64(chunkBytes), remaining - served))

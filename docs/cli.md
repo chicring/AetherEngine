@@ -101,7 +101,7 @@ the same clock as `FIRSTFRAME`. The 1 Hz tick samples the phase, which is far to
 signal apart from the moment the rate rolls; a healthy native join is exactly two edges, `loading` at the
 load and `playing` at the roll (AE#440).
 
-`--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `ratehold` (set 1.5, pause at tick 3, resume at tick 5, then read the rate back off the transport itself: the #436 drill, and it fails the run if the resume came back at 1.0), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), and `overlapseek` (the #292 seek-window drills below); this is how the pre-arming `setRate` wedge was isolated.
+`--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `ratehold` (set 1.5, pause at tick 3, resume at tick 5, then read the rate back off the transport itself: the #436 drill, and it fails the run if the resume came back at 1.0), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), `overlapseek` (the #292 seek-window drills below), and `pauseseek` (pause at t=12, seek at t=15 while paused, resume at t=20; with `--sw` the five paused ticks between landing and resume show what the `[SWDiag]` line reports while the pump is parked and has not heard of the seek, the AE#479 shape); this is how the pre-arming `setRate` wedge was isolated.
 
 `--seek-every N` seeks once every N ticks past tick 10, walking `--seek-pattern <abs,abs,...>` if one is given (a short backward hop otherwise), and `--seek-count K` stops after K seeks so a run can be a BURST and then play. Both halves are needed for anything about what a seek sequence leaves behind: the burst puts the store in the state under test, and only the playing half shows what the overlay carries through it. That pairing is what made AE#362's second mechanism reproducible (a hole between a restarted pump and the island the previous run left ahead of it, decoded across and then never re-read).
 
@@ -134,6 +134,23 @@ numbers.
 
 `--audio-delay <ms>` sets `LoadOptions.audioDelaySeconds` for the load, and `--switch-audio-delay <ms>[@ms]` calls `setAudioDelay(_:)` on a session that is already playing (default +20 s, same reason as the teletext switch). The runtime half is the interesting one: at load the offset is just a number handed to a muxer or a renderer, while mid-session it has to reach media the session has already committed to the previous value, and the two routes pay differently for that (a seek on `.software`, the session-preserving reload on `.loopback`). The engine states the delivered offset rather than the requested one: `[AudioOutput] AE#464 audio delay in effect: +200 ms (sample at 3.994s delivered at 4.194s)` on the software path, `[MP4SegmentMuxer] AE#464 cutting seg1+ with audio delay -150 ms` on the loopback one (AE#464).
 
+`--switch-audio-delay` is repeatable and `--paused` mounts with `autoplay = false`, which is what makes
+the round-2 pair of AE#464 reproducible without hardware. `--paused --host-calls play` is a host that
+owns transport (mount paused, play next to its own load), and the rebuild the engine raises for a nudge
+has no such caller: before the fix item #2 settled `timeControlStatus=paused reason=- t+0.00s`, never
+reached `playing`, and the producer parked on `#65 backpressure PARK (advance) ... (consumer paused)`
+while the run still ended `VERDICT: OK`. After it, `#2 timeControlStatus=playing t+0.06s`. Three presses
+inside one runloop turn (`--switch-audio-delay 50@15000 --switch-audio-delay 100@15003
+--switch-audio-delay 150@15006`) stack three reloads, two superseded by generation, and before the fix
+the survivor loaded `startPos=nil` and cut `seg0+` on a session 14.90 s in; after it,
+`startPos=14.90s`, `initial producer anchored at idx=3` and `seg3+`.
+
+`play --live` without `--dvr-window` is the live-only shape, and it is the one that shows the re-anchor
+gate: `AE#464: audio delay = +150 ms stands, but this session cannot re-anchor at the playhead
+(state=playing, live=true); it arrives at the next seam`. With `--dvr-window 1800` the same run takes the
+re-anchor and re-cuts. Before round 2 the gate read `liveWindow != nil`, which is true for both, so the
+live-only session took a rebuild that rejoins at the edge.
+
 `--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, and `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
 
 `play --sw` sets `LoadOptions.preferredDecodePath = .software` (#461), the shipping per-session lever, rather than the process-global `setForceSoftwarePathForTesting` it drove before; that hook is still what `live --sw` and `dvr` use, since those harnesses run several sessions and want every one of them on the software host. `--reload-applying decode-path=software` is the same lever applied to a session that is already playing: on the 300 s H.264 fixture the run dispatches `codec=27 → native`, takes the correction at t=9.90 s and comes back `codec=27 → software` at 10.81 s, playing. On a live load the override reaches the same routing decision, which is the case with no alternative, since the #2 capability gate is VOD-only and a live session is never classified at all.
@@ -149,7 +166,15 @@ time out of the picture itself, which is the one axis question nothing else here
 other observable (`#260` frame times, `prodShift` / `hostShift`) describes what the engine WROTE, not
 where AVPlayer then PUT it. Per tick it appends `pic` (source seconds decoded from the frame),
 `picItem` (AVPlayer's own `itemTimeForDisplay` for that frame), `axisErr` (their difference, 0 on an
-honest axis) and `capErr` (the same error as a host placing a cue at `sourceTime` would make it).
+honest axis), `capErr` (the same error as a host placing a cue at `sourceTime` would make it) and
+`capFr`, that same error in frames.
+
+The two errors do NOT have the same resolution, which is why `capFr` is printed. `axisErr`
+differences two frame-grid values read out of one `copyPixelBuffer` call, so it is a whole number of
+frames and every digit of it is a reading. `capErr` differences that same grid value against the
+engine's continuous clock, so below one frame it carries the sub-frame phase of the sampling instant:
+`capFr=+0.40` is the same frame, `capFr=+1.80` is not. Two runs whose `capErr` differs by less than a
+frame have not been shown to differ.
 Needs a fixture whose picture states its own frame number, which `Scripts/timecode-fixture.sh`
 writes; against anything else it prints `pic=none` or nonsense. `pic=none` is also the normal read
 before the first frame and during a stall, so it is not reported as a zero. This is what settled
@@ -182,28 +207,72 @@ Round 4 also needs a fixture with B-FRAMES, and `Scripts/timecode-fixture.sh` no
 (`tc-bframes.mkv`). `-preset ultrafast` disables them, so on `tc-drought.mkv` a segment's dts and pts
 are one number and the gate's offset is the same either way. On real content they are not: the gate
 opens on a random-access point in DECODE order, and taking the offset there put the axis
-`video_delay` frames under the truth on every epoch. The pair isolates exactly that. Read the verdict
-as the MEAN of `capErr` per axis over the run, since a single tick carries up to two frames of the
-probe's own quantisation.
+`video_delay` frames under the truth on every epoch. The pair isolates exactly that. Read the verdict per axis in
+`capFr`, whole frames: a single tick carries up to two frames of the probe's own quantisation. A mean
+of `|capErr|` over ticks does NOT buy resolution below that quantum, it averages the sampling phase
+(AE#418 round 11).
 
-**Round 6: how much a lead counts is a property of the SOURCE, so the session measures it.** Round 5
-found that a composition lands on a BASE one presentation lead under the axis, measured it on
-`tc-bframes.mkv` and shipped it as arithmetic. It is not arithmetic. The script now writes a third
-clip, `tc-bf1.mkv`, identical but for `-bf 1`, and on the same burst arm the three reorder depths
-place three different ways, the reading and the picture agreeing in all nine runs:
+**Round 8: how far a placement sits below its axis is MEASURED, in seconds.** Rounds 5, 6 and 7 read
+that distance as a multiple of the epoch's presentation lead: round 5 shipped the multiple as
+arithmetic, round 6 measured it per source, round 7 held the median of its readings. The premise was
+that the distance is a geometry of the source. It is not. `Scripts/timecode-fixture.sh` writes three
+clips identical but for their reorder depth, and on the same burst arm over a throttled origin
+(`Scripts/slowrange.py`, 3200 kbps + 100 ms), `--picture-probe` reading the axis off AVPlayer's own video
+output, 2 runs each and every run identical:
 
-| clip | gate lead | base a composition lands on | burst arm |
+| clip | gate lead | placement 2 sits | placement 3 sits |
 |---|---|---|---|
-| `tc-drought.mkv` | 0.000 | the axis | -9.000 -> -18.000 -> -23.000 |
-| `tc-bf1.mkv` | 0.042 (one frame) | the axis | -9.000 -> -18.000 -> -23.000 |
-| `tc-bframes.mkv` | 0.083 (two frames) | one lead below the axis | -9.000 -> -18.083 -> -23.166 |
+| `tc-cues-lie.mkv` | 0.000 (no reordering) | 0.000 below its axis | **0.042 below its axis** |
+| `tc-bf1-cues-lie.mkv` | 0.042 (one frame) | 0.000 | 0.083 |
+| `tc-bf-cues-lie.mkv` | 0.083 (two frames) | 0.083 | 0.125 |
 
-So a session now starts with no coefficient and composes without one, and the first placement it can
-read back states what a lead is worth here: `#418 segN says a lead counts 1.00x on this source (axis
-Xs, base measured Ys, lead Zs)`. Every `placed` line prints the coefficient it used (`lead 0.083s
-x1.00`, or `x0.00 unmeasured` before the first reading). Under round 5 the middle row was composed
-0.042 s low and corrected back on every measurable placement, and the placements that cannot be
-measured at all kept that error for the rest of the session.
+The bold cell is what retires the model: that clip has `has_b_frames=0`, every gate opens with
+`lead=0`, and its third placement still sits a frame below its axis. A quantity that is nonzero where
+the lead is exactly zero is not a multiple of the lead, and no coefficient can express it. The middle
+row retires the source-law premise separately: one source, two placements, 0.000 then 0.083.
+
+So the session carries the distance in the units it corrects, reads it off the same placement reading
+that already measures the base, and every reading teaches it, a confirmation included. That is also
+what fixes the starvation round 7 shipped: only a placement carrying a lead could teach, and on a
+source without reordering, or on any session whose placements are AE#412 re-cuts (worth 0 and lead 0
+by construction), there is never one. Measured on `tc-wide-cues-lie.mkv`, 13 of 13 placements across
+two runs carried `lead 0.000s`, so the parameter could not move at all.
+
+Each `placed` line names what it composed with (`sitting 0.083s below its axis`), and a reading that
+moves it says so: `#418 segN sat Xs below the axis it composed on, not Ys; the next composition
+starts there`. An item's FIRST placement is no longer a case of its own: with nothing measured yet
+the distance is zero, which is what AVPlayer does there (measured base 0.000 on every arm of every
+fixture). The gate-open line still prints `lead=`, now purely as a source fact.
+
+Round 9 puts the lesson on the reading's own line, because round 8 printed only the MOVES and two
+different things were silent under that. Every verdict line now ends in one of three clauses: `taught
+the distance Xs` (an own-run reading that moved it, with the `sat` line under it), `taught the
+standing distance Xs again` (an own-run reading that agreed with it), or `taught nothing, read off a
+rebuilt timeline; the distance stays Xs`. The third is the one worth having: a rebuilt-timeline
+reading corrects the axis like any other, by 28.000 s on `tc-wide-cues-lie.mkv`, and round 7 refuses
+it the parameter on purpose, so its correction line was otherwise indistinguishable from one that had
+just taught a 28 s lesson.
+
+AE#481 is the case those ten rounds could not see, because a seek burst heals it inside a second. The
+axis belongs to the RUN a re-aimed segment opened, not to the timeline from its advertised start on:
+run the same chain with the re-anchoring seek LAST (`--seek-count 5 --seek-pattern 65,60,70,58,75`,
+served through `Scripts/slowrange.py` at 600 kbps / 300 ms) and the picture reads `pic - picItem` of
+-9.000 at item 53.000 and 0.000 everywhere the landing goes, while the session keeps mapping with
+-9.000 and `capErr` sits at +9.017 to the end of the run. A seek landing now reads what its run
+carries, and says so: `#481 the run holding the landing at item Xs opens at Ys, which is segN's own
+playlist position, so it carries Zs and not the Ws this session was mapping with`. The discriminator
+is that opening, asked of ONE segment: the first the local server answered after the seek, which is the
+one whose content opens that run. It goes into a timeline carrying an axis at the seam that axis
+predicts and into a timeline carrying nothing at its own position, which is round 7's pair of
+admissible answers. Asked of the whole plan the same rule publishes on a coincidence (31 boundaries
+over 120 s against a half-second tolerance: measured, a 0.000 axis written into a timeline carrying
+-27.875 s). Measured on the arm above, `capErr` goes from +9.037 to +0.037, which is 216 frames and the
+only unambiguous number in the set, while the 24-seek arms it must not touch are unchanged (10
+placements, axis -34.376, no reading fired in 2 of 2 runs). On the two slow arms the `capErr` tail
+moves onto the same one-frame lattice pair the fast arm sits on (`+0.009` / `-0.033`). That is a
+sub-frame move and carries no accuracy claim in either direction: an earlier revision of this
+paragraph read it as an improvement from 0.0230 and 0.0411 to 0.0162, which is the mistake AE#418
+round 11 documents on both sides of that thread.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 
@@ -300,6 +369,57 @@ reproduced the harness's own retention with his signature. A harness that brings
 matches the shape and answers a different question, and only a second arm that allocates nothing can
 tell those two apart. Run both: the Foundation arm is now the control that proves the pool drains,
 and the POSIX arm is the one that measures the engine.
+
+**`--reload-at S` rebuilds the live session in place S seconds in, and `--cancel-latches` is the
+reader that reads `cancel()` as terminal.** The correction it applies (`httpHeaders`) is inert on a
+custom source on purpose: what the arm measures is the REBUILD, not the field. It reports the
+playhead and the reader's cursor on both sides of it, and the closing `LOOKBACK` line states how far
+back the rebuild reached:
+
+```
+  RELOAD at t=60s: playhead=41.52s cursor=15.0MB edge=15.0MB
+  RELOAD done: playhead 41.52s -> 0.00s, reader cursor 15.0 -> 15.8 MB, edge 15.0 -> 15.8 MB
+LOOKBACK: 7 seeks, deepest reach-back 0.0 MB behind the live edge (0 s of source at this rate)
+```
+
+A reach-back of 0 MB is the rebuild rejoining at the edge. Before the AE#460 follow-up the same run
+reported 15.0 MB (61 s of source) and a playhead of 1.90 s: the reopen rewound the host's spool to
+its base and re-read the whole delivered window. `--cancel-latches` is the other arm, and it is a
+control rather than a defect: a reader that treats `cancel()` as terminal cannot serve the rebuild
+that reuses it, so the reopen dies on stream info and the correction throws.
+
+**`--reload-decode-path automatic|software` makes the correction the decode path itself** (AE#461
+follow-up), on `customio` with `--reload` and on `customio --live` with `--reload-at`. The header
+probe those arms apply by default is inert on a custom source on purpose, so it measures the rebuild
+and can never measure this field; the field is what a host actually corrects. Both arms print the
+backend on each side of the rebuild, which is the whole observable:
+
+```
+  RELOAD applying preferredDecodePath=software: playhead=0.00s backend=native
+[AetherEngine] #461: reload re-routing this session native -> software on the host's preference (custom source: true)
+  RELOAD done: playhead 0.00s -> 0.33s, backend native -> software, decoder=libavcodec H264 (SW)
+```
+
+Before the follow-up the same run logged `#460: reload applying preferredDecodePath` and then
+`backend native -> native, decoder=VideoToolbox H264 (HW)`: accepted, named in the log, ignored.
+
+On a source the software path cannot represent the arm measures the OTHER half, that a refusal costs
+nothing, by reporting the state the refusal left behind rather than exiting on the throw. The Dolby
+browser test kit is the fixture, because it carries its own control:
+
+```
+# Profile 5 (IPT-only): refused, and the session is untouched
+  REFUSED state=playing backend=native playhead=0.00s (was 0.00s) decoder=VideoToolbox HEVC (HW)
+VERDICT: correction refused, session untouched and still playing
+# Profile 8.1, same material and grading: honoured
+  RELOAD done: playhead 0.00s -> 0.26s, backend native -> software, decoder=libavcodec HEVC (SW)
+```
+
+**Read the live arm's retention ratio over a long run, not a short one.** The slope anchors at 60 s
+to skip the load step, which is exactly where `--reload-at 60` puts a SECOND step: the software
+pipeline's own baseline. A 100 s run reads ratio 1.31 and means nothing by it; a 260 s run shows
+`physFP` stepping 25 to 66 MB across the switch and then flat at 67 for 140 s, ratio 0.18 and still
+falling, which is a step being amortized rather than a session retaining anything.
 
 **`--host-carry removeFirst|subdata` is the third arm, and it names a cause rather than measuring
 the engine.** Round 3's census on the reporter's device pinned his footprint to ONE `REALLOC`-tagged

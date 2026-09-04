@@ -61,7 +61,15 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     /// Total bytes the pacer has released; the live edge in logical-offset terms.
     private var released: Int64 = 0
     private var startTime = Date()
-    private var cancelled = false
+
+    /// AE#460 follow-up: `IOReader.cancel()` is documented as "unblock only, do not invalidate" for
+    /// a reader the engine may reload, and an in-place rebuild reuses the reader it just cancelled.
+    /// The conforming arm therefore wakes the parked read ONCE (epoch bump) and serves again; the
+    /// latching arm (`--cancel-latches`) is the other reading, which is what "network readers cancel
+    /// the in-flight request" naturally becomes when the request is a socket.
+    private let cancelLatches: Bool
+    private var cancelEpoch = 0
+    private var latched = false
 
     /// Lifetime bytes handed to the engine, for the harness's own throughput line.
     private(set) var bytesRead: Int64 = 0
@@ -74,6 +82,13 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     private(set) var maxLookbackBytes: Int64 = 0
     private(set) var seekCount: Int = 0
 
+    /// AE#460: where the read cursor sits and where the pacer's edge is, in logical offsets. A
+    /// rebuild that re-bases the spool states itself here as a cursor that went backwards while
+    /// the edge kept running, which no engine-side counter can show: the engine believes it is at
+    /// byte 0 of a fresh source either way.
+    var logicalPosition: Int64 { lock.lock(); defer { lock.unlock() }; return position }
+    var releasedBytes: Int64 { lock.lock(); defer { lock.unlock() }; return released }
+
     /// Host-side parse carry (see `HostCarryTrim`). Bounded in `count` by construction: everything
     /// but the partial trailing TS packet is consumed on every fill.
     private let carryTrim: HostCarryTrim
@@ -84,9 +99,11 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     private(set) var carryStartIndex = 0
 
     init(path: String, rateKbps: Int, reportsSize: Bool, wraps: Bool,
-         foundationRead: Bool = false, carryTrim: HostCarryTrim = .none) throws {
+         foundationRead: Bool = false, carryTrim: HostCarryTrim = .none,
+         cancelLatches: Bool = false) throws {
         self.path = path
         self.carryTrim = carryTrim
+        self.cancelLatches = cancelLatches
         let attrs = try FileManager.default.attributesOfItem(atPath: path)
         self.fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
         if foundationRead {
@@ -113,13 +130,14 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
         guard let buffer = buffer, size > 0 else { return -1 }
         let want = Int(size)
+        lock.lock(); let epoch = cancelEpoch; lock.unlock()
 
         // Block at the live edge exactly as a ring over an upstream socket does: wait until the
         // pacer has released bytes past the read cursor. Polling rather than a condition variable
         // keeps the reader honest about `cancel()` unblocking a parked read.
         while true {
             lock.lock()
-            if cancelled { lock.unlock(); return -1 }
+            if latched || cancelEpoch != epoch { lock.unlock(); return -1 }
             let elapsed = Date().timeIntervalSince(startTime)
             // Release in whole chunks, not in whatever fraction of a byte the clock has earned since
             // the last call. A byte-granular pacer answers every callback with a handful of bytes and
@@ -203,7 +221,14 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     }
 
     func cancel() {
-        lock.lock(); cancelled = true; lock.unlock()
+        lock.lock()
+        cancelEpoch += 1
+        if cancelLatches { latched = true }
+        let n = cancelEpoch
+        lock.unlock()
+        // One cancel per rebuild is the invariant: a second one lands on the successor bridge's
+        // read, and on a live source that read is parked at the edge (AE#460 follow-up).
+        print(String(format: "  READER cancel() #%d at t=%.0fs", n, Date().timeIntervalSince(startTime)))
     }
 
     /// The reporter's spool hands out independent cursors; the engine uses them for the subtitle
@@ -211,7 +236,8 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     func makeIndependentReader() -> IOReader? {
         try? PacedLiveSpoolIOReader(path: path, rateKbps: Int(rateBytesPerSecond * 8.0 / 1000.0),
                                     reportsSize: reportsSize, wraps: wraps,
-                                    foundationRead: handle != nil, carryTrim: carryTrim)
+                                    foundationRead: handle != nil, carryTrim: carryTrim,
+                                    cancelLatches: cancelLatches)
     }
 
     var discImageProbeEnabled: Bool { false }
@@ -230,7 +256,9 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
 /// graph. macOS has no jetsam, so the run cannot be killed here: the slope IS the finding.
 func runCustomLiveSpool(path: String, seconds: Double, rateKbps: Int, dvrWindow: Double?,
                         reportsSize: Bool, wraps: Bool, mallocCensus: Bool,
-                        foundationReader: Bool = false, carryTrim: HostCarryTrim = .none) -> Int32 {
+                        foundationReader: Bool = false, carryTrim: HostCarryTrim = .none,
+                        reloadAt: Double? = nil, cancelLatches: Bool = false,
+                        reloadDecodePath: DecodePath? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
         // Uncapped captures: a steady mux-rate climb spends one capture per threshold climbed, so the
@@ -241,12 +269,16 @@ func runCustomLiveSpool(path: String, seconds: Double, rateKbps: Int, dvrWindow:
     print("aetherctl customio --live: \(path) (rate=\(rateKbps) kbit/s seconds=\(seconds) "
           + "dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") size=\(reportsSize ? "reported" : "unknown") "
           + "wrap=\(wraps) census=\(mallocCensus) "
-          + "reader=\(foundationReader ? "foundation" : "posix") hostCarry=\(carryTrim.rawValue))")
+          + "reader=\(foundationReader ? "foundation" : "posix") hostCarry=\(carryTrim.rawValue) "
+          + "cancel=\(cancelLatches ? "latches" : "unblocks"))")
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
         box.value = await customLiveSpoolRun(path: path, seconds: seconds, rateKbps: rateKbps,
                                              dvrWindow: dvrWindow, reportsSize: reportsSize, wraps: wraps,
-                                             foundationReader: foundationReader, carryTrim: carryTrim)
+                                             foundationReader: foundationReader, carryTrim: carryTrim,
+                                             reloadAt: reloadAt,
+                                             reloadDecodePath: reloadDecodePath,
+                                             cancelLatches: cancelLatches)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -256,12 +288,15 @@ func runCustomLiveSpool(path: String, seconds: Double, rateKbps: Int, dvrWindow:
 @MainActor
 private func customLiveSpoolRun(path: String, seconds: Double, rateKbps: Int, dvrWindow: Double?,
                                 reportsSize: Bool, wraps: Bool, foundationReader: Bool,
-                                carryTrim: HostCarryTrim) async -> Int32 {
+                                carryTrim: HostCarryTrim, reloadAt: Double? = nil,
+                                reloadDecodePath: DecodePath? = nil,
+                                cancelLatches: Bool = false) async -> Int32 {
     let reader: PacedLiveSpoolIOReader
     do {
         reader = try PacedLiveSpoolIOReader(path: path, rateKbps: rateKbps,
                                             reportsSize: reportsSize, wraps: wraps,
-                                            foundationRead: foundationReader, carryTrim: carryTrim)
+                                            foundationRead: foundationReader, carryTrim: carryTrim,
+                                            cancelLatches: cancelLatches)
     } catch {
         print("VERDICT: reader init failed: \(error.localizedDescription)")
         return 1
@@ -284,6 +319,52 @@ private func customLiveSpoolRun(path: String, seconds: Double, rateKbps: Int, dv
         print("VERDICT: load failed: \(error.localizedDescription)")
         engine.stop()
         return 1
+    }
+
+    // AE#460 follow-up: an in-place rebuild on a retained live reader, fired from outside the
+    // engine at a point where the spool has run well past its base. The correction itself is
+    // deliberately inert on a custom source (`httpHeaders` is read only by the URL open), so what
+    // the run measures is the REBUILD, not the field.
+    let reloadReport = UncheckedBox<String?>(nil)
+    if let reloadAt {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(reloadAt * 1_000_000_000))
+            let beforePos = engine.currentTime
+            let beforeCursor = reader.logicalPosition
+            let beforeEdge = reader.releasedBytes
+            let beforeBackend = engine.playbackBackend
+            print(String(format: "  RELOAD at t=%.0fs: playhead=%.2fs cursor=%.1fMB edge=%.1fMB backend=%@",
+                         reloadAt, beforePos,
+                         Double(beforeCursor) / 1_048_576.0, Double(beforeEdge) / 1_048_576.0,
+                         "\(beforeBackend)"))
+            do {
+                // AE#461 follow-up: with --reload-decode-path the correction is the decode path
+                // itself, which is the field a custom source could not previously be corrected on.
+                // Without it the arm keeps its header probe, which is inert here on purpose and
+                // measures the rebuild rather than any field.
+                if let reloadDecodePath {
+                    try await engine.reloadAtCurrentPosition { $0.preferredDecodePath = reloadDecodePath }
+                } else {
+                    try await engine.reloadAtCurrentPosition { $0.httpHeaders["X-Aether-Probe"] = "1" }
+                }
+                print("  RELOAD returned without throwing, state=\(engine.state)")
+            } catch {
+                reloadReport.value = "threw \(error), state=\(engine.state)"
+                print("  RELOAD threw: \(error), state=\(engine.state)")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            let afterPos = engine.currentTime
+            let afterCursor = reader.logicalPosition
+            let afterEdge = reader.releasedBytes
+            reloadReport.value = String(
+                format: "playhead %.2fs -> %.2fs, reader cursor %.1f -> %.1f MB, edge %.1f -> %.1f MB, backend %@ -> %@",
+                beforePos, afterPos,
+                Double(beforeCursor) / 1_048_576.0, Double(afterCursor) / 1_048_576.0,
+                Double(beforeEdge) / 1_048_576.0, Double(afterEdge) / 1_048_576.0,
+                "\(beforeBackend)", "\(engine.playbackBackend)")
+            print("  RELOAD done: \(reloadReport.value ?? "")")
+        }
     }
 
     let start = Date()
@@ -317,6 +398,9 @@ private func customLiveSpoolRun(path: String, seconds: Double, rateKbps: Int, dv
         }
     }
 
+    if let line = reloadReport.value {
+        print("RELOAD: \(line)")
+    }
     let srcMBps = Double(rateKbps) * 1000.0 / 8.0 / 1_048_576.0
     let lookbackMB = Double(reader.maxLookbackBytes) / 1_048_576.0
     print(String(format: "LOOKBACK: %d seeks, deepest reach-back %.1f MB behind the live edge "

@@ -1885,23 +1885,32 @@ extension AetherEngine {
     }
 
     /// Rebuild the pipeline at the current playhead with an optional audio stream override (nil = keep auto-picked). Re-arms the active subtitle source. Called by `selectAudioTrack` and `reloadAtCurrentPosition`. Snapshots subtitle + playhead INSIDE the task body: a chained `selectSubtitleTrack` lands on MainActor before the body runs; snapshotting at call-site would miss it.
+    ///
+    /// AE#460 follow-up: returns the error that killed the rebuild, or nil when the session came
+    /// back (a supersede, which is not a failure, also returns nil: a newer load owns the engine).
+    /// This path publishes its failure and used to return silently either way, so a caller could
+    /// not tell a rebuilt session from a dead one; `reloadAtCurrentPosition(applying:)` is built on
+    /// exactly that distinction. Callers that only drive UI keep discarding it.
+    @discardableResult
     func reloadWithAudioOverride(
         url: URL,
         audioStreamIndex: Int32?,
         expectedGeneration: UInt64,
         discTitleIDOverride: Int? = nil,
         resumeOverride: Double? = nil
-    ) async {
+    ) async -> Error? {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
         guard loadGeneration == expectedGeneration, loadedURL != nil else {
             EngineLog.emit("[AetherEngine] reload superseded before start; ignored", category: .engine)
-            return
+            return nil
         }
         // Disc title to reopen with: an explicit override (selectTitle on a custom disc) wins, else the title
         // already playing so an audio switch / background-resume doesn't silently revert to the main title (#67).
         let titleToReopen = discTitleIDOverride ?? activeDiscTitleID
         // resumeOverride 0 restarts a title switch at the new title's head; nil keeps the current playhead.
-        let resumeAt = resumeOverride ?? currentTime
+        // AE#464 round 2: "the current playhead" is not `currentTime` while another load is in flight,
+        // which has already zeroed that clock. See `AetherEngine.rebuildPosition`.
+        let resumeAt = resumeOverride ?? positionForSessionRebuild
         let embeddedStreamToResume: Int32 = activeEmbeddedSubtitleStreamIndex
         let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
             ? loadedSidecarURL
@@ -1940,16 +1949,43 @@ extension AetherEngine {
         )
 
         state = .loading
+        // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
+        // parks its own rebuild position for anything that stacks behind it.
+        positionUnderReconstruction = resumeAt
         let previousAudioIndex = activeAudioTrackIndex
         // Snapshot before stopInternal wipes state. Must reload on the same backend: loadNative on a SW-routed AV1 source throws unsupportedCodec (HLSVideoEngine only accepts HEVC / H.264 / VP9 / probed-AV1).
         let wasOnSoftwarePath = (playbackBackend == .software)
+        // AE#461 follow-up: which host this rebuild hands the source to. This used to be
+        // `wasOnSoftwarePath` alone, which made a `preferredDecodePath` correction on a custom source
+        // accepted, logged as applied and then silently ignored: the option is read only inside
+        // `load`, and a custom source never reaches it. The same pure policy `load` asks decides it
+        // here, seeded with the backend the session is currently on.
+        //
+        // The one-way type is what makes re-routing safe on this path. `DecodePath` has no `.native`,
+        // so the only flip reachable is native -> software, and the software path is the general one;
+        // the reverse (the `unsupportedCodec` case the line above warns about) stays unreachable by
+        // construction. What the software path cannot REPRESENT is refused before any teardown, in
+        // `reloadAtCurrentPosition(applying:)`, because the guards that catch it in `load` run after
+        // the routing decision and would fail a session this rebuild had already stopped.
+        let targetSoftwarePath = VideoRoutingPolicy.usesSoftwarePath(
+            routedSoftware: wasOnSoftwarePath, preferred: loadedOptions.preferredDecodePath)
+        if targetSoftwarePath != wasOnSoftwarePath {
+            EngineLog.emit(
+                "[AetherEngine] #461: reload re-routing this session native -> software on the host's "
+                + "preference (custom source: \(isCustomSource))",
+                category: .engine
+            )
+        }
         // Preserve codec so the decoder label can be reconstructed without re-probing.
         let preservedVideoCodec = lastDetectedVideoCodec
         let reloadStart = DispatchTime.now()
         EngineLog.emit("[AetherEngine] reload: stopInternal start", category: .engine)
         // resetDisplayCriteria: false: video format is unchanged; resetting triggers a full waitForSwitch Stage 2 timeout (5 s at the 2026-05-26 device test, ~2 s cap since #117; Bose SLIII A2DP + 4K HDR10 PQ: each switch added ~12 s black-screen). On the same route a panel SDR drop during the reset window failed the PQ variant with AVFoundationErrorDomain -11868 / CoreMediaErrorDomain -17223.
-        // keepNativeHost: !wasOnSoftwarePath preserves the AVPlayer across the switch (issue #15).
-        stopInternal(resetDisplayCriteria: false, keepNativeHost: !wasOnSoftwarePath, keepCustomReader: true)
+        // keepNativeHost: !targetSoftwarePath preserves the AVPlayer across the switch (issue #15).
+        // It follows the TARGET route, not the previous one: a rebuild that flips to software renders
+        // into its own layer, and a preserved host would leave AVKit bound to a stale player with
+        // audio still flowing into the next load (the release `load()` does by hand on that branch).
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: !targetSoftwarePath, keepCustomReader: true)
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         let gen = loadGeneration
         loadedURL = url
@@ -1978,7 +2014,7 @@ extension AetherEngine {
                 EngineLog.emit("[AetherEngine] reload: custom reader reopen failed: \(error)", category: .engine)
                 activeAudioTrackIndex = previousAudioIndex
                 publishError(.reloadFailed, "Reload failed: \(error.localizedDescription)", underlying: error)
-                return
+                return error
             }
             if loadGeneration != gen {
                 customPreopened?.markClosed()
@@ -1986,7 +2022,7 @@ extension AetherEngine {
                     Task.detached { d.close() }
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after reader reopen; unwinding", category: .engine)
-                return
+                return nil
             }
         } else if titleToReopen != nil {
             // URL/local disc audio switch: the backend would otherwise reopen by URL with no title id and
@@ -2003,7 +2039,7 @@ extension AetherEngine {
                 EngineLog.emit("[AetherEngine] reload: disc URL reopen failed: \(error)", category: .engine)
                 activeAudioTrackIndex = previousAudioIndex
                 publishError(.reloadFailed, "Reload failed: \(error.localizedDescription)", underlying: error)
-                return
+                return error
             }
             if loadGeneration != gen {
                 customPreopened?.markClosed()
@@ -2011,7 +2047,7 @@ extension AetherEngine {
                     Task.detached { d.close() }
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after disc URL reopen; unwinding", category: .engine)
-                return
+                return nil
             }
         }
 
@@ -2041,7 +2077,7 @@ extension AetherEngine {
 
         do {
             let loadStart = DispatchTime.now()
-            if wasOnSoftwarePath {
+            if targetSoftwarePath {
                 EngineLog.emit("[AetherEngine] reload: loadSoftware enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
                 try await loadSoftware(
                     url: url,
@@ -2126,13 +2162,13 @@ extension AetherEngine {
             // fail the reload like a load error instead of leaving the user
             // on an indefinitely frozen frame. Scoped to live reloads on the
             // native path; initial joins and VOD reloads never arm it.
-            if loadedOptions.isLive, !wasOnSoftwarePath {
+            if loadedOptions.isLive, !targetSoftwarePath {
                 armLiveReloadWatchdog(generation: gen)
             }
             EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
         } catch is CancellationError {
             // Superseded by a newer load/stop: it owns the engine state.
-            return
+            return nil
         } catch {
             EngineLog.emit(
                 "[AetherEngine] selectAudioTrack reload failed: \(error), playback stopped",
@@ -2140,7 +2176,7 @@ extension AetherEngine {
             )
             activeAudioTrackIndex = previousAudioIndex
             publishError(.audioTrackSwitchFailed, "Audio track switch failed: \(error.localizedDescription)", underlying: error)
-            return
+            return error
         }
 
         // Reload succeeded (failure paths returned above). Re-establish disc state stopInternal wiped.
@@ -2155,7 +2191,7 @@ extension AetherEngine {
             // A title switch changes the title's stream set. The native path already republished the session's
             // real list via syncPublishedAudioStateFromNativeSession above; only the software path, which does
             // not reconcile tracks post-load, needs the probe-derived lists re-applied here.
-            if wasOnSoftwarePath {
+            if targetSoftwarePath {
                 audioTracks = reopenedAudioTracks
                 applyConfirmedAtmos()   // #214 follow-up: a title switch re-applies probe lists
                 subtitleTracks = reopenedSubtitleTracks
@@ -2208,6 +2244,7 @@ extension AetherEngine {
             )
             setNativeSubtitleSelected(track: ordinal)
         }
+        return nil
     }
 
     private func elapsedMs(since start: DispatchTime) -> Int {

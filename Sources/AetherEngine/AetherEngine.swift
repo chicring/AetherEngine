@@ -509,6 +509,13 @@ public final class AetherEngine: ObservableObject {
     /// `sourceVideoFormat` for Stats-for-Nerds labels ("Dolby Vision P5"); read from the dvcC record.
     @Published public internal(set) var sourceDVProfile: Int? = nil
 
+    /// AE#461: base-layer signal compatibility ID from the same dvcC/dvvC record as `sourceDVProfile`
+    /// (0 = IPT-only, no compatible base layer). Kept because a decode-path correction has to decide
+    /// whether the software path can represent this source BEFORE it tears the session down, and by
+    /// then the probe stream that carried the record is long gone. Internal: `sourceDVProfile` is the
+    /// label hosts read, this is the term only `softwarePathCannotRepresent` needs.
+    var sourceDVBLCompatID: Int? = nil
+
     /// Nominal source frame rate (fps) from the container's `avg_frame_rate` (falling back to `r_frame_rate`),
     /// or nil when the source has no video or libavformat couldn't derive one. Companion to `sourceVideoFormat`
     /// for Stats-for-Nerds. `LiveTelemetry.observedFps` measures the live rate but is nil on the native AVPlayer
@@ -1438,6 +1445,9 @@ public final class AetherEngine: ObservableObject {
     /// AVPlayer says it holds the bytes that seam describes. One at a time, newest wins, cancelled in
     /// stopInternal: it exists only to check the axis just published, so an older check is stale.
     var placementVerificationTask: Task<Void, Never>?
+    /// AE#481: the sampler reading what the run holding a seek landing carries. One at a time, and the
+    /// newest seek owns it: an older landing describes a position the playhead has left.
+    var landingAxisTask: Task<Void, Never>?
 
     /// 1 Hz live-telemetry sampler. Lifecycle mirrors memoryProbeTask. Holds a weak engine reference
     /// so the retained task can't keep self alive past teardown.
@@ -1674,6 +1684,13 @@ public final class AetherEngine: ObservableObject {
     /// value has to live where the session's own rebuilds replay it from, or a lip-sync correction
     /// would be lost at the next audio-track switch or background return.
     func setLoadedAudioDelay(_ seconds: Double) { loadedOptions.audioDelaySeconds = seconds }
+
+    /// AE#464 round 2: the fourth narrow write, and the one that makes a session-preserving reload
+    /// preserve the session's transport. `autoplay` describes a MOUNT, and a rebuild is not a mount;
+    /// writing the session's own transport state here is what both reload branches then replay,
+    /// without either of them having to learn about it (the URL branch copies this struct into
+    /// `load`, the custom-source branch reads these fields one by one). See `rebuildResumesPlaying`.
+    func setLoadedAutoplay(_ autoplay: Bool) { loadedOptions.autoplay = autoplay }
 
     /// AE#460: the second narrow write into `loadedOptions` outside a load, for a host correction
     /// that a session-preserving reload is about to rebuild on. Installed before the rebuild rather
@@ -2151,6 +2168,46 @@ public final class AetherEngine: ObservableObject {
     /// site cannot silently bypass the flag.
     nonisolated static func loadPerformsAutostart(_ options: LoadOptions) -> Bool {
         options.autoplay
+    }
+
+    /// AE#464 round 2: whether a session-preserving rebuild comes back PLAYING.
+    ///
+    /// `reloadAtCurrentPosition` replayed `LoadOptions.autoplay` verbatim, and that flag describes the
+    /// FIRST mount, not the session. A host that owns transport itself and mounts with
+    /// `autoplay = false` therefore got a frozen picture and no error out of every rebuild the engine
+    /// makes on its own (the AirPlay LAN swap, a #460 correction, the #464 nudge): the rebuilt host
+    /// settled `paused`, the producer parked on a consumer that would never ask for a segment, and
+    /// nothing was left to call `play()` because the load was the engine's, not the host's. The rate a
+    /// host set already survives these rebuilds (#436); the play/pause did not.
+    ///
+    /// `nativeTransportIntent` is the native host's durable #122 intent, which is what the session is
+    /// DOING rather than what its player momentarily reads: it survives a scrub, so a rebuild raised
+    /// mid-seek comes back playing instead of paused. nil where there is no native host to ask (the
+    /// software and audio routes have no competing transport owner, so `state` is authoritative there,
+    /// which is the same split `togglePlayPause` makes).
+    nonisolated static func rebuildResumesPlaying(state: PlaybackState, nativeTransportIntent: Bool?) -> Bool {
+        if let nativeTransportIntent { return nativeTransportIntent }
+        switch state {
+        case .playing, .seeking: return true
+        case .idle, .loading, .paused, .ended, .error: return false
+        }
+    }
+
+    /// AE#464 round 2: the playhead a session-preserving rebuild has to come back to.
+    ///
+    /// `load()` zeroes the clock at its start, before the session it is building has anything to put
+    /// there, so a reload raised while another load is still in flight snapshotted that zero and
+    /// rebuilt the session at its head. Measured by the reporter: three stepper presses inside one
+    /// runloop turn stacked three reloads, two were superseded by generation, and the one that
+    /// survived cut `seg0+` on a title 15 s in. While a load is in flight the position that describes
+    /// the session is the one THAT load was handed, which it received before the clock was cleared.
+    ///
+    /// `.loading` is the whole of that window and nothing else: the only other writer of it holds it
+    /// through startup before the first roll (`host.$timeControlStatus`, which cannot reach it once
+    /// the session has played), so the parked value can never be read after the load it belongs to.
+    nonisolated static func rebuildPosition(state: PlaybackState, clock: Double, underReconstruction: Double?) -> Double {
+        guard state == .loading, let parked = underReconstruction else { return clock }
+        return parked
     }
 
     /// #35 cold-DV-master startup-readiness gate. A DV master (P7->P8.1, or any HDR master)
@@ -2803,6 +2860,28 @@ public final class AetherEngine: ObservableObject {
     /// misread as deselect) and applied by `restoreSubtitleSelection`.
     var sessionPreservingReloadInFlight = false
     var pendingNativeRenderingRequest: Bool? = nil
+
+    /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
+    /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
+    /// Written at the two sites that raise `state = .loading` for a load; read only through
+    /// `positionForSessionRebuild`, which is what makes a reload stacked behind another one rebuild at
+    /// the playhead instead of at the head.
+    var positionUnderReconstruction: Double?
+
+    /// The playhead a rebuild of this session has to come back to (#464 round 2).
+    var positionForSessionRebuild: Double {
+        Self.rebuildPosition(state: state, clock: currentTime, underReconstruction: positionUnderReconstruction)
+    }
+
+    /// The transport state a rebuild of this session has to come back in (#464 round 2). Asks the
+    /// native host for its durable intent where there is one to ask, exactly as `togglePlayPause`
+    /// does, and falls back to `state` on the routes that have no competing transport owner.
+    var sessionRebuildResumesPlaying: Bool {
+        let nativeIntent = (nativeHost != nil && !audioAVPlayerActive && audioHost == nil && softwareHost == nil)
+            ? nativeHost?.transportIntentIsPlaying
+            : nil
+        return Self.rebuildResumesPlaying(state: state, nativeTransportIntent: nativeIntent)
+    }
     /// #357: selection parked by a background teardown for the foreground reload, because on that
     /// path the two are minutes apart and `stopInternal` has wiped the state the reload snapshots
     /// itself. Claimed by `consumeReloadSelection`, dropped by any other `load()` and by `stop()`.
@@ -3196,6 +3275,10 @@ public final class AetherEngine: ObservableObject {
             ? LiveWindow(windowSeconds: options.nativeRemoteHLS ? .greatestFiniteMagnitude : options.dvrWindowSeconds)
             : nil
         state = .loading
+        // AE#464 round 2: park the position THIS load is rebuilding toward before the clock that held
+        // it is cleared below, so a reload raised while this one is still in flight has something
+        // truer than the zero to snapshot. See `rebuildPosition`.
+        positionUnderReconstruction = startPosition ?? 0
         isBuffering = false
         residentPlaylistRanges = []
         residentRanges = []
@@ -3256,6 +3339,7 @@ public final class AetherEngine: ObservableObject {
         videoFormat = .sdr
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
+        sourceDVBLCompatID = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
         sourceVideoCodecName = nil
@@ -3312,6 +3396,7 @@ public final class AetherEngine: ObservableObject {
         var detectedFormat: VideoFormat = .sdr
         var effectiveFormat: VideoFormat = .sdr
         var detectedDVProfileNum: Int? = nil
+        var detectedDVBLCompatIDNum: Int? = nil
         var detectedRate: Double? = nil
         var detectedVideoBitrate: Int64 = 0
         var detectedDVProfile: Bool = false
@@ -3370,7 +3455,9 @@ public final class AetherEngine: ObservableObject {
                 // DV->HDR10 when the panel can't host it; we don't pre-strip engine-side. Pairs with
                 // always-emit-SUPPLEMENTAL + no-strip in HLSVideoEngine's profile81/profile84 emission.
                 detectedDVProfile = (detectedFormat == .dolbyVision)
-                detectedDVProfileNum = Self.dvProfile(stream: stream)
+                let detectedDVConfig = Self.dvConfig(stream: stream)
+                detectedDVProfileNum = detectedDVConfig?.profile
+                detectedDVBLCompatIDNum = detectedDVConfig?.blCompatID
                 detectedCodecID = stream.pointee.codecpar.pointee.codec_id
                 detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
@@ -3498,6 +3585,7 @@ public final class AetherEngine: ObservableObject {
         // the criteria handshake; see panelHDRAfterHandshake below).
         sourceVideoFormat = detectedFormat
         sourceDVProfile = detectedDVProfileNum
+        sourceDVBLCompatID = detectedDVBLCompatIDNum
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
         sourceVideoCodecName = detectedCodecID == AV_CODEC_ID_NONE
@@ -4224,15 +4312,28 @@ public final class AetherEngine: ObservableObject {
         // nothing was parked this is exactly the pre-#357 live read.
         let resumesTornDownSession = backgroundTeardownSelection != nil
         let selection = consumeReloadSelection()
+        // AE#464 round 2: come back in the transport state the session is IN, not the one its first
+        // mount was given. Written before the branch because only the URL branch below carries a
+        // struct into `load`; the custom-source branch reads `loadedOptions` field by field.
+        // A torn-down session (#357 background teardown) has no transport left to read and its
+        // resume is the host's call, so that path keeps replaying the mount flag exactly as before.
+        if !resumesTornDownSession { setLoadedAutoplay(sessionRebuildResumesPlaying) }
         if isCustomSource {
             // Rebuild on retained reader (seekable only); no URL to reopen.
             guard customSourceIsSeekable, let placeholderURL = loadedURL else { return }
-            await reloadWithAudioOverride(
+            let failure = await reloadWithAudioOverride(
                 url: placeholderURL,
                 audioStreamIndex: selection.audioTrackIndex.map { Int32($0) },
                 expectedGeneration: loadGeneration,
                 discTitleIDOverride: selection.discTitleID
             )
+            // AE#460 follow-up: a rebuild that died leaves the session in `.error`, and this branch
+            // used to return as if it had come back, so `reloadAtCurrentPosition(applying:)`
+            // reported a correction it had not made. The URL branch below has always thrown what
+            // its load threw; both branches now answer the same way. Measured on a live custom
+            // source whose reader read `cancel()` as terminal: the rebuild failed on stream info
+            // and the call still returned success.
+            if let failure { throw failure }
             // The reload restores from its own pre-stopInternal snapshot, which a torn-down session
             // no longer had anything in; replay the parked subtitle pick on top of it.
             if resumesTornDownSession {
@@ -4241,7 +4342,9 @@ public final class AetherEngine: ObservableObject {
             return
         }
         guard let url = loadedURL else { return }
-        let pos = currentTime
+        // AE#464 round 2: not `currentTime`. A reload stacked behind one still in flight reads a clock
+        // that load already zeroed, and rebuilds the session at its head. See `rebuildPosition`.
+        let pos = positionForSessionRebuild
         // Snapshot the disc title before load()'s stopInternal wipes it, so a background-resumed disc image
         // keeps the title the user selected instead of reverting to the main title (#67).
         let titleID = selection.discTitleID
@@ -4455,6 +4558,15 @@ public final class AetherEngine: ObservableObject {
         // still had when the seek was issued; from the landing forward the clock describes the axis
         // it will have instead.
         nativeVideoSession?.snapAxisAfterSeek(landingItemSeconds: clockTarget)
+        // AE#481: and what the landing's run carries is a READING, not the composition it inherits. A
+        // seek that opens a new run at a segment written on its planned position lands on a source-true
+        // stretch, which nothing else in the session ever looks at: measured on the #418 chain with the
+        // re-anchoring seek last, the clock stayed 9 s over the picture from the landing to the end of
+        // the session. Armed here rather than at the landing because the sampler waits for a run to
+        // hold the target anyway, and a superseded seek cancels it.
+        if let session = nativeVideoSession, nativeHost != nil {
+            verifyAxisAtSeekLanding(session: session, landingItemSeconds: clockTarget)
+        }
         // AE#412: inside a keyframe drought, audio opened plan boundaries the keyframe-gated cutter
         // folded, so the landing segment can carry no random-access point at all. AVPlayer reaches
         // back a fixed few seconds on a cold seek and does not look for one, so the picture would
@@ -5021,6 +5133,7 @@ public final class AetherEngine: ObservableObject {
         videoFormat = .sdr
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
+        sourceDVBLCompatID = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
         sourceVideoCodecName = nil
@@ -5806,6 +5919,8 @@ public final class AetherEngine: ObservableObject {
         memoryProbeTask = nil
         placementVerificationTask?.cancel()
         placementVerificationTask = nil
+        landingAxisTask?.cancel()
+        landingAxisTask = nil
         // AE#446: the outage watcher belongs to the session whose window was closed with ENDLIST.
         liveOutageResumeWatcher?.cancel()
         liveOutageResumeWatcher = nil
