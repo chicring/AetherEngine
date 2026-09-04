@@ -43,6 +43,9 @@ final class SegmentCache: @unchecked Sendable {
     /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
     /// (live sessions, where the sliding playlist already dropped everything behind the window).
     private let retentionBudgetBytes: Int
+    /// Explicit byte-budget mode. Its hard window is deliberately kept small and the budget includes
+    /// that window; the historical retention mode keeps its high-water anchor for backward compatibility.
+    private let budgetIncludesHardWindow: Bool
 
     private var entries: [Int: URL] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
@@ -103,10 +106,12 @@ final class SegmentCache: @unchecked Sendable {
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
+         budgetIncludesHardWindow: Bool = false,
          baseDirectory: URL? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
+        self.budgetIncludesHardWindow = budgetIncludesHardWindow
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
@@ -752,18 +757,21 @@ final class SegmentCache: @unchecked Sendable {
 
     /// #207 producer park step: true once the producer may write `head`. Withheld while its race-ahead
     /// has reached `budgetBytes` and the consumer still has a safe lead behind it; the extras eviction
-    /// that follows the advancing playhead is what frees the room again.
-    func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int, timeout: TimeInterval = 1.0) -> Bool {
+    /// that follows the advancing playhead is what frees the room again. Explicit host budgets use the
+    /// total cache footprint; historical retention uses forward bytes so retained history does not park
+    /// a normal producer.
+    func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int, totalBudget: Bool = false,
+                                   timeout: TimeInterval = 1.0) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        if !shouldParkLocked(head: head, budgetBytes: budgetBytes) { return true }
+        if !shouldParkLocked(head: head, budgetBytes: budgetBytes, totalBudget: totalBudget) { return true }
         _ = condition.wait(until: Date().addingTimeInterval(timeout))
-        return !shouldParkLocked(head: head, budgetBytes: budgetBytes)
+        return !shouldParkLocked(head: head, budgetBytes: budgetBytes, totalBudget: totalBudget)
     }
 
     /// Must be called with condition held.
-    private func shouldParkLocked(head: Int, budgetBytes: Int) -> Bool {
-        PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
+    private func shouldParkLocked(head: Int, budgetBytes: Int, totalBudget: Bool) -> Bool {
+        PrefetchDiskBudget.shouldPark(forwardBytes: totalBudget ? _totalBytes : currentForwardBytes(),
                                       budgetBytes: budgetBytes,
                                       head: head,
                                       consumerTarget: currentTargetIndex)
@@ -790,7 +798,12 @@ final class SegmentCache: @unchecked Sendable {
     /// (a resident backward target = no producer restart) holds across the whole retained span.
     private func pruneOutsideWindow() -> [URL] {
         let lo = currentTargetIndex - backwardWindow
-        let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
+        // Explicit byte mode treats the safety window as part of the budget. Do not anchor its upper
+        // edge to the producer's high-water mark: that would make a whole-source producer's output
+        // exempt from the very byte limit the host selected.
+        let hi = budgetIncludesHardWindow
+            ? currentTargetIndex + min(forwardWindow, PrefetchDiskBudget.minAheadSegments)
+            : max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         var doomed: [URL] = []
         if retentionBudgetBytes > 0 {
             var extras: [(index: Int, bytes: Int)] = []

@@ -10,7 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+- **Added `LoadOptions.diskCacheBudgetBytes` for byte-sized native buffering.** A positive budget enables
+  whole-source prefetch bounded by the total loopback segment-cache footprint, with a small AVPlayer
+  safety window and the existing quarter-of-free-space guard. `nil` keeps the existing
+  `forwardBufferSegments` behavior.
 
 ## [6.67.2] - 2026-09-03
 

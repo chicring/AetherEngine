@@ -158,3 +158,71 @@ struct SegmentCachePrefetchFootprintTests {
         #expect(c.awaitPrefetchDiskHeadroom(head: 30, budgetBytes: 50, timeout: 0.05) == true)
     }
 }
+
+@Suite("Explicit total disk-budget mode")
+struct ExplicitDiskBudgetTests {
+
+    private func makeData(_ n: Int) -> Data { Data(repeating: 0xBB, count: n) }
+
+    @Test("The explicit budget includes the cache safety window")
+    func totalBudgetEvictsDistantSegments() {
+        let c = SegmentCache(
+            forwardWindow: 2,
+            backwardWindow: 1,
+            retentionBudgetBytes: 50,
+            budgetIncludesHardWindow: true
+        )
+        defer { c.close() }
+        c.declareTarget(0)
+        for i in 0...10 { c.store(index: i, data: makeData(10)) }
+
+        #expect(c.totalBytes == 50)
+        #expect(c.peek(index: 0) != nil)
+        #expect(c.peek(index: 2) != nil)
+        #expect(c.peek(index: 5) == nil)
+    }
+
+    @Test("Total-budget headroom counts retained history")
+    func totalBudgetParkCountsWholeCache() {
+        let c = SegmentCache(
+            forwardWindow: 2,
+            backwardWindow: 1,
+            retentionBudgetBytes: 50,
+            budgetIncludesHardWindow: true
+        )
+        defer { c.close() }
+        c.declareTarget(3)
+        for i in 0...5 { c.store(index: i, data: makeData(10)) }
+
+        #expect(c.totalBytes == 50)
+        #expect(c.forwardBytes < 50)
+        #expect(c.awaitPrefetchDiskHeadroom(head: 20, budgetBytes: 50, timeout: 0.05) == true)
+        #expect(c.awaitPrefetchDiskHeadroom(
+            head: 20, budgetBytes: 50, totalBudget: true, timeout: 0.05
+        ) == false)
+    }
+}
+
+@Suite("Explicit disk-budget sizing")
+struct ExplicitDiskBudgetSizingTests {
+
+    @Test("Positive budgets are normalized and non-positive values use automatic sizing")
+    func normalizesBudget() {
+        #expect(HLSVideoEngine.normalizedDiskCacheBudgetBytes(nil) == nil)
+        #expect(HLSVideoEngine.normalizedDiskCacheBudgetBytes(0) == nil)
+        #expect(HLSVideoEngine.normalizedDiskCacheBudgetBytes(-1) == nil)
+        #expect(HLSVideoEngine.normalizedDiskCacheBudgetBytes(150 << 20) == 150 << 20)
+    }
+
+    @Test("Explicit budgets remain capped by a quarter of free space")
+    func capsExplicitBudgetToFreeSpace() {
+        #expect(HLSVideoEngine.resolvedRetentionBudgetBytes(
+            explicitBudgetBytes: 1 << 30,
+            volumeAvailableBytes: 2 << 30
+        ) == 512 << 20)
+        #expect(HLSVideoEngine.resolvedRetentionBudgetBytes(
+            explicitBudgetBytes: 1 << 30,
+            volumeAvailableBytes: nil
+        ) == 1 << 30)
+    }
+}

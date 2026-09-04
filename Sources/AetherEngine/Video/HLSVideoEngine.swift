@@ -801,6 +801,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
         forwardWindowSegments > defaultRetentionCapWindowCeiling
     }
 
+    /// Explicit byte-budget mode lets the producer prefetch the source, while the cache keeps only
+    /// the small window AVPlayer needs as a correctness floor. The selected byte budget then controls
+    /// how much additional content stays resident.
+    static let explicitDiskCacheProducerWindowSegments = 2700
+    static let explicitDiskCacheForwardWindowSegments = 10
+    static let explicitDiskCacheBackwardWindowSegments = 2
+
+    static func normalizedDiskCacheBudgetBytes(_ requested: Int64?) -> Int? {
+        guard let requested, requested > 0 else { return nil }
+        return requested >= Int64(Int.max) ? Int.max : Int(requested)
+    }
+
+    /// A host-selected budget remains an upper bound, but never consumes more than a quarter of the
+    /// temporary volume's free space. Unknown capacity keeps the host's exact positive value.
+    static func resolvedRetentionBudgetBytes(explicitBudgetBytes: Int?,
+                                             volumeAvailableBytes: Int64?,
+                                             capRelaxed: Bool = false) -> Int {
+        guard let explicitBudgetBytes else {
+            return sessionRetentionBudgetBytes(volumeAvailableBytes: volumeAvailableBytes,
+                                               capRelaxed: capRelaxed)
+        }
+        guard let available = volumeAvailableBytes else { return explicitBudgetBytes }
+        return min(explicitBudgetBytes, max(0, Int(available / 4)))
+    }
+
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
     // Sliding MEDIA-SEQUENCE is now unconditional for live (see `LiveWindowSizing`).
@@ -842,6 +867,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         sequentialOrigin: Bool = false,
         declaredDurationSeconds: Double? = nil,
         forwardBufferSegments: Int? = nil,
+        diskCacheBudgetBytes: Int64? = nil,
         shortFirstSegmentSeconds: Double? = nil
     ) {
         self.sourceURL = url
@@ -891,15 +917,29 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sourceReopenableByURL = sourceReopenableByURL
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
-        self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        let requestedForwardWindow = Self.clampedForwardWindow(forwardBufferSegments)
+        let normalizedDiskBudget = Self.normalizedDiskCacheBudgetBytes(diskCacheBudgetBytes)
+        self.explicitDiskCacheBudgetBytes = normalizedDiskBudget
+        self.usesExplicitDiskCacheBudget = normalizedDiskBudget != nil
+        self.forwardWindowSegments = normalizedDiskBudget == nil
+            ? requestedForwardWindow : Self.explicitDiskCacheProducerWindowSegments
+        self.cacheForwardWindowSegments = normalizedDiskBudget == nil
+            ? requestedForwardWindow : Self.explicitDiskCacheForwardWindowSegments
+        self.cacheBackwardWindowSegments = normalizedDiskBudget == nil
+            ? 20 : Self.explicitDiskCacheBackwardWindowSegments
         self.shortFirstSegmentSeconds = shortFirstSegmentSeconds
     }
 
-    /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
-    /// (`HLSSegmentProducer.bufferAheadSegments`) and the cache's forward window
-    /// (`SegmentCache.forwardWindow`); the two MUST stay identical (a drift is exactly what stalls
-    /// AVPlayer, see `SegmentCache`). From `LoadOptions.forwardBufferSegments`; nil -> historical 10.
+    /// Session producer race-ahead window in segments. In explicit byte-budget mode this is the
+    /// whole-source sanity ceiling; `prefetchDiskBudgetBytes` is the real bound.
     let forwardWindowSegments: Int
+
+    /// Cache safety window. It is separate from the producer window only in explicit byte-budget mode:
+    /// the producer may race through the source, while the total byte budget evicts distant segments.
+    private let cacheForwardWindowSegments: Int
+    private let cacheBackwardWindowSegments: Int
+    private let explicitDiskCacheBudgetBytes: Int?
+    private let usesExplicitDiskCacheBudget: Bool
 
     /// Session retention budget resolved in `start()`; also bounds the producer's race-ahead on disk
     /// (#207, see `PrefetchDiskBudget`). Live resolves the same budget, so the DVR history the
@@ -1350,20 +1390,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
         #endif
-        let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
-        let retentionBudget = Self.sessionRetentionBudgetBytes(volumeAvailableBytes: availableBytes,
-                                                               capRelaxed: capRelaxed)
+        let capRelaxed = !usesExplicitDiskCacheBudget
+            && Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
+        let retentionBudget = Self.resolvedRetentionBudgetBytes(
+            explicitBudgetBytes: explicitDiskCacheBudgetBytes,
+            volumeAvailableBytes: availableBytes,
+            capRelaxed: capRelaxed
+        )
         self.retentionBudgetBytes = retentionBudget
         let segmentCache = SegmentCache(
-            forwardWindow: forwardWindowSegments,
+            forwardWindow: cacheForwardWindowSegments,
+            backwardWindow: cacheBackwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
+            budgetIncludesHardWindow: usesExplicitDiskCacheBudget,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
         self.cache = segmentCache
         EngineLog.emit(
             "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
             + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"), "
-            + "forwardWindow=\(forwardWindowSegments) seg"
+            + "producerWindow=\(forwardWindowSegments) seg, cacheWindow=\(cacheBackwardWindowSegments)..."
+            + "\(cacheForwardWindowSegments) seg"
+            + (usesExplicitDiskCacheBudget ? ", explicit total budget" : "")
             + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "") + ")",
             category: .session
         )
@@ -2465,6 +2513,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
             bufferAheadSegments: forwardWindowSegments,
             prefetchDiskBudgetBytes: retentionBudgetBytes,
+            prefetchDiskBudgetIsTotal: usesExplicitDiskCacheBudget,
             // AE#222: nil until a pump proved this source cuts its first segment before any audio packet
             // arrives; from then on every producer of the session muxes moov from this frame.
             audioMoovPrimeFrame: sessionAudioMoovPrimeFrame,

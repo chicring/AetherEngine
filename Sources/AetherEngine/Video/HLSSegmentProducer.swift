@@ -715,6 +715,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// so the race-ahead parks once it has filled the session retention budget (`PrefetchDiskBudget`).
     /// 0 disables the park (live, and any host that never opted in stays far below its budget anyway).
     private let prefetchDiskBudgetBytes: Int
+    /// Explicit host budgets include the cache safety window, so the park must account for total cache
+    /// bytes instead of only bytes at or above the consumer target. Historical retention keeps the
+    /// forward-only accounting to avoid throttling on retained playback history.
+    private let prefetchDiskBudgetIsTotal: Bool
 
     /// AE#464: the host's audio offset this producer's muxers write. Fixed for the producer's life;
     /// a new value arrives as a new producer (see `MP4SegmentMuxer.audioDelaySeconds`).
@@ -1358,6 +1362,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packedSideAudioFallbackDurationPts: Int64 = 0,
         bufferAheadSegments: Int = 10,
         prefetchDiskBudgetBytes: Int = 0,
+        prefetchDiskBudgetIsTotal: Bool = false,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioMoovPrimeKnownUnobtainable: Bool = false,
         audioDelaySeconds: Double = 0,
@@ -1371,6 +1376,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             audio.map { MP4SegmentMuxer.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.bufferAheadSegments = bufferAheadSegments
         self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
+        self.prefetchDiskBudgetIsTotal = prefetchDiskBudgetIsTotal
         self.demuxer = demuxer
         self.sideAudioDemuxer = sideAudioDemuxer
         // Packed side audio: synthesize timestamps from ID3 PRIV anchor; TS-side sessions use real timestamps.
@@ -1854,6 +1860,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
+        let footprintLabel = prefetchDiskBudgetIsTotal ? "total" : "forward"
         var wedgeDetector = detectWedge && !isLive
             ? BackpressureWedgeDetector(
                 breakThresholdSeconds: Self.backpressureWedgeBreakThresholdSeconds,
@@ -1864,12 +1871,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         while !checkShouldStop() {
             if cache.awaitPrefetchDiskHeadroom(head: head,
                                                budgetBytes: prefetchDiskBudgetBytes,
+                                               totalBudget: prefetchDiskBudgetIsTotal,
                                                timeout: 1.0) {
                 if parked >= Self.prefetchDiskParkLogThresholdSeconds {
                     EngineLog.emit(
                         "[HLSSegmentProducer] #207 prefetch disk park released (\(context)) head=\(head) "
                         + "after=\(parked)s cacheTarget=\(cache.targetIndex) "
-                        + "forward=\(cache.forwardBytes / (1 << 20)) MiB",
+                        + "\(footprintLabel)=\(prefetchDiskBudgetIsTotal ? cache.totalBytes : cache.forwardBytes) B",
                         category: .session
                     )
                 }
@@ -1880,7 +1888,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 nextLogAt += 30
                 EngineLog.emit(
                     "[HLSSegmentProducer] #207 prefetch disk PARK (\(context)) head=\(head) "
-                    + "cacheTarget=\(cache.targetIndex) forward=\(cache.forwardBytes / (1 << 20)) MiB "
+                    + "cacheTarget=\(cache.targetIndex) "
+                    + "\(footprintLabel)=\(prefetchDiskBudgetIsTotal ? cache.totalBytes : cache.forwardBytes) B "
                     + "budget=\(prefetchDiskBudgetBytes / (1 << 20)) MiB parked=\(parked)s "
                     + "(opt-in prefetch full; resumes as playback advances)",
                     category: .session

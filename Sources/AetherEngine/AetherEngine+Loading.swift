@@ -715,6 +715,7 @@ extension AetherEngine {
             sequentialOrigin: loadedOptions.sequentialOrigin,
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: loadedOptions.forwardBufferSegments,
+            diskCacheBudgetBytes: loadedOptions.diskCacheBudgetBytes,
             shortFirstSegmentSeconds: loadedOptions.shortFirstSegmentSeconds
         )
         // AE#464: every producer this session builds reads it off the session. Set before start().

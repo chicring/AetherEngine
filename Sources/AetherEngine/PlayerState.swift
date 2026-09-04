@@ -559,6 +559,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// remote server directly.
     public var forwardBufferSegments: Int?
 
+    /// Explicit disk budget for the loopback HLS segment cache, in bytes. When positive, the producer
+    /// prefetches ahead until this total segment-cache budget is reached, then follows playback as
+    /// eviction frees room. The engine keeps a small AVPlayer safety window and may temporarily exceed
+    /// the value when that minimum window alone is larger; the effective budget is also capped at a
+    /// quarter of the temporary volume's free space. `nil` (or a non-positive value) keeps the automatic
+    /// budget derived from free space. This takes precedence over `forwardBufferSegments` and is ignored
+    /// for `nativeRemoteHLS`.
+    public var diskCacheBudgetBytes: Int64?
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on
@@ -666,6 +675,7 @@ public struct LoadOptions: Sendable, Equatable {
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
+        diskCacheBudgetBytes: Int64? = nil,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
@@ -706,6 +716,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
+        self.diskCacheBudgetBytes = diskCacheBudgetBytes
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds
