@@ -15,6 +15,80 @@ the public-API contract.
   safety window and the existing quarter-of-free-space guard. `nil` keeps the existing
   `forwardBufferSegments` behavior.
 
+## [6.68.1] - 2026-09-05
+
+### Fixed
+
+- **A software session is built on the gravity the host asked for, instead of on the layer's own
+  default (#489).** `videoGravity` reached the software display layer through its setter only, so a
+  value set before playback started was dropped when the load built the host, and the identical
+  value set again mid-session took effect. From the outside that reads as a picture mode that works
+  only when you toggle it. The native path has re-applied the stored gravity on every host build all
+  along; the software path now does too, and does it at construction, so the layer is never briefly
+  on a fill nobody asked for. Beyond the picture itself, a host that draws its own subtitle overlay
+  has to know which gravity is on screen in order to place cues against the right rectangle, and
+  while the engine's published value and the layer's real one could disagree for a whole session
+  there was nothing for it to trust.
+
+## [6.68.0] - 2026-09-05
+
+### Fixed
+
+- **A live source that goes quiet for a moment no longer commits the session to an item swap
+  (AE#446 round 7).** The window was served as a finished asset (ENDLIST) the instant the source
+  missed its cadence, which is the same `1.5 x TARGETDURATION` threshold that withdraws the
+  blocking-reload advert. The two decisions do not cost the same: the withdrawal is reversible and
+  free, while an item that has read an ENDLIST never reloads its playlist again, so the source
+  coming back is only expressible as an item swap and the viewer pays for it with a visible seam at
+  the end of the runway. Reported from the field on a 1 s-segment stack (TARGETDURATION 2, so the
+  threshold was 3.0 s): a 3.006 s stall in the source read closed a window with 14 s of runway still
+  ahead of the consumer, the source delivered again 0.6 s later, and the session played out its
+  runway and swapped 17 s after that, for 0.18 to 0.20 s of rebuffering the outage never required.
+  The close now waits for `3 x TARGETDURATION` of silence, and closes early only when the runway
+  left in front of the consumer falls under `2 x TARGETDURATION`, because a consumer that walks off
+  the end of an open window gets no `didPlayToEndTime` to hand the session a controlled swap. The
+  wait is bounded above by the producer's own patience with a source that cuts nothing (35 s, after
+  which the read is given up and a window not yet closed never would be), which is reachable at the
+  large TARGETDURATION a bursty relay seals from its arrival cadence. The
+  ceiling this spends is measured rather than assumed: with the close suppressed and the advert
+  withdrawn, AVPlayer kept fetching the resident runway for 77 s past a freeze at TARGETDURATION 6,
+  about 13 target durations (20 fetches, 13 `-12888` lines across 20 polls), and it stopped on the
+  last listed segment rather than on patience. The
+  harness leg names the new outcome (`VERDICT: live-freeze gap absorbed`), and both ends of a late
+  episode are now stated in the log, including the case where the source comes back and nothing was
+  ever closed. Covered by `Issue446OutageCloseDeadlineTests`.
+
+- **A seek landing reads the axis its own run carries, instead of inheriting one measured
+  elsewhere (AE#481).** The AE#418 axis is published once, at the advertised start of the segment
+  whose gate re-aimed below its boundary, and it then stood for the whole timeline above that seam.
+  The picture says the offset is narrower than that: it belongs to the RUN that segment opened. A
+  seek that opens a new run at a segment the producer wrote on its planned position lands on a
+  source-true stretch, and nothing looked, so `capErr` sat at +9.017 from the landing to the end of
+  the session and every cue placed from the clock was 9 s early, permanently. A seek burst heals it
+  inside a second, which is why ten rounds of #418 never saw it standing: only a session whose last
+  re-anchoring seek is also its last seek keeps the error. A landing now takes the reading itself,
+  anchored on the segment the local server answered first after the seek. Measured on the same arms:
+  `capErr` 9.037 to the end of the session before, 0.037 after, with no reading moving the picture
+  anywhere else (+0.008 to +0.017 across every publication).
+
+### Added
+
+- **`prepareForItemReplacement()`: a host can ask for the AE#158 in-place item handover on a
+  foreground episode change.** The handover that keeps a PiP window alive across a native->native
+  `load()` was gated on `pictureInPictureActive` alone, so a host that mounts the engine's own
+  `AVPlayerLayer` still took the nil-item gap on every next-episode transition, and on tvOS that gap
+  can leave the layer black while the successor's audio and clock run. The request is one-shot:
+  consumed by the next `load()`, cancelled by `stop()`, ignored when the outgoing backend is not
+  native. When the item is kept, the native host now retires the outgoing session's publishers
+  before the engine subscribes for the successor, so a previous episode's EOF, readiness, rate and
+  clock are not replayed into the new session; the same-content #93 recovery swap is unchanged.
+  Main-actor hops queued by the outgoing item's KVO drop on their session guard instead of writing
+  into the successor, layer readiness included: the handover leaves the outgoing item mounted on the
+  layer, so that observer is the one that goes on reporting through the gap. The `nativeRemoteHLS`
+  bypass now consumes the handover too; it used to drop
+  the item to nil across a native->native load even while PiP was active. Covered by
+  `PiPItemHandoverTests`.
+
 ## [6.67.2] - 2026-09-03
 
 ### Changed

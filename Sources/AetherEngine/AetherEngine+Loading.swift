@@ -489,12 +489,17 @@ extension AetherEngine {
         // generic live HLS origins (IPTV / Stremio add-on channels) enforce per-stream Referer /
         // User-Agent / Authorization headers, so LoadOptions.httpHeaders rides into the AVURLAsset (#119).
         // forwardBufferDuration: 0 = system-adaptive; the 4 s VOD floor caused a 3-4 s black screen on live startup.
+        // AE#158: consume-and-reset, mirroring the loopback callsite, so the bypass honours a PiP or
+        // host-requested handover instead of dropping the item to nil across the swap.
+        let inPlaceHandover = pendingInPlaceItemHandover
+        pendingInPlaceItemHandover = false
         if loadGeneration == bypassGeneration { recordStartupCheckpoint(.sessionConstructed) }   // #361
         host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true,
                   // AE#154: a VOD resume anchor seeks; nil keeps the live no-initial-seek contract.
                   skipInitialSeek: startPosition == nil,
+                  inPlaceSwap: inPlaceHandover,
                   contract: .init(
                       isLive: options.isLive,
                       // AE#440: the same join tail exists where AVPlayer owns the buffer; the engine only
@@ -1585,7 +1590,10 @@ extension AetherEngine {
         // SW-PiP cue mirror never delivered a cue after the frame compositor was armed. Both halves
         // of such a wiring work in isolation, which is why a dead sink here reads as a working one.
         softwareCancellables.removeAll()
-        let host = SoftwarePlaybackHost()
+        // #489: same contract as the native host two paths over, which re-applies `_videoGravity`
+        // on every build. Without it a software host came up aspect-fit whatever the app had set,
+        // and only a second write mid-session took effect.
+        let host = SoftwarePlaybackHost(videoGravity: _videoGravity)
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,

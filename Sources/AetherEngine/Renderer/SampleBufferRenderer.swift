@@ -154,8 +154,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if let settled { observer?(settled) }
     }
 
-    init() {
-        displayLayer = Self.makeDisplayLayer(isHDR: false)
+    /// #489: the gravity is a construction parameter, not something a caller assigns afterwards.
+    /// The engine holds the host app's picture mode across loads, and a layer that starts on the
+    /// default and is corrected a moment later shows one frame of the wrong fill.
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        displayLayer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own

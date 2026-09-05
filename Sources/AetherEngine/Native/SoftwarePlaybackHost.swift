@@ -483,8 +483,8 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Init
 
-    init() {
-        self.renderer = SampleBufferRenderer()
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        self.renderer = SampleBufferRenderer(videoGravity: videoGravity)
         // Default to the software decoder; load() swaps it for the
         // VT-backed one when the source's video codec is HEVC.
         self.videoDecoder = SoftwareVideoDecoder()

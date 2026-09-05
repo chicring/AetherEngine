@@ -638,6 +638,11 @@ private final class FreezeRecoveryCounters: @unchecked Sendable {
     /// closed window was still feeding the consumer it is the defect this round fixed.
     private(set) var handedToHost = false
     private(set) var handedWhileRunwayPlaying = false
+    /// AE#446 round 7: whether the window was ever closed, and whether the source came back inside the
+    /// close deadline. A run where the source went late and returned without an ENDLIST is not a run
+    /// with a missing rejoin, it is a run with nothing to rejoin, and the leg used to fail it.
+    private(set) var windowClosed = false
+    private(set) var gapAbsorbed = false
     private var runwayEnded = false
     private var didSwap = false
     /// AE#454: the two stamps the hand-off is argued from. The rejoin names the place it is coming
@@ -728,6 +733,10 @@ private final class FreezeRecoveryCounters: @unchecked Sendable {
             }
         }
         if line.contains("#446 the window ran out") { runwayEnded = true }
+        if line.contains("serving the rest of the window as a finished asset") { windowClosed = true }
+        if line.contains("#446 the source is cutting again and the window was never closed") {
+            gapAbsorbed = true
+        }
         if line.contains("requesting host retune") || line.contains("publishing liveSourceReset") {
             handedToHost = true
             if !runwayEnded { handedWhileRunwayPlaying = true }
@@ -1006,7 +1015,15 @@ private func liveFreezeTest(url: URL, seconds playSeconds: Double, dvrWindow: Do
     // not see. It read as healthy on every seconds-based number (the playhead had not moved, so it
     // had not moved WRONG) while the session sat on its last frame for the rest of the run, because
     // the no-cut watchdog had abandoned the read the recovery was waiting on 35 s in.
-    if expectsRecovery, counters.fetchedAfterSwap.isEmpty {
+    // AE#446 round 7: the source went late and came back before the window's close deadline. Nothing
+    // was committed, so there is nothing to rejoin and the item that was playing is still playing; the
+    // position checks below decide the run exactly as they do for any other.
+    let absorbedGap = counters.gapAbsorbed && !counters.windowClosed
+    if absorbedGap {
+        print("  the gap was absorbed: the source came back inside the close deadline, the window was "
+              + "never closed as a finished asset, and no item was swapped")
+    }
+    if expectsRecovery, counters.fetchedAfterSwap.isEmpty, !absorbedGap {
         if counters.handedWhileRunwayPlaying {
             print("VERDICT: live-freeze NO REJOIN (the source read was given up while the closed "
                   + "window was still feeding the consumer, so the source coming back was never "
@@ -1059,6 +1076,11 @@ private func liveFreezeTest(url: URL, seconds playSeconds: Double, dvrWindow: Do
                      + "it held, for %dms, before the placement landed)",
                      flash.above, flash.below, flash.spanMS))
         return 1
+    }
+    if absorbedGap {
+        print(String(format: "VERDICT: live-freeze gap absorbed (no ENDLIST, no swap; largest step "
+                     + "%.2fs, advanced %.2fs after the freeze)", maxForwardSnap, advanceAfterFreeze))
+        return 0
     }
     print(String(format: "VERDICT: live-freeze position held (largest step %.2fs, advanced %.2fs after the freeze)",
                  maxForwardSnap, advanceAfterFreeze))

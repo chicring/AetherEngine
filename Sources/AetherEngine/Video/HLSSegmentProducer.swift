@@ -578,7 +578,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private static let liveSegmentStallTimeoutSeconds: TimeInterval = 10
     /// Source-starvation timeout: feed trickles (slow/flaky CDN). Ingest retries ~31 s then terminates;
     /// escalating at the tight wedge timeout turns one slow segment into a full host retune (device repro: hung on -1001).
-    private static let liveSourceStarvationTimeoutSeconds: TimeInterval = 35
+    static let liveSourceStarvationTimeoutSeconds: TimeInterval = 35
     /// Read rate (pkt/s) threshold classifying a no-cut stall as cutter-wedge vs. source-starvation.
     /// Healthy 1080p25: ~60 pkt/s. Rate-based to avoid misreading a trickle that accumulated a high count (Alex Berlin: 137 pkts/13 s = 10.5 pkt/s).
     static let liveWedgeProgressRateThreshold: Double = 40
