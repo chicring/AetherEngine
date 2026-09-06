@@ -15,6 +15,59 @@ the public-API contract.
   safety window and the existing quarter-of-free-space guard. `nil` keeps the existing
   `forwardBufferSegments` behavior.
 
+## [6.68.3] - 2026-09-06
+
+### Fixed
+
+- **A seek's window is closed at both ends, not just at the request (#491 round 2).** The seek
+  generation moves when a seek is REQUESTED, and the read position moves when the reposition runs,
+  tens of milliseconds later. A packet read in between carries the OLD position's bytes under the
+  NEW generation, which is the pass condition of every gate that compares generations, so round 1's
+  guards let it through. One video packet is enough: on a backward seek its timestamp is past the
+  target, so the skip threshold passes it and it becomes the renderer's frontier, and since the
+  frontier is a maximum no frame from the new position can lower it again, leaving the reported
+  cushion carrying the seek distance for the rest of the session. The audio half of the same window
+  measures a packet enqueued after the landing against a clock the landing has not re-anchored yet,
+  and a lead the size of the seek reads as an exhausted one that pauses the clock for a rebuffer
+  that is not happening. The demux loop now stands still from the bump until the source and the
+  clock are both at the target, and discards anything a read took out of that window. Measured on a
+  3000 s fixture with twelve alternating large seeks two seconds apart: 5 to 9 packets per run
+  entered the pipeline from a source that had not been repositioned yet and two of three runs took
+  a spurious rebuffer, against zero of either afterwards, with the seek landing latency unchanged
+  (59.7 ms against 60.7 ms over 24 seeks).
+
+## [6.68.2] - 2026-09-05
+
+### Fixed
+
+- **A seek arms its references before the reposition instead of after it (#491).** `seek(to:)`
+  flushes the decoders, the renderer and the audio output and then awaits the demuxer reposition,
+  and the decode thread keeps running under that await. The skip thresholds that reject a pre-seek
+  frame were installed only after the landing, so for the length of the reposition a frame decoded
+  from a packet read before the seek reached the renderer unopposed and was taken. One such frame
+  is enough to poison two single-valued readings: it becomes the base the inter-frame spacing is
+  measured from and it restores the enqueued frontier, so the first real post-seek frame reports
+  the whole seek distance as one interval and a negative cushion of the same size. The audio branch
+  of the demux loop had no generation check at all, unlike the video branch, so a pre-seek audio
+  packet decoded across the flush landed in the emptied audio queue and set the marker the lead
+  check measures against. With the clock re-anchored at the target and the marker still hundreds of
+  seconds behind it, the lead read as exhausted and the clock was paused for a rebuffer that was not
+  happening, on an ordinary forward seek. Three gates now stand, because no single one covers both
+  directions: the thresholds are armed before the await, the decoder callback drops a frame whose
+  decode generation is not the live one (the only gate a backward seek has, and the one that also
+  covers the hardware decoder answering on its own thread), and the audio branch re-checks the
+  generation before decoding and again before enqueueing.
+
+### Changed
+
+- **`[Deinterlace] engaged` states what the graph cost to build (#492).** The graph is torn down at
+  every seek so stale temporal references never cross a discontinuity, which means an interlaced
+  source pays a build per seek that a progressive one never pays. Measured at 0.8 to 3.6 ms for 480i
+  after warm-up against 35.6 ms for the cold warm-up graph, so on that geometry it is well inside a
+  59.94 fps frame budget. The number is on the line now because the hwframe pool scales with the
+  picture, and a report comparing per-seek frame drops between interlaced and progressive sessions
+  needs it from the session rather than by inference.
+
 ## [6.68.1] - 2026-09-05
 
 ### Fixed
