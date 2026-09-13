@@ -630,6 +630,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // CDN stall threshold: no bytes for this long triggers reconnect. Instance-captured (see
     // `connStallTimeout`) so tests can shorten it; the shipped value is this one.
     private static let connStallTimeoutDefault: TimeInterval = 20
+    // The faster, demand-side ladder. Field case: an edge that answers the range and then
+    // drips — a few KB every couple of seconds — re-arms the delivery-gap watchdog (#309)
+    // on every drip while the read starves; one such stall cost 153 s against a 20 s gap
+    // threshold. While a read cannot be served, a generation that has moved the window
+    // frontier less than `fastStallMinDelivery` within `fastStallTimeout` is rebuilt rather
+    // than waited out. The frontier only grows on live-connection appends — resident spans,
+    // the detour cache and tail prefetches never touch it — so the meter reads the one thing
+    // that matters: what this connection delivered to this read. A "window cannot serve"
+    // clock would reset on every drip that lands exactly at the read position; a delivery
+    // floor does not.
+    private static let fastStallTimeout: TimeInterval = 1.0
+    // The floor a starved read demands of its connection: far above the observed drip
+    // (~1 KB/s) and far below the slowest legitimate sustained delivery (~8 KB/s for a
+    // 64 kbit/s audio track), so a throttled link counts as dead and a merely slow one
+    // does not.
+    private static let fastStallMinDelivery: Int64 = 4 * 1024
     /// #450: fraction of the stall threshold at which a generation that has seen no first byte is
     /// REPORTED. Derived from the threshold rather than set beside it so the invariant holds at
     /// every value of the threshold, the shortened ones tests run with included: the witness speaks
@@ -1703,6 +1719,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #281 retest: fixed once per read, so a loop that wakes repeatedly cannot keep extending
         // its own patience for the speculative fetch.
         var tailWaitDeadline: Date?
+        // Fast-stall accounting, one tuple per starved stretch: which generation it belongs to,
+        // the frontier it started from, and when it started. Re-armed whenever the obligation
+        // changes — a new generation, a rewound frontier, a stretch where the read was waiting
+        // on a path that is not this connection — and slid forward whenever the generation
+        // delivers at least `fastStallMinDelivery` within one window.
+        var fastStallGeneration = -1
+        var fastStallFrontier: Int64 = 0
+        var fastStallSince: Date?
         func msSince(_ t: DispatchTime) -> Double {
             Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
         }
@@ -1826,6 +1850,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     _ = winCond.wait(until: min(deadline, readDeadline))
                     winCond.unlock()
                     diag.recordTailWait(ms: msSince(waitStart))
+                    // The wait belonged to the speculative fetch, not to the streaming
+                    // connection: it owes the starved clock nothing for this stretch.
+                    fastStallSince = nil
                     continue
                 }
             }
@@ -1890,6 +1917,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         timedReconnect(seek: true, at: curPosition)
                         continue
                     }
+                    // The fetch below parks this read on the detour arm while the streaming
+                    // connection idles; its silence during that stretch is not a stall.
+                    fastStallSince = nil
                     let detourStart = DispatchTime.now()
                     switch serveFromDetour(into: buf.advanced(by: totalRead),
                                            maxLen: requestSize - totalRead,
@@ -2055,16 +2085,81 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
 
             if !ended {
-                // Wait for the live connection to fill forward. A false return
-                // means connStallTimeout elapsed with no data (socket stall).
+                // Wait for the live connection to fill forward. The wait polls at
+                // fastStallTimeout granularity rather than blocking for connStallTimeout:
+                // a starved read must judge its generation on the fast clock, and a
+                // completely silent connection produces no delivery broadcast that would
+                // wake this wait any earlier.
                 let waitStart = DispatchTime.now()
-                let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
+                let waitUntil = min(Date(timeIntervalSinceNow: min(Self.fastStallTimeout, connStallTimeout)),
+                                    readDeadline)
+                let signaled = winCond.wait(until: waitUntil)
+                // Still under the lock: refresh the starvation clock against the live
+                // generation. A connection not on the link owes the read nothing (the
+                // ended/refill paths own that recovery); one that delivered the floor
+                // slides the window; one that did neither is judged below.
+                let frontierNow = winStart + Int64(window.count)
+                let deliveryGapNow = secondsSinceNetworkDelivery()
+                // `ended` was sampled before the wait; a generation can end while the wait
+                // sleeps. Route that through the ended ladder next iteration rather than
+                // letting a stall verdict act on a connection that is already over.
+                let endedNow = connEnded
+                var fastStallFired = false
+                var starveElapsed: TimeInterval = 0
+                var starveDelivered: Int64 = 0
+                if !isLive && !endedNow {
+                    if activeTransfer == nil || connGeneration != fastStallGeneration
+                        || frontierNow < fastStallFrontier {
+                        fastStallGeneration = connGeneration
+                        fastStallFrontier = frontierNow
+                        fastStallSince = Date()
+                    } else if frontierNow - fastStallFrontier >= Self.fastStallMinDelivery {
+                        fastStallFrontier = frontierNow
+                        fastStallSince = Date()
+                    } else if let since = fastStallSince {
+                        starveElapsed = Date().timeIntervalSince(since)
+                        starveDelivered = frontierNow - fastStallFrontier
+                        // A generation that never delivered a first byte gets the longer
+                        // witness delay: on a high-RTT link the answer is legitimately
+                        // late, and rebuilding at 1 s would burn the never-productive
+                        // budget on a healthy source.
+                        let threshold = connFirstDataSeen
+                            ? Self.fastStallTimeout : firstByteWitnessDelay
+                        fastStallFired = starveElapsed >= threshold
+                    }
+                }
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
                 // Check deadline before stall handling to avoid misrouting a
                 // deadline wake as a socket stall (which would reconnect).
                 if isPastReadDeadline { continue }
-                if !signaled {
+                if endedNow { continue }
+                if fastStallFired {
+                    fastStallSince = nil
+                    // The rebuild pays the same unproductive budget as the conn-stall
+                    // ladder: a permanently wedged origin must give up, not rebuild once
+                    // a second forever. A generation that delivered before it dried up
+                    // holds streak=0 here, so the field case reconnects with no backoff.
+                    if recordReconnectAndShouldGiveUp() {
+                        EngineLog.emit("[AVIOReader] \(label) fast-stall gave up at offset \(frontierNow) (\(unproductiveReconnects) unproductive)", category: .demux)
+                        emitNetworkPhase(.exhausted)
+                        return totalRead > 0 ? Int32(totalRead) : -1
+                    }
+                    EngineLog.emit(
+                        "[AVIOReader] \(label) starved \(String(format: "%.1f", starveElapsed))s with \(starveDelivered)B delivered at offset \(frontierNow); rebuilding connection (fast-stall)",
+                        category: .demux)
+                    lastUnplannedReconnectAt = Date()
+                    emitNetworkPhase(.reconnecting)
+                    let backoffStart = DispatchTime.now()
+                    backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
+                    diag.recordBackoff(ms: msSince(backoffStart))
+                    timedReconnect(seek: false, at: frontierNow)
+                    continue
+                }
+                // A false return now means the ~1 s poll elapsed with no wake, not the
+                // stall timeout. The ladder keeps its shipped meaning by gating on the
+                // measured delivery gap itself.
+                if !signaled && deliveryGapNow >= connStallTimeout {
                     if recordReconnectAndShouldGiveUp() {
                         EngineLog.emit("[AVIOReader] \(label) stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
                         emitNetworkPhase(.exhausted)   // ladder spent; the reopen owns recovery, the source is still down (#410)
