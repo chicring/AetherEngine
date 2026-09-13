@@ -30,6 +30,10 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// ended SHORT of its Content-Length - the observable behind the sequential reader's
         /// EIO-not-EOF distinction (a lost source must not read as end-of-media).
         case serveThenDrop(afterBytes: Int64)
+        /// The throttled-CDN shape: answer 206, deliver `afterBytes` normally, then keep the
+        /// socket alive dripping `tickBytes` every `tickUs` forever. Every drip is a delivery,
+        /// so a gap watchdog re-arms on each one while the read starves all the same.
+        case serveThenTrickle(afterBytes: Int64, tickBytes: Int, tickUs: useconds_t)
     }
 
     let port: UInt16
@@ -274,6 +278,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
+        var trickle: (after: Int64, tick: Int, us: useconds_t)? = nil
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
@@ -281,6 +286,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
             silentAfter = max(0, afterBytes)
         case .serveThenDrop(let afterBytes):
             dropAfter = max(0, afterBytes)
+        case .serveThenTrickle(let afterBytes, let tickBytes, let tickUs):
+            trickle = (max(0, afterBytes), max(1, tickBytes), max(0, tickUs))
         case .status(let code, let retryAfter):
             let header = "HTTP/1.1 \(code) Status\r\n"
                 + (retryAfter.map { "Retry-After: \($0)\r\n" } ?? "")
@@ -342,9 +349,28 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 while !stopped { usleep(200_000) }
                 return false
             }
+            // The drip point: the socket stays open and answers with `tick` bytes every
+            // `us`, bounded by the promised range. Once the range is spent the connection
+            // parks like the silent variant. `stop()` is what releases this thread.
+            if let trickle, served >= trickle.after {
+                while served < remaining && !stopped {
+                    var pending = trickle.us
+                    while pending > 0 && !stopped {
+                        let slice = min(pending, 100_000)   // usleep is only defined below one second
+                        usleep(slice)
+                        pending -= slice
+                    }
+                    let tickN = min(Int64(trickle.tick), remaining - served)
+                    guard writeBody(fd, Array(chunk[0..<Int(tickN)])) else { return false }
+                    served += tickN
+                }
+                while !stopped { usleep(200_000) }
+                return false
+            }
             var n = Int(min(Int64(chunkBytes), remaining - served))
             if let silentAfter { n = Int(min(Int64(n), silentAfter - served)) }
             if let dropAfter { n = Int(min(Int64(n), dropAfter - served)) }
+            if let trickle { n = Int(min(Int64(n), trickle.after - served)) }
             guard writeBody(fd, Array(chunk[0..<n])) else { return false }
             served += Int64(n)
             if throttleUs > 0 { usleep(throttleUs) }
