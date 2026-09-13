@@ -271,7 +271,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // a healthy session emits this once. Which target is pinned is half of every field
             // trace about a redirecting origin (#307, #377, #380), and behind `#if DEBUG` it was
             // readable only by the reporters who happened to build the engine themselves.
-            EngineLog.emit("[AVIOReader] Cached resolved URL host=\(resolved.host ?? "?") url=\(resolved.absoluteString)", category: .demux)
+            EngineLog.emit("[AVIOReader] Cached resolved URL host=\(resolved.host ?? "?")", category: .demux)
         }
     }
 
@@ -1156,8 +1156,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     let pumpRefusal = (!gotData && Self.isResolvedExpiryStatus(pumpStatus)) ? pumpStatus : 0
                     if pumpRefusal != 0 {
                         EngineLog.emit(
-                            "[AVIOReader] \(label) data connection refused status=\(pumpRefusal) at offset 0 "
-                            + "url=\(requestURL().absoluteString); "
+                            "[AVIOReader] \(label) data connection refused status=\(pumpRefusal) at offset 0; "
                             + "skipping the size probes, trying one unranged GET",
                             category: .demux)
                         fileSize = -1
@@ -1274,7 +1273,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         guard status != 0 else { return }
         EngineLog.emit(
-            "[AVIOReader] \(label) source refused: HTTP \(status) url=\(requestURL().absoluteString); failing the open typed",
+            "[AVIOReader] \(label) source refused: HTTP \(status); failing the open typed",
             category: .demux)
         markClosed()
         close()
@@ -3262,7 +3261,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit(
                 "[AVIOReader] \(label) gen=\(generation) rejected response status=\(status) at offset \(requestedOffset)"
                     + respondingTargetDescription(respondedBy)
-                    + " url=\(respondedBy?.absoluteString ?? "?")"
                     + (retryAfter > 0 ? " retryAfter=\(Int(retryAfter))s" : ""),
                 category: .demux
             )
@@ -3359,8 +3357,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     self.noteOriginRefusal(status: status, respondedBy: respondedBy)
                 }
                 EngineLog.emit(
-                    "[AVIOReader] \(self.label) streaming GET refused status=\(status)"
-                    + " url=\(respondedBy?.absoluteString ?? "?"); hanging up at the header",
+                    "[AVIOReader] \(self.label) streaming GET refused status=\(status); hanging up at the header",
                     category: .demux)
             }
         ) { [weak self] data in
@@ -4701,10 +4698,9 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
         }
         guard http.statusCode == 206 else {
             let status = http.statusCode
-            let urlSuffix = http.url.map { " url=\($0.absoluteString)" } ?? ""
             rejection = AVIOReader.suffixRangeStatusDeclinesTheForm(status)
-                ? ("status=\(status) (no suffix range support)\(urlSuffix)", .declinedByOrigin)
-                : ("status=\(status) (about the resource, not the range form)\(urlSuffix)", .unrelated)
+                ? ("status=\(status) (no suffix range support)", .declinedByOrigin)
+                : ("status=\(status) (about the resource, not the range form)", .unrelated)
             completionHandler(.cancel)
             return
         }
