@@ -54,6 +54,26 @@ struct Issue436ResumeRateTests {
         #expect(audio.avPlayer.defaultRate == 1.25)
     }
 
+    @Test("a speed change while paused stays paused: only the remembered speed moves")
+    func pausedTransportIgnoresRateWrite() {
+        // Writing `rate` on a paused player starts playback and arms the readyToPlay
+        // re-assert via playIntent: the session keeps reporting paused while the
+        // transport plays behind its back. Only the resume speed may move.
+        let host = NativeAVPlayerHost()
+        host.play()
+        host.pause()
+        host.setRate(1.5)
+        #expect(host.avPlayer.rate == 0)
+        #expect(!host.transportIntentIsPlaying)
+        #expect(host.avPlayer.defaultRate == 1.5)
+
+        let audio = AudioAVPlayerHost()
+        audio.pause()
+        audio.setRate(1.5)
+        #expect(audio.avPlayer.rate == 0)
+        #expect(audio.avPlayer.defaultRate == 1.5)
+    }
+
     @Test("seeding the resume rate never asserts play")
     func seedingDoesNotStartPlayback() {
         let host = NativeAVPlayerHost()

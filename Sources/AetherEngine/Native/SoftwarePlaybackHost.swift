@@ -1202,7 +1202,10 @@ final class SoftwarePlaybackHost {
         // right after load(), before the demux/feeder loop armed the clock, wedged the
         // delayed-rate-change machinery and froze live sessions on the first frame; the arming
         // seekClock picks up lastRate instead (#107).
-        if clockArmed {
+        // A parked clock takes the same rule: writing the synchronizer rate restarts it while
+        // isPlaying stays false — a paused session that only wanted a new resume speed ends up
+        // playing behind the client's back.
+        if clockArmed && isPlaying {
             audioOutput?.setRate(newRate)
         }
     }
