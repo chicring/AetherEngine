@@ -10,6 +10,24 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stream-copied Dolby Atmos track is declared as object audio in the master playlist.** The
+  loopback master's `EXT-X-MEDIA:TYPE=AUDIO` tag carried no `CHANNELS` attribute at all. Apple's HLS
+  Authoring Specification makes it required on every audio rendition, and for Dolby Digital Plus with
+  Joint Object Coding it is the only playlist-level statement that the rendition carries objects, since
+  `CODECS` stays `ec-3` for JOC and non-JOC alike (#34) and the `dec3` box is a layer below. With
+  nothing above the segments saying "object audio", AVFoundation settled on the bed and an Atmos
+  bitstream that had been stream-copied intact reached an Atmos-capable receiver as 5.1 PCM. The
+  engine already knew: `HLSVideoEngine` latches the E-AC-3 `profile == 30` verdict and logs
+  `EAC3+JOC Atmos: stream-copy engaged`, and nothing carried that up to the playlist builder. The
+  rendition is now advertised `CHANNELS="16/JOC"` when the JOC bitstream actually reached the
+  segments, and with its served bed count otherwise. The JOC form is gated on the delivery being a
+  stream copy as well as on the probe, so a JOC source that fell back to the audio bridge claims
+  only the channels it still has, and the count is read from the codec parameters the muxer was
+  given rather than the source's. `CODECS` and the `EXT-X-STREAM-INF` line are byte-identical
+  before and after.
+
 ### Tests and CI
 
 - **Every wait in the suite now follows the rule in `TestWaiting.swift`.** An audit of 79 test files found around 80 places where a step that has to happen carried a wall-clock bound of its own (`waitFor(upTo:)`, hand-rolled `Date()` loops, short semaphore and XCTest timeouts) or a fixed sleep stood in for an observable state, the pattern behind four of the five CI flakes fixed in 7.32.3. Those now wait unbounded under a `.timeLimit`, or wait for the state itself; sync helpers that cannot await keep a generous bound. `try?` around loop sleeps became `try`. Bounds that are the assertion (must not happen within n seconds) stay, and latency assertions that are the point of their test stay with their margin unchanged.

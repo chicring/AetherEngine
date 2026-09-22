@@ -216,6 +216,19 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Two channels or fewer have no surround to carry", docs)
     }
 
+    // MARK: - The Atmos rendition's CHANNELS value
+
+    /// docs/formats.md and docs/architecture.md both print the CHANNELS value a stream-copied
+    /// E-AC-3 JOC rendition is advertised with, and the object count in it is the part a reader
+    /// checks against Dolby's delivery kit. If the engine ever sources it from the `dec3` box's
+    /// `complexity_index_type_a` instead of stating it, both sentences stop being true at once.
+    func testAtmosRenditionChannelsValueIsWhatTheDocsSay() throws {
+        let docs = try documentation()
+        XCTAssertEqual(VideoSegmentProvider.atmosChannelsAttribute, "16/JOC",
+                       "documented as the object count, a slash, then JOC")
+        assertDocumented(#"`CHANNELS="16/JOC"`"#, docs)
+    }
+
     // MARK: - External subtitle ids
 
     /// A host tells its own tracks from the engine's by this base, and docs/api.md prints the number.
