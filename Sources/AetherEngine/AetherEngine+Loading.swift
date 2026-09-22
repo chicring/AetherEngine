@@ -2048,7 +2048,12 @@ extension AetherEngine {
         audioStreamIndex: Int32?,
         expectedGeneration: UInt64,
         discTitleIDOverride: Int? = nil,
-        resumeOverride: Double? = nil
+        resumeOverride: Double? = nil,
+        /// False only for the #357 torn-down resume, which has no transport left to read:
+        /// there the mount flag (`LoadOptions.autoplay`) decides, exactly as
+        /// `reloadAtCurrentPosition` partitions it. Every other caller owns a live session
+        /// whose transport this rebuild must preserve.
+        sessionOwnsTransport: Bool = true
     ) async -> Error? {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
         guard loadGeneration == expectedGeneration, loadedURL != nil else {
@@ -2121,6 +2126,13 @@ extension AetherEngine {
             category: .engine
         )
 
+        // #464 round 2, same write `reloadAtCurrentPosition` makes at its call site: the rebuild
+        // comes back in the transport the session is IN, not the mount flag. selectAudioTrack /
+        // selectTitle reach here without that write, and nothing else refreshes `loadedOptions`
+        // on a pause, so a paused session used to come back playing off a stale `autoplay = true`.
+        // Read before `state = .loading`: past that line `sessionRebuildResumesPlaying` answers
+        // the parked intent of the load in flight, not this session's.
+        if sessionOwnsTransport { setLoadedAutoplay(sessionRebuildResumesPlaying) }
         state = .loading
         // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
         // parks its own rebuild position for anything that stacks behind it. Round 3 parks the
@@ -2277,7 +2289,11 @@ extension AetherEngine {
                     audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
                 presentCurrentLayer()
-                softwareHost?.play()
+                // #124 / #464 round 2: a paused session's rebuild skips the autostart; the wired
+                // isReady waypoint settles .loading -> .paused, same as a paused mount.
+                if Self.loadPerformsAutostart(loadedOptions) {
+                    softwareHost?.play()
+                }
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
@@ -2365,10 +2381,19 @@ extension AetherEngine {
                     ),
                     settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd)
                 try checkLoadCurrent(gen)
-                nativeHost?.play()
+                if Self.loadPerformsAutostart(loadedOptions) {
+                    nativeHost?.play()
+                }
             }
             try checkLoadCurrent(gen)
-            state = .playing
+            // `state = .loading` was written at the top of this rebuild and nothing between there and
+            // here publishes `.playing`, so that read below is a play() pressed while the rebuild was
+            // in flight — the press reached no pipeline. Honour it the way the mount's autostart
+            // would have; a repeat play() on a transport already rolling is a no-op.
+            if Self.loadPerformsAutostart(loadedOptions) || state == .playing {
+                if targetSoftwarePath { softwareHost?.play() } else { nativeHost?.play() }
+                state = .playing
+            }
             // Re-arm samplers: stopInternal nilled them, and the reload path bypasses public load() that normally restarts them. Without this, liveTelemetry stays nil and the stats overlay shows "-" after every audio switch.
             startMemoryProbe()
             startLiveTelemetrySampler()
@@ -2380,7 +2405,7 @@ extension AetherEngine {
             if loadedOptions.isLive, !targetSoftwarePath {
                 armLiveReloadWatchdog(generation: gen)
             }
-            EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
+            EngineLog.emit("[AetherEngine] reload: state=\(state) total=\(elapsedMs(since: reloadStart))ms", category: .engine)
         } catch is CancellationError {
             // Superseded by a newer load/stop: it owns the engine state.
             return nil
