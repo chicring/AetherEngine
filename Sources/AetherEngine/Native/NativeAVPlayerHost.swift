@@ -1707,7 +1707,21 @@ final class NativeAVPlayerHost {
         // The session may have been handed over while the seek was in flight; a retired session
         // must not restart the player under its successor.
         guard sessionID == sid else { return true }
-        avPlayer.play()
+        // A pause that landed during the re-seek was swallowed by the tcs observer's
+        // `prematureEndRecoveryInFlight` guard, so intent is the only witness left: re-check it
+        // here rather than resuming behind the client's back. The end is still suppressed (true)
+        // — a paused session must not read as a completed one — and the publish below lands the
+        // swallowed .paused so the engine converges on the pause the user asked for.
+        // `didReachEnd` rides along for symmetry with the entry guard: an end the engine
+        // synthesized mid-re-seek (the #169 tail park) must not be played past either.
+        guard playIntent, !didReachEnd else {
+            prematureEndRecoveryInFlight = false
+            timeControlStatus = avPlayer.timeControlStatus
+            return true
+        }
+        // Through play(), not avPlayer.play(): the single writer that keeps the #122 intent
+        // latch consistent with the transport it drives.
+        self.play()
         prematureEndRecoveryInFlight = false
         timeControlStatus = avPlayer.timeControlStatus
         let resumedAt = await prematureEndReading().playhead
@@ -1773,35 +1787,43 @@ final class NativeAVPlayerHost {
                 }
             }
             // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
-            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard let self else {
-                        if resumeGuard.claim() { cont.resume(returning: true) }
+                        if resumeGuard.claim() { cont.resume(returning: finished) }
                         return
                     }
-                    // Settle the clock on a real landing even if the deadline already returned (late landing).
-                    // Superseded seek: leave the newer generation's flags intact.
+                    // finished == false: the seek was cancelled, not landed. The one cancellation that
+                    // reaches this generation alive is `reengageStalledConsumer`'s cancelPendingSeeks,
+                    // which does not bump seekGeneration. It must not stamp the frozen position as the
+                    // landing or report success: the awaiting engine would then retire
+                    // `pendingRecoverySeekClockTarget` and finalize a seek AVPlayer never made (#93 --
+                    // the defect `awaitPendingSeekLanding` works around by polling position evidence,
+                    // while this Bool is the landing contract the deadline loop trusts). seekInFlight
+                    // still clears so the periodic observer un-gates and folds the real position back in.
                     if gen == self.seekGeneration {
                         self.seekInFlight = false
-                        let landed = self.avPlayer.currentTime().seconds
-                        if landed.isFinite {
-                            self.currentTime = landed
-                            // #49: settle renderedTime so sourceTime settles immediately, BUT only when the
-                            // landed frame is actually presented (playing or paused shows the target frame).
-                            // #123: while still buffering toward the target (`waitingToPlayAtSpecifiedRate`)
-                            // the picture is frozen behind it and `landed` is the target the player accepted,
-                            // not the on-screen frame; stamping it parks renderedTime (and thus sourceTime)
-                            // ahead of the picture for the whole chase, because the 100ms periodic observer is
-                            // silent while waiting and cannot walk it back. Hold renderedTime on the frozen
-                            // frame; the observer settles it to the target when playback resumes.
-                            if AetherEngine.seekLandingSettlesToTarget(
-                                bufferingTowardTarget: self.isBufferingTowardSeekTarget) {
-                                self.latestSeekRenderedTimePublished = true
-                                self.renderedTime = landed
+                        if finished {
+                            let landed = self.avPlayer.currentTime().seconds
+                            if landed.isFinite {
+                                self.currentTime = landed
+                                // #49: settle renderedTime so sourceTime settles immediately, BUT only when the
+                                // landed frame is actually presented (playing or paused shows the target frame).
+                                // #123: while still buffering toward the target (`waitingToPlayAtSpecifiedRate`)
+                                // the picture is frozen behind it and `landed` is the target the player accepted,
+                                // not the on-screen frame; stamping it parks renderedTime (and thus sourceTime)
+                                // ahead of the picture for the whole chase, because the 100ms periodic observer is
+                                // silent while waiting and cannot walk it back. Hold renderedTime on the frozen
+                                // frame; the observer settles it to the target when playback resumes.
+                                if AetherEngine.seekLandingSettlesToTarget(
+                                    bufferingTowardTarget: self.isBufferingTowardSeekTarget) {
+                                    self.latestSeekRenderedTimePublished = true
+                                    self.renderedTime = landed
+                                }
                             }
                         }
                     }
-                    if resumeGuard.claim() { cont.resume(returning: true) }
+                    if resumeGuard.claim() { cont.resume(returning: finished) }
                 }
             }
         }
@@ -1886,8 +1908,6 @@ final class NativeAVPlayerHost {
     }
 
     func setRate(_ value: Float) {
-        // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
-        playIntent = (value != 0)
         // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
         // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
         // premature-end recovery, plus AVKit's own transport and the remote command centre calling
@@ -1895,7 +1915,24 @@ final class NativeAVPlayerHost {
         // so recording the speed there is what makes it survive all of them, with no rate write in
         // anyone's resume window. Setting `rate` does not update it (AVPlayer.h), hence both.
         if value != 0 { avPlayer.defaultRate = value }
-        avPlayer.rate = value
+        // A paused transport takes only the remembered speed: writing `rate` on a paused player
+        // starts playback behind the client's back while it still believes the transport is
+        // paused. "Paused" is the transport's own reading: `timeControlStatus` is the only witness
+        // an external AVKit / command-centre pause — or resume — leaves; `playIntent` only tracks
+        // engine-routed calls, so gating on it drops the rate change (and, via
+        // `transportIntentIsPlaying`, every stall recovery) for a session that was resumed
+        // externally (the same gate AudioAVPlayerHost.setRate takes).
+        // `waitingToPlayAtSpecifiedRate` is not a pause, so a speed change mid-rebuffer or during
+        // startup spin-up still applies live.
+        if value == 0 {
+            playIntent = false
+            avPlayer.rate = 0
+        } else if avPlayer.timeControlStatus != .paused {
+            // Non-zero rate on a running transport counts as play intent (must survive
+            // replaceCurrentItem swap like play() does).
+            playIntent = true
+            avPlayer.rate = value
+        }
     }
 
     func setResumeRate(_ rate: Float) {
