@@ -4899,7 +4899,8 @@ public final class AetherEngine: ObservableObject {
                 url: placeholderURL,
                 audioStreamIndex: selection.audioTrackIndex.map { Int32($0) },
                 expectedGeneration: loadGeneration,
-                discTitleIDOverride: selection.discTitleID
+                discTitleIDOverride: selection.discTitleID,
+                sessionOwnsTransport: !resumesTornDownSession
             )
             // AE#460 follow-up: a rebuild that died leaves the session in `.error`, and this branch
             // used to return as if it had come back, so `reloadAtCurrentPosition(applying:)`
@@ -5560,7 +5561,11 @@ public final class AetherEngine: ObservableObject {
         } else if !audioAVPlayerActive, let hostIsPlaying = softwareHost?.isPlaying ?? audioHost?.isPlaying {
             state = hostIsPlaying ? .playing : .paused
         } else {
-            state = .playing
+            // AVPlayer-backed audio wires no transport status back to the engine (loadAudioNative
+            // refuses one on purpose), so the player's own status is the only read: a setRate(0)
+            // inside the seek window parks it, and landing .playing over a parked transport is the
+            // same lie the SW/audio read above exists to prevent.
+            state = audioAVPlayerHost?.avPlayer.timeControlStatus == .paused ? .paused : .playing
         }
         // AetherEngine#164: a VOD scrubbed to its final frame is parked, not playing. Override the
         // reconcile's `.playing` with an honest `.paused` (non-terminal, so the scrubber stays live and
@@ -6375,6 +6380,15 @@ public final class AetherEngine: ObservableObject {
         // Zero is a pause, not a speed: it must not become what a later resume comes back at (#436).
         if clamped != 0 { desiredRate = clamped }
         activeTransportHost?.setRate(clamped)
+        // The native video path reaches .paused through its $timeControlStatus sink; every other
+        // transport publishes no status back to the engine at all (loadSoftware/loadAudio wire none,
+        // loadAudioNative deliberately refuses one), so the pause a zero rate just made is invisible
+        // here unless the engine says it. A non-zero rate writes nothing: a paused host only remembers
+        // the speed on every path, so the transport does not move either way.
+        if clamped == 0, !(activeTransportHost is NativeAVPlayerHost) {
+            if state == .playing { state = .paused }
+            isBuffering = false
+        }
     }
 
     // MARK: - Audio / subtitle track selection
@@ -6445,7 +6459,6 @@ public final class AetherEngine: ObservableObject {
 
         EngineLog.emit("[AetherEngine] selectTitle: scheduling switch to title \(id)", category: .engine)
         let gen = loadGeneration
-        let options = loadedOptions
         let custom = isCustomSource
         Task { @MainActor [weak self] in
             guard let self = self else { return }
@@ -6466,6 +6479,11 @@ public final class AetherEngine: ObservableObject {
                     EngineLog.emit("[AetherEngine] selectTitle reload superseded before start; ignored", category: .engine)
                     return
                 }
+                // #464 round 2, same write reloadAtCurrentPosition makes: a title switch is a
+                // session-preserving rebuild, so it comes back in the session's transport, not the
+                // mount flag the snapshot above carried (a pause since load left autoplay=true).
+                self.setLoadedAutoplay(self.sessionRebuildResumesPlaying)
+                let options = self.loadedOptions
                 // URL/local disc: a full reload re-probes the new title and republishes audio/subtitle/title/
                 // duration plus re-runs the display-criteria handshake. Correct because a title switch changes
                 // content entirely (unlike the audio-switch fast path, which keeps the panel mode).
