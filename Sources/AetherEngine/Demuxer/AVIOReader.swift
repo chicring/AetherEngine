@@ -718,6 +718,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Distinct axis from unproductiveReconnects: NOT reset by seekReconnect, so parse-driven
     // seeks cannot mask a throttled origin into an infinite reconnect loop (AetherEngine#71).
     private static let rateLimitMaxStreak = 6
+    /// Consecutive ignored-Range refusals before the source is abandoned. One could be a
+    /// confused edge; four is a server that cannot seek. Internal so the rung is unit-tested.
+    static let rangeIgnoredMaxStreak = 3
     // Rate-limited attempts that keep the pinned redirect target before one attempt through the
     // source URL is spent on a fresh redirect. Three paced attempts (~7 s of ladder) ride out the
     // lingering-slot 509 of a connection-capped panel (#307 follow-up: the slot frees in seconds);
@@ -880,6 +883,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var bytesAtLastReconnect: Int64 = 0
     // Consecutive rate-limited attempts; survives seekReconnect, resets on real read progress (#71).
     private var rateLimitStreak = 0
+    // Consecutive nonzero-offset requests the origin answered with a bare 200 — its verdict
+    // that it cannot serve ranges at all. Counted on the #71 pattern: seekReconnect clears
+    // unproductiveReconnects and ≥minReconnectProgress of from-0 bytes clears it too, and a
+    // Range-ignoring server satisfies BOTH resets forever (seek to 0 streams a productive
+    // 200, every offset past it is refused), so without a dedicated axis open() loops
+    // forever against e.g. a plain `python -m http.server` or a Range-stripping proxy.
+    private var rangeIgnoredStreak = 0
 
     /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
     /// `winCond`). Stores only full-size blocks; short bodies are served once but never cached
@@ -2148,6 +2158,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let endedByRangeEnd = connEndedAtRangeEnd
             let status = connStatus
             let retryAfter = connRetryAfter
+            let rangeRefused = rangeIgnoredExceeded()
 
             if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
                 winCond.unlock()
@@ -2298,10 +2309,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
             // that parse seeks fire, so a throttled origin fails cleanly instead of looping (#71).
             let isRateLimited = Self.isRateLimitStatus(status)
+            // The ignored-Range verdict is enforced on its own axis: a Range-ignoring origin
+            // keeps resetting unproductiveReconnects (probe seeks via seekReconnect, plus the
+            // ≥minReconnectProgress a bare 200 to offset 0 streams back), so the ordinary
+            // ladder never reaches its cap and open() would hang forever.
             let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp()
-                                       : recordReconnectAndShouldGiveUp(status: status)
+                                       : rangeRefused || recordReconnectAndShouldGiveUp(status: status)
             if giveUp {
-                let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive rate-limited" : "\(unproductiveReconnects) unproductive"
+                let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive rate-limited"
+                    : rangeRefused ? "server ignored Range"
+                    : "\(unproductiveReconnects) unproductive"
                 EngineLog.emit("[AVIOReader] \(label) reconnect exhausted at offset \(frontier) status=\(status) (\(streakDesc))\(isLive ? " [live source lost]" : "")", category: .demux)
                 emitNetworkPhase(.exhausted)   // ladder spent; the reopen owns recovery, the source is still down (#410)
                 if isLive {
@@ -2509,6 +2526,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     func recordRateLimitAndShouldGiveUp() -> Bool {
         rateLimitStreak += 1
         return rateLimitStreak > Self.rateLimitMaxStreak
+    }
+
+    /// One more bare-200-to-nonzero-offset refusal, on its own axis: the streak must survive
+    /// the `seekReconnect` that parse seeks fire (the #71 shape), so it cannot piggy-back on
+    /// `recordReconnectAndShouldGiveUp`. Internal so the cap is unit-tested without a live
+    /// origin.
+    func noteRangeIgnored() {
+        rangeIgnoredStreak += 1
+    }
+
+    /// A genuine 206 at a nonzero offset proves the origin does range; the verdict is revoked.
+    func noteRangeHonored() {
+        rangeIgnoredStreak = 0
+    }
+
+    /// Whether the ignored-Range verdict has stood past `rangeIgnoredMaxStreak` refusals.
+    /// Internal so the bounded give-up is unit-tested without a live origin.
+    func rangeIgnoredExceeded() -> Bool {
+        rangeIgnoredStreak > Self.rangeIgnoredMaxStreak
     }
 
     // MARK: - Detour Block Cache (AetherEngine#69)
@@ -3368,6 +3404,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
            !liveOffsetsUnsatisfiable {
             liveOffsetsUnsatisfiable = true
             latchedJoinShape = true
+        }
+        // The bare-200-to-nonzero-offset rejection below is a capability verdict: keep it on
+        // its own axis (see rangeIgnoredStreak), where probe seeks and from-0 bodies cannot
+        // wash it out. A genuine 206 at a nonzero offset revokes the verdict.
+        if generation == connGeneration, !isLive, requestedOffset > 0 {
+            if status == 200 {
+                noteRangeIgnored()
+            } else if status == 206 {
+                noteRangeHonored()
+            }
         }
         // Issue #70: the first from-0 data connection doubles as the size probe, so the
         // playback open skips probeFileSize() entirely. Derive the total from this

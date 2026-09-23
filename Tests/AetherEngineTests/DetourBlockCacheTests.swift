@@ -142,3 +142,30 @@ struct AVIOReaderRateLimitStreakTests {
         #expect(reader.recordRateLimitAndShouldGiveUp() == true, "7th consecutive 429/503 must give up")
     }
 }
+
+/// A Range-ignoring origin (a bare `python -m http.server`, a Range-stripping proxy) answers
+/// every nonzero offset with 200, which the reader rejects — while probe seeks keep clearing
+/// unproductiveReconnects via seekReconnect and every from-0 reconnect streams a "productive"
+/// body, so the ordinary give-up ladder never trips and `avformat_open_input` never returns.
+/// The verdict rides its own streak, which survives both resets and must give up bounded.
+struct AVIOReaderRangeIgnoredTests {
+
+    @Test("ignored-Range verdict gives up only after the bounded cap")
+    func boundedGiveUp() {
+        let reader = AVIOReader(url: URL(string: "https://example.com/x.mkv")!)
+        for attempt in 1...AVIOReader.rangeIgnoredMaxStreak {
+            reader.noteRangeIgnored()
+            #expect(!reader.rangeIgnoredExceeded(), "refusal \(attempt) should keep trying")
+        }
+        reader.noteRangeIgnored()
+        #expect(reader.rangeIgnoredExceeded(), "ignored Range past the cap must give up")
+    }
+
+    @Test("a genuine ranged 206 at a nonzero offset revokes the verdict")
+    func honoredRangeResets() {
+        let reader = AVIOReader(url: URL(string: "https://example.com/x.mkv")!)
+        for _ in 0..<AVIOReader.rangeIgnoredMaxStreak { reader.noteRangeIgnored() }
+        reader.noteRangeHonored()
+        #expect(!reader.rangeIgnoredExceeded(), "a real 206 must clear the verdict")
+    }
+}
