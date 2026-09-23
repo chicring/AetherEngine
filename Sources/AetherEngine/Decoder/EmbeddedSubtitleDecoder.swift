@@ -113,8 +113,13 @@ final class EmbeddedSubtitleDecoder {
         }
         self.assPlayRes = playRes
 
-        // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
-        stream.pointee.discard = AVDISCARD_NONE
+        // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything
+        // reaches av_read_frame. A stream the producer left at AVDISCARD_ALL stays off: it was
+        // dropped on purpose (e.g. its track ends before the producer's anchor), and re-arming it
+        // would make read_frame drain its stale seek backlog one chunk at a time.
+        if stream.pointee.discard != AVDISCARD_ALL {
+            stream.pointee.discard = AVDISCARD_NONE
+        }
     }
 
     deinit {
