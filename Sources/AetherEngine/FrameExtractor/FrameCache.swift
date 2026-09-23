@@ -51,6 +51,28 @@ final class FrameCache {
         }
     }
 
+    /// Nearest stored thumbnail whose bucket is within `maxDistance` of `seconds`.
+    /// Scrub jitter sits on bucket boundaries, so a strict key miss must not decide
+    /// whether a remote fetch happens: a frame decoded a few seconds away is a better
+    /// still than a spinner while an identical-looking neighbour gets decoded again.
+    /// Snapshot callers never reach this — frame-accurate mode stays exact.
+    func nearestThumbnail(to seconds: Double, within maxDistance: Double) -> CGImage? {
+        var bestKey: Int?
+        var bestDistance = maxDistance
+        for key in thumbnailStore.keys {
+            let lo = Double(key) * thumbnailBucketSeconds
+            let hi = lo + thumbnailBucketSeconds
+            let distance = seconds < lo ? lo - seconds : (seconds >= hi ? seconds - hi : 0)
+            if distance <= bestDistance {
+                bestDistance = distance
+                bestKey = key
+            }
+        }
+        guard let key = bestKey else { return nil }
+        touch(&thumbnailOrder, key)
+        return thumbnailStore[key]
+    }
+
     func set(_ image: CGImage, mode: FrameMode, seconds: Double) {
         let key = bucket(seconds, mode: mode)
         switch mode {

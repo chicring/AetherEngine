@@ -28,6 +28,19 @@ public actor FrameExtractor {
     }
     private var currentToken: CancelToken?
 
+    /// The thumbnail decode currently on the queue, if any. A scrub request whose
+    /// target lands within `thumbnailReuseSeconds` of the in-flight target awaits the
+    /// SAME decode instead of cancelling it: jitter across a bucket boundary used to
+    /// abort one remote seek and start another on every wobble.
+    private var inFlightThumbnail: (seconds: Double, token: CancelToken, task: Task<CGImage?, Never>)?
+
+    /// How far from a stored or in-flight thumbnail a scrub request may sit and still be
+    /// served by it. A finger on a touchscreen jitters by seconds; the preview card only
+    /// needs a nearby representative frame, and every avoided miss is a remote seek plus
+    /// a megabyte-scale pull that never reaches the user's eye as a distinct image.
+    /// Var, not let, so tests and hosts can A/B it.
+    public nonisolated(unsafe) static var thumbnailReuseSeconds: Double = 5.0
+
     /// Set by `shutdown()`. Once true, the extractor refuses further
     /// work instead of lazily reopening a closed context.
     private var isShutDown = false
@@ -124,6 +137,23 @@ public actor FrameExtractor {
             scheduleIdleClose()
             return hit
         }
+        if mode == .thumbnail {
+            // Reuse window: a decoded frame a few seconds off is a better preview than a
+            // spinner while a near-identical neighbour is fetched remotely. Checked before
+            // the yield gate because it consumes no link at all.
+            if let near = cache.nearestThumbnail(to: seconds, within: Self.thumbnailReuseSeconds) {
+                scheduleIdleClose()
+                return near
+            }
+            // A nearby decode already running owns this request too: awaiting its task does
+            // not restart the remote seek, and if the caller is superseded the decode still
+            // finishes into the cache, where the next nearby request lands instantly.
+            if let inFlight = inFlightThumbnail,
+               !inFlight.token.isCancelled,
+               abs(inFlight.seconds - seconds) <= Self.thumbnailReuseSeconds {
+                return await inFlight.task.value
+            }
+        }
         // Elective thumbnails yield to a starved playback pipeline (snapshots are deliberate
         // one-shot user actions and stay ungated). Checked after the cache: hits are free.
         if mode == .thumbnail, yieldWhile?() == true {
@@ -135,6 +165,27 @@ public actor FrameExtractor {
         let token = CancelToken()
         currentToken = token
 
+        if mode == .thumbnail {
+            let task = Task<CGImage?, Never> { [weak self] in
+                guard let self else { return nil }
+                return await self.decodeAndCache(
+                    at: seconds, mode: mode, targetWidth: targetWidth,
+                    maxSize: maxSize, token: token
+                )
+            }
+            inFlightThumbnail = (seconds: seconds, token: token, task: task)
+            let image = await task.value
+            if inFlightThumbnail?.token === token { inFlightThumbnail = nil }
+            return image
+        }
+        return await decodeAndCache(
+            at: seconds, mode: mode, targetWidth: targetWidth, maxSize: maxSize, token: token)
+    }
+
+    private func decodeAndCache(
+        at seconds: Double, mode: FrameMode, targetWidth: Int,
+        maxSize: CGSize?, token: CancelToken
+    ) async -> CGImage? {
         let context = self.context
         let result = await runOnQueue { () -> FrameResult in
             if token.isCancelled { return FrameResult(image: nil) }
