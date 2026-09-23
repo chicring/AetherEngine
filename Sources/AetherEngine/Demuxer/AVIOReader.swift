@@ -1024,6 +1024,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var firstByteWitnessDelay: TimeInterval {
         min(Self.firstByteWitnessMaxSeconds, connStallTimeout * Self.firstByteWitnessFraction)
     }
+    /// The delivery-gap watchdog's FIRST check on a new generation: a beat after the witness
+    /// speaks, so the report still lands before the watchdog can act on the same silence — the
+    /// "speaks before the threshold acts" invariant holds when both share a serial queue.
+    private var firstByteActionDelay: TimeInterval {
+        firstByteWitnessDelay + 0.1
+    }
     /// High-water mark this reader ends the connection at. Mode-dependent (live absorbs a
     /// join burst the VOD value was never sized for — see the backpressure doc block) and
     /// an init parameter for the same reason `connStallTimeout` is one: a process-wide
@@ -1249,7 +1255,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     } else {
                         startPersistentConnection(at: 0)
                         if !awaitFirstPersistentData() {
-                            EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within 15s, proceeding to read-loop reconnect", category: .demux)
+                            EngineLog.emit("[AVIOReader] Persistent open (post-probe): no first byte before the open wait ended, proceeding to read-loop reconnect", category: .demux)
                         }
                     }
                 }
@@ -1278,8 +1284,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
             }
             if !tookFallback && !gotData {
-                // No first byte within 15s; read loop's stall/reconnect machinery takes over.
-                EngineLog.emit("[AVIOReader] Persistent open: no first byte within 15s, proceeding to read-loop reconnect", category: .demux)
+                // No first byte before the open wait ended (timeout or the connection ended
+                // first — e.g. a hung handshake the delivery-gap watchdog just cut); the read
+                // loop's stall/reconnect machinery takes over.
+                EngineLog.emit("[AVIOReader] Persistent open: no first byte before the open wait ended, proceeding to read-loop reconnect", category: .demux)
             }
         } else {
             // Non-prefetch (still extraction / one-shot seekable): the size is needed up
@@ -3100,7 +3108,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         transfer.startTransfer()
         // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
-        armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
+        // The first check rides just behind the first-byte witness: a generation that still has
+        // no first byte at that point is judged on the witness delay itself — the same bar the
+        // read loop's fast-stall ladder applies to a starved read on a never-delivered
+        // connection — instead of sitting out the full stall threshold. A hung TLS handshake
+        // otherwise costs the whole open (a ~12 s stall was the field case) before anyone acts.
+        armDeliveryGapWatchdog(generation: generation, after: firstByteActionDelay)
         armFirstByteWitness(generation: generation, originURL: requestURLForBudget)
         // #240: not DEBUG-only any more, and it names its reader. This is the line a field report
         // needs to answer "who is on the link": with bounded ranges every 32 MiB refill starts a
@@ -3193,6 +3206,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         let gap = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)
             / 1_000_000_000
+        // A generation that has never delivered is judged on the witness delay, not the full
+        // stall threshold — the same bar the read loop's fast-stall ladder applies to a starved
+        // read (a hung handshake or a headers-no-body response otherwise rides the link for the
+        // whole stall window while the consumer waits). Live sources keep the long threshold:
+        // a join can legitimately hold the request while the encoder's edge arrives.
+        let effectiveStall = (!isLive && !connFirstDataSeen) ? firstByteWitnessDelay : connStallTimeout
         // A held connection sitting on a full window has no read outstanding: the pump asked for a
         // budget, was told there was no room, and is waiting. Nothing is late, so there is no gap to
         // judge. The pushed path cannot reach this state -- it ends at the high water instead -- which
@@ -3212,10 +3231,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
             return
         }
-        if gap < connStallTimeout {
+        if gap < effectiveStall {
             winCond.unlock()
             // Data landed since this closure was scheduled; wait out what is left of the window.
-            armDeliveryGapWatchdog(generation: generation, after: max(0.02, connStallTimeout - gap))
+            armDeliveryGapWatchdog(generation: generation, after: max(0.02, effectiveStall - gap))
             return
         }
         connEnded = true
