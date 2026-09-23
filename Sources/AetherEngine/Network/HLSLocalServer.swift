@@ -17,6 +17,12 @@ protocol HLSSegmentProvider: AnyObject {
     /// Default forwards to `mediaSegment(at:)` without ever signalling.
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
 
+    /// Same contract for the EXT-X-MAP init segment: a remote-source start or resume keeps the
+    /// producer positioning while AVPlayer's map request already burns through its -12889
+    /// window ("No response for map"), and three of those fail the item before a byte of init
+    /// ever existed. Default forwards to `initSegment()` without ever signalling.
+    func initSegment(onSlow: (@Sendable () -> Void)?) -> Data?
+
     /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
     /// Must name a file that exists: the server stats and opens it afterwards, and a URL whose file
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
@@ -137,6 +143,7 @@ protocol HLSSegmentProvider: AnyObject {
 
 extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
+    func initSegment(onSlow: (@Sendable () -> Void)?) -> Data? { initSegment() }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
     func didServeMediaSegment(index: Int, delivered: Bool) {}
     var staticMasterPlaylistBody: String? { nil }
@@ -925,7 +932,32 @@ final class HLSLocalServer: @unchecked Sendable {
 
         case "/init.mp4":
             stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
-            let data = provider?.initSegment() ?? Data()
+            // The map request burns through the same ~3.5 s -12889 window as a media segment
+            // ("No response for map"), but the init fetch can block for tens of seconds while a
+            // remote-source producer is still positioning. Emit the early chunked header on the
+            // same threshold so a slow init rides out AVPlayer's watchdog instead of dying on it.
+            let early = EarlyHeaderState()
+            let data = provider?.initSegment(onSlow: { [weak self] in
+                guard let self, early.markSentOnce() else { return }
+                EngineLog.emit(
+                    "[HLSLocalServer] init.mp4: slow serve, sending early chunked header",
+                    category: .hlsServer)
+                _ = self.writeAll(fd: fd,
+                                  data: Self.chunkedResponseHeader(contentType: "video/mp4"),
+                                  path: "\(normalizedPath) [early header]")
+            }) ?? Data()
+            if early.wasSent {
+                guard !data.isEmpty else {
+                    // Headers are committed; abort so AVPlayer sees a truncated transfer
+                    // and retries, instead of a cacheable empty 200.
+                    EngineLog.emit(
+                        "[HLSLocalServer] init.mp4: early-header serve missed; "
+                        + "closing connection for AVPlayer retry",
+                        category: .hlsServer)
+                    return false
+                }
+                return sendChunkedBody(fd: fd, path: normalizedPath, data: data)
+            }
             if data.isEmpty {
                 return send404(fd: fd, path: normalizedPath,
                                reason: "init.mp4 empty (provider not ready?)")

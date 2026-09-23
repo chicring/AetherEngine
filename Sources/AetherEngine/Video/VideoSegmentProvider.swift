@@ -793,7 +793,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         sparseHoleWaitSlice: TimeInterval = 2.0,
         repositionRideCapSeconds: TimeInterval = 90.0,
         forwardBackpressureWaitSeconds: TimeInterval = 30.0,
-        slowServeThresholdSeconds: TimeInterval = 2.0,
+        slowServeThresholdSeconds: TimeInterval = 1.2,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
         nativeSubtitleLanguages: [String?] = [],
         nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
@@ -1196,6 +1196,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     func initSegment() -> Data? {
         return cache.fetchInit(timeout: 30.0)
+    }
+
+    /// The map fetch blocks on `fetchInit` for as long as a remote-source producer needs to
+    /// position and mux its first init — past AVPlayer's -12889 window on a slow source, which
+    /// is how a remote resume died on "No response for map" before a byte of init existed. Arm
+    /// the same one-shot signal the media-segment serve uses so the server can answer early.
+    func initSegment(onSlow: (@Sendable () -> Void)?) -> Data? {
+        guard let onSlow, !isLive else { return initSegment() }
+        let signal = SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: onSlow)
+        defer { signal.complete() }
+        return initSegment()
     }
 
     func initVersionID(forSegment index: Int) -> Int {
