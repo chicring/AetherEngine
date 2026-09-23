@@ -293,7 +293,20 @@ extension AetherEngine {
             .store(in: &cancellables)
         failure
             .compactMap { $0 }
-            .sink { [weak self] info in self?.publishError(info) }
+            .sink { [weak self] info in
+                guard let self else { return }
+                // A published session failure is terminal: AVPlayerItem.failed cannot revive and
+                // every host path that lands here has lost its session. Without a teardown the
+                // producer underneath it kept running — on an undecodable item the loopback
+                // producer's AVIOReader prefetch pumped multi-megabyte range reads for minutes
+                // after `.error` was already published. Same shape as the live-reload watchdog:
+                // tear the session down first so subscribers see the failure on an engine whose
+                // pipeline is actually stopped, then publish. `state`/`errorInfo`/`loadedURL`
+                // are untouched by stopInternal, so the error still reads and a later
+                // load()/reloadAtCurrentPosition() rebuilds as before.
+                self.stopInternal()
+                self.publishError(info)
+            }
             .store(in: &cancellables)
         didReachEnd
             .filter { $0 }
