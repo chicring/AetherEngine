@@ -241,12 +241,14 @@ struct Issue240SideReaderLinkPriorityTests {
         seeking: Bool = false, startingUp: Bool = false, videoProducing: Bool = false,
         maxYieldSeconds: Double = SideReaderLinkPolicy.maxYieldSeconds,
         valveGrantSeconds: Double = SideReaderLinkPolicy.maxYieldSeconds,
-        anchorGraceSeconds: Double = 0
+        anchorGraceSeconds: Double = 0,
+        reanchorGraceSeconds: Double = SideReaderLinkPolicy.reanchorGraceSeconds
     ) -> SideReaderLinkArbiter {
         var a = SideReaderLinkArbiter(state: { (seeking, startingUp, videoProducing) })
         a.maxYieldSeconds = maxYieldSeconds
         a.valveGrantSeconds = valveGrantSeconds
         a.anchorGraceSeconds = anchorGraceSeconds
+        a.reanchorGraceSeconds = reanchorGraceSeconds
         a.pollNanoseconds = 1_000_000
         return a
     }
@@ -341,6 +343,37 @@ struct Issue240SideReaderLinkPriorityTests {
         // What the reader then BANKS at the new position is bought by the grace window, which
         // `readerStopsWhileTheVideoPathFetches` covers; this arbiter runs with none on purpose, so
         // that applying the move is the only thing the expectation above can be measuring.
+    }
+
+    /// The move itself is bought by `hasPending`, not by a fresh grace: after it lands, a reader
+    /// whose re-anchor carries no grace yields to a fetching pump on the very next iteration.
+    /// The cues around the new playhead are the producer tap's job, so an unconditional window
+    /// here only splits the post-seek refill bandwidth.
+    @Test("a re-anchor does not re-arm the link grace")
+    func reanchorDoesNotRearmGrace() async throws {
+        let box = SubtitleForwardPrefetcher.SideReaderReanchor(
+            anchorStreamIndex: -1, fallbackDuration: 15, seekTimeout: 5)
+        box.request(10)
+
+        let harvested = try await Self.harvestedPTS(
+            link: Self.arbiter(videoProducing: true), reanchor: box)
+        #expect(box.take() == nil, "the pending move is still applied")
+        #expect(!harvested.contains { $0 >= 13 },
+                "without a re-armed grace the reader yields again right after landing")
+    }
+
+    /// The knob, for A/B: a non-zero reanchor grace restores the previous behaviour, where the
+    /// reader keeps the link through a busy pump after every move.
+    @Test("a reanchor grace re-arms the link when configured")
+    func reanchorGraceRearmsWhenConfigured() async throws {
+        let box = SubtitleForwardPrefetcher.SideReaderReanchor(
+            anchorStreamIndex: -1, fallbackDuration: 15, seekTimeout: 5)
+        box.request(10)
+
+        let harvested = try await Self.harvestedPTS(
+            link: Self.arbiter(videoProducing: true, reanchorGraceSeconds: 30), reanchor: box)
+        #expect(harvested.contains { $0 >= 13 },
+                "inside the re-armed grace the reader fetches through a busy pump")
     }
 
     /// The other wait, and the worse one: a backward seek leaves the read position far past the new

@@ -34,6 +34,15 @@ enum SideReaderLinkPolicy {
     /// with nothing in the store yet, not steady-state lookahead.
     static let anchorGraceSeconds: Double = 8
 
+    /// Grace re-armed after an in-place re-anchor (a playhead jump). Unlike the session-start
+    /// grace, this one defaults to zero: the pump's keep-set taps every embedded subtitle stream
+    /// across the region it produces, so the cues around a fresh playhead are harvested by the
+    /// producer itself, and an unconditional 8 s fetch window lands exactly on the post-seek
+    /// buffer refill that is most deadline-sensitive on a link without headroom. A reader that
+    /// re-anchored while the producer is parked fetches immediately anyway, since nothing is
+    /// producing; one that needs the link regardless still gets the yield cap's valve grant.
+    static let reanchorGraceSeconds: Double = 0
+
     /// Longest continuous yield before the side reader takes the link anyway. Longer than the seek
     /// machinery's whole budget (8 s + 4x4 s extensions + re-anchor waits, #216), so a real seek
     /// never trips it and only a stuck signal does.
@@ -132,6 +141,9 @@ final class SideReaderLinkGate: @unchecked Sendable {
 struct SideReaderLinkArbiter: Sendable {
     let state: @Sendable () -> (seeking: Bool, startingUp: Bool, videoProducing: Bool)
     var anchorGraceSeconds: Double = SideReaderLinkPolicy.anchorGraceSeconds
+    /// See `SideReaderLinkPolicy.reanchorGraceSeconds`: applied to the re-arm after an in-place
+    /// move, kept separate from the session-start grace.
+    var reanchorGraceSeconds: Double = SideReaderLinkPolicy.reanchorGraceSeconds
     var maxYieldSeconds: Double = SideReaderLinkPolicy.maxYieldSeconds
     /// How long the reader keeps the link once the cap has fired, before it starts asking again.
     /// Without a window the valve would be worthless: the cap is evaluated per loop iteration, so it

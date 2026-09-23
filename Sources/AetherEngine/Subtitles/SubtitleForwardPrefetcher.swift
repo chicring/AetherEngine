@@ -330,8 +330,12 @@ enum SubtitleForwardPrefetcher {
                 // request, so this under-claims by up to one authored gap and never over-claims.
                 store.noteHarvestAnchor(.prefetch, at: target.seconds)
                 lastCoverageNoted = -Double.infinity
+                // 再锚定不续宽限期（默认 0s）：落点附近的 cue 由 producer 的 keep-set tap
+                // 顺带收获，无条件读 8 秒只会在链路余量不足时把落地后的 buffer refill
+                // 带宽对半分。producer 停着时仲裁本来就不让阅读器等待，所以暂停下
+                // seek 的预取并不受影响。要恢复旧行为把 reanchorGraceSeconds 调回 8。
                 anchorGraceUntil = DispatchTime.now()
-                    + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
+                    + (link?.reanchorGraceSeconds ?? SideReaderLinkPolicy.reanchorGraceSeconds)
                 if let fresh = await playhead() { playheadSnapshot = fresh }
             }
 
