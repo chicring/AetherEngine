@@ -75,6 +75,7 @@ func printUsage() {
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
+                 [--switch-rate <rate>[@ms]]...
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
@@ -754,6 +755,18 @@ if first == "play" {
             milliseconds: ms,
             delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
+    // `<rate>[@ms]`, repeatable; delays are absolute ms after the load returns, not deltas.
+    var rateSwitches: [RateSwitchRequest] = []
+    while let spec = takeStringFlag("--switch-rate", from: &rest) {
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        guard let rate = Float(parts[0]) else {
+            print("ERROR: --switch-rate takes <rate>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        rateSwitches.append(RateSwitchRequest(
+            rate: rate,
+            delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 10_000) : 10_000))
+    }
     // AE#464 round 2: mount with `autoplay = false`, the shape of a host that owns transport.
     let pausedMount = takeFlag("--paused", from: &rest)
     // AE#587: LoadOptions.preserveASSMarkup, documented as ASS/SSA only. The report that it leaks
@@ -876,6 +889,7 @@ if first == "play" {
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
+                 rateSwitches: rateSwitches,
                  pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,

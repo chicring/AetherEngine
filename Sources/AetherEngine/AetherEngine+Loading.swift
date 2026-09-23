@@ -2228,7 +2228,7 @@ extension AetherEngine {
         } else if titleToReopen != nil {
             // URL/local disc audio switch: the backend would otherwise reopen by URL with no title id and
             // silently revert to the main title. Preopen the disc demuxer with the title so the selection
-            // survives the reload (#67). Non-disc URL sources keep customPreopened nil and reopen by URL.
+            // survives the reload (#67).
             let headers = loadedOptions.httpHeaders
             do {
                 customPreopened = try await Task.detached(priority: .userInitiated) {
@@ -2248,6 +2248,39 @@ extension AetherEngine {
                     Task.detached { d.close() }
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after disc URL reopen; unwinding", category: .engine)
+                return nil
+            }
+        } else {
+            // Plain-URL audio switch: preopen here so the rebuild's find_stream_info runs on the
+            // bounded reopen budget instead of the full playback one. The reload re-probes the SAME
+            // source the session already probed at load; on a remote URL the unbounded chase is
+            // pure cost — #79's restartReopen reasoning applies verbatim (video_delay resolves from
+            // the first packets; never-resolving subtitle streams burn whatever budget they get).
+            // A host's explicit #68 budget still wins via withProbeBudget. Failure is non-fatal:
+            // loadNative's fallback open reproduces today's behavior at the full budget.
+            let headers = loadedOptions.httpHeaders
+            let isLiveReload = loadedOptions.isLive
+            let urlReloadProfile = DemuxerOpenProfile.restartReopen
+                .withProbeBudget(probesize: loadedOptions.probesize,
+                                 maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration)
+                .withSequentialOrigin(loadedOptions.sequentialOrigin,
+                                      declaredDuration: loadedOptions.declaredDurationSeconds)
+                .withHeldSourceConnection(loadedOptions.heldSourceConnection)
+            do {
+                customPreopened = try await Task.detached(priority: .userInitiated) {
+                    let d = Demuxer()
+                    try d.open(url: url, extraHeaders: headers, profile: urlReloadProfile, isLive: isLiveReload)
+                    return d
+                }.value
+            } catch {
+                customPreopened = nil
+                EngineLog.emit("[AetherEngine] reload: URL preopen failed; loadNative will reopen at the full budget: \(error)", category: .engine)
+            }
+            if let d = customPreopened, loadGeneration != gen {
+                d.markClosed()
+                Task.detached { d.close() }
+                customPreopened = nil
+                EngineLog.emit("[AetherEngine] reload superseded after URL preopen; unwinding", category: .engine)
                 return nil
             }
         }
