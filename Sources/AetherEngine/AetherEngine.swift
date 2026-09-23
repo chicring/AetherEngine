@@ -5208,6 +5208,15 @@ public final class AetherEngine: ObservableObject {
         clockTarget = await Self.prepareSeekLanding(
             session: nativeVideoSession, itemSeconds: clockTarget)
         guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
+        // A forward seek landing past the march's near front on a non-resident segment would
+        // otherwise sit in the forward-wait window while the producer finishes dead ground the
+        // post-seek playhead never reads (measured: a +30 s scrub held 8.2 s while the march
+        // filled five segments AVPlayer never requested; the deadline path fires this same
+        // re-anchor 8 s late). Fire it now, off-main; AVPlayer's request rides the restart.
+        if let session = nativeVideoSession {
+            let playlistTarget = clockTarget
+            Task.detached { session.reanchorForwardSeekTargetIfLagging(playlistSeconds: playlistTarget) }
+        }
         let gen = loadGeneration
         // Publish the native-path seek target up front so the scrub clock snaps immediately (#37); the host
         // suppresses periodic-observer reads until landing. SW/audio hosts resolve synchronously and write

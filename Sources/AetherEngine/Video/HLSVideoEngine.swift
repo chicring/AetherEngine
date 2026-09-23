@@ -3786,6 +3786,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return prov.activeMarchCovers(segmentIndexForPlaylistTime(seconds))
     }
 
+    /// A forward seek landing past the march's near front on a non-resident segment gets the
+    /// same re-anchor the seek deadline fires `nativeSeekReconcileBudgetSeconds` late — fired
+    /// here, at seek time, so the producer builds the target instead of the dead ground in
+    /// between. AVPlayer's request for the target rides the in-flight restart (#93). Callers
+    /// must run this off the main actor: requestRestart blocks on the old pump's teardown.
+    func reanchorForwardSeekTargetIfLagging(playlistSeconds: Double) {
+        guard !isLiveSession, let prov = provider else { return }
+        let idx = segmentIndexForPlaylistTime(playlistSeconds)
+        guard prov.seekTargetNeedsReanchor(idx) else { return }
+        EngineLog.emit(
+            "[HLSVideoEngine] forward seek target seg\(idx) is past the march front "
+            + "and not resident; re-anchoring the producer at it now",
+            category: .session
+        )
+        requestRestart(at: idx)
+    }
+
     /// #93 restart latency: phase split for the "restart took" line, so a slow restart names the
     /// phase that ate the time (old-pump stop wait, wedged-reopen, demuxer seek, producer build).
     nonisolated static func restartPhaseSummary(

@@ -1709,6 +1709,25 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         max(cache.highestStoredIndex, lastRestartIndex)
     }
 
+    /// How far past the march front a non-resident forward-seek target may sit before the
+    /// engine re-anchors at it instead of letting the fetch wait out the march. Inside the
+    /// forward-wait window the march still produces every segment between the front and the
+    /// target, but a post-seek playhead only ever asks for the target onward: the gap is dead
+    /// ground bought with deadline seconds (measured: a +30 s scrub held 8.2 s while the march
+    /// filled five segments AVPlayer never requested). Past the lead, re-anchoring at the
+    /// target costs less than producing the gap at any plausible delivery rate; at or inside
+    /// it the march arrives first and the existing wait is kept.
+    private static let seekReanchorLeadSegments = 2
+
+    /// Whether a forward-seek target segment needs a producer re-anchor rather than the
+    /// forward-wait the fetch path would otherwise give it. Resident segments are served by
+    /// the cache fast path and must not tear down the producer; targets at or behind the
+    /// front+lead boundary are close enough that the march beats a restart.
+    func seekTargetNeedsReanchor(_ index: Int) -> Bool {
+        guard cache.peekURL(index: index) == nil else { return false }
+        return index > activeMarchFront + Self.seekReanchorLeadSegments
+    }
+
     /// AE#141: whether the active producer's march can plausibly deliver `index` without a
     /// re-anchor: at or behind its anchor-to-front span, or within the forward-wait window
     /// ahead of the front. The engine's seek-deadline backstop asks this before preserving a
