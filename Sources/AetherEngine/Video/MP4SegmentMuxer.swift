@@ -282,6 +282,14 @@ final class MP4SegmentMuxer {
         let firstFd = try Self.openPosix(path: firstPath)
         self.fd = firstFd
 
+        // progressive VOD serve: register the staging file at 0 bytes immediately. iOS AVPlayer
+        // asks for init.mp4 and the first media segment in PARALLEL at startup/resume, before the
+        // first keep-packet would ever trigger a flush; a 0-byte entry is invisible to readers
+        // (they only act on committed > 0) but lets a request for this segment park on the board
+        // instead of falling into the whole-segment blocking serve. Init failures below run deinit,
+        // which abandons the entry.
+        progressiveBoard?.commit(index: initialSegmentIndex, path: firstPath, bytes: 0)
+
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd

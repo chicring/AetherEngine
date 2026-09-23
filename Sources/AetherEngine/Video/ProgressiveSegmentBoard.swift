@@ -116,6 +116,25 @@ final class ProgressiveSegmentBoard: @unchecked Sendable {
         return Handle(index: index, path: e.path, board: self)
     }
 
+    /// Block until a NON-terminal entry exists for `index` and return its handle. Nil at the
+    /// deadline, or immediately when the current entry is completed: that segment belongs to the
+    /// cache file path. An abandoned entry is waited past, not returned: a seek restart abandons
+    /// the old muxer's staging file for exactly the index the new muxer is about to register.
+    func awaitHandle(for index: Int, until deadline: Date) -> Handle? {
+        condition.lock()
+        defer { condition.unlock() }
+        while true {
+            if let e = entries[index] {
+                switch e.terminal {
+                case nil: return Handle(index: index, path: e.path, board: self)
+                case .completed: return nil
+                case .abandoned: break
+                }
+            }
+            if !condition.wait(until: deadline) { return nil }
+        }
+    }
+
     /// Block until the entry for `handle` commits beyond `beyond`, terminates, or `deadline`
     /// passes. A handle whose entry was replaced by a newer epoch or dropped reads .abandoned, so a
     /// serve never waits on a file that will never grow again. Nil = deadline elapsed.

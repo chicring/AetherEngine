@@ -1231,15 +1231,31 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// handle, the server never sees the progressive branch).
     nonisolated(unsafe) static var progressiveVODServe = true
 
+    /// progressive VOD serve: how long a request may wait for the muxer's staging file to appear
+    /// on the board. iOS AVPlayer asks for init.mp4 and the first media segment in PARALLEL at
+    /// startup and resume, before the producer has allocated its muxer (it allocates on the first
+    /// keep-packet); without a bounded wait the first segment — the one progressive serve exists
+    /// for — falls into the legacy blocking serve and eats AVPlayer's ~3.5 s -12889 watchdog.
+    /// Bounded so an index the producer never reaches still falls back to the legacy serve with
+    /// its restart logic intact.
+    static let progressiveEntryWaitSeconds: TimeInterval = 2.0
+
     /// progressive VOD serve: the in-production staging file for `index`, or nil when the feature
     /// is off, the session is live, the index is out of range, or nothing is being produced for it
     /// right now. Deliberately does NOT drive handleTargetChange: the server calls this only after
     /// mediaSegmentURL(at:) already did, and declaring the target twice per request would double
     /// the fetch accounting.
+    ///
+    /// When nothing is registered yet but the ACTIVE producer is marching toward this index (and
+    /// the cache does not already hold it), wait briefly for the muxer to appear: covers the
+    /// parallel init+first-segment fetch window at startup/resume.
     func progressiveSegment(at index: Int) -> ProgressiveSegmentBoard.Handle? {
         guard Self.progressiveVODServe, !isLive,
               index >= 0, index < currentSegmentCount else { return nil }
-        return cache.progressive.handle(for: index)
+        if let h = cache.progressive.handle(for: index) { return h }
+        guard cache.peekURL(index: index) == nil, activeProducerCovers(index) else { return nil }
+        return cache.progressive.awaitHandle(
+            for: index, until: Date().addingTimeInterval(Self.progressiveEntryWaitSeconds))
     }
 
     /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog

@@ -116,6 +116,56 @@ struct ProgressiveSegmentBoardTests {
         #expect(h1?.wait(beyond: 0, until: Date()) == .abandoned)
     }
 
+    @Test("awaitHandle returns as soon as a commit registers the index")
+    func awaitHandleWakesOnCommit() {
+        let board = ProgressiveSegmentBoard()
+        let path = url("b")
+        let t = Thread {
+            Thread.sleep(forTimeInterval: 0.2)
+            board.commit(index: 0, path: path, bytes: 0)
+        }
+        t.start()
+        let h = board.awaitHandle(for: 0, until: Date().addingTimeInterval(10))
+        join(t)
+        #expect(h?.path == path)
+    }
+
+    @Test("awaitHandle waits past an abandoned entry for the restart muxer's new epoch")
+    func awaitHandleWaitsPastAbandoned() {
+        let board = ProgressiveSegmentBoard()
+        let old = url("old"), fresh = url("fresh")
+        board.commit(index: 0, path: old, bytes: 10)
+        board.abandon(index: 0, path: old)
+        let t = Thread {
+            Thread.sleep(forTimeInterval: 0.2)
+            board.commit(index: 0, path: fresh, bytes: 0)
+        }
+        t.start()
+        let h = board.awaitHandle(for: 0, until: Date().addingTimeInterval(10))
+        join(t)
+        #expect(h?.path == fresh)
+    }
+
+    @Test("awaitHandle returns nil at the deadline when nothing is registered")
+    func awaitHandleTimesOut() {
+        let board = ProgressiveSegmentBoard()
+        let start = Date()
+        #expect(board.awaitHandle(for: 0, until: Date().addingTimeInterval(0.1)) == nil)
+        #expect(Date().timeIntervalSince(start) >= 0.09)
+    }
+
+    @Test("awaitHandle returns nil immediately for a terminal entry")
+    func awaitHandleSkipsTerminal() {
+        let board = ProgressiveSegmentBoard()
+        let path = url("b")
+        board.commit(index: 0, path: path, bytes: 10)
+        board.complete(index: 0, path: path, bytes: 20)
+        let start = Date()
+        #expect(board.awaitHandle(for: 0, until: Date().addingTimeInterval(5)) == nil)
+        #expect(Date().timeIntervalSince(start) < 1,
+                "a completed entry belongs to the cache file path, not to a wait")
+    }
+
     @Test("a wait with no progress returns nil at the deadline")
     func waitTimesOut() {
         let board = ProgressiveSegmentBoard()
@@ -399,7 +449,7 @@ struct MP4SegmentMuxerProgressiveCommitTests {
         for i in 0..<10 {
             try rig.writeVideoSample(payloads[i % payloads.count],
                                      dts: Int64(i) * stride, key: i == 0, into: muxer)
-            if let n = committedNow(cache.progressive, index: 0), n != commits.last {
+            if let n = committedNow(cache.progressive, index: 0), n != commits.last, n > 0 {
                 commits.append(n)
             }
         }
@@ -435,6 +485,19 @@ struct MP4SegmentMuxerProgressiveCommitTests {
         #expect(Self.isWholeFragmentSequence(Array(adopted)))
     }
 
+    @Test("the staging file is registered at 0 bytes from init, before any packet")
+    func initRegistersStagingFile() throws {
+        let board = ProgressiveSegmentBoard()
+        let rig = try Rig()
+        try rig.open(audioFixture: nil)
+        _ = try rig.makeMuxer(board: board, withAudio: false)
+        guard let h = board.handle(for: 0) else {
+            Issue.record("init must register the staging file so an early request can park on it")
+            return
+        }
+        #expect(h.wait(beyond: -1, until: Date()) == .committed(0))
+    }
+
     @Test("no commit is published before moov is flushed (AE#222 EAC3 guard)")
     func noCommitBeforeMoov() throws {
         let board = ProgressiveSegmentBoard()
@@ -444,8 +507,11 @@ struct MP4SegmentMuxerProgressiveCommitTests {
         // packet, so every interim flush must be refused until one audio packet lands.
         let muxer = try rig.makeMuxer(board: board, withAudio: true)
 
+        // The staging file is registered at 0 bytes from init; the AE#222 guard is about BYTES:
+        // nothing above 0 may be published while the moov prime can still ftruncate the file.
+        #expect(committedNow(board, index: 0) == 0)
         try feedSpan(rig: rig, muxer: muxer)
-        #expect(board.handle(for: 0) == nil,
+        #expect((committedNow(board, index: 0) ?? 0) == 0,
                 "bytes published before moov could be ftruncated by the moov prime")
 
         let frame = try rig.firstAudioFrameBytes()
@@ -695,6 +761,89 @@ struct HLSLocalServerProgressiveServeTests {
                 "Range requests must not even consult the progressive board")
         #expect(header.contains("Content-Length: \(payload.count)"))
         #expect(body.prefix(payload.count) == payload)
+    }
+
+    private func realProvider(cache: SegmentCache, producerBase: Int?) -> VideoSegmentProvider {
+        let segments = (0..<4).map {
+            HLSVideoEngine.Segment(startPts: Int64($0) * 4000, endPts: Int64($0 + 1) * 4000,
+                                   startSeconds: Double($0) * 4.0, durationSeconds: 4.0)
+        }
+        return VideoSegmentProvider(
+            cache: cache, segments: segments, codecsString: "hvc1", supplementalCodecs: nil,
+            resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
+            sourceBitrate: 8_000_000,
+            restartHandler: { _ in }, restartActivity: { false },
+            activeProducerBase: { producerBase }
+        )
+    }
+
+    @Test("a request arriving before the muxer exists parks on the board and is served progressively")
+    func earlyRequestWaitsForEntry() throws {
+        // iOS AVPlayer asks for init.mp4 and seg1 in parallel at startup; the muxer (and its board
+        // entry) only exist ~300 ms later when the first keep-packet allocates it.
+        let cache = SegmentCache(forwardWindow: 5, backwardWindow: 5)
+        defer { cache.close() }
+        let (dir, path) = try makeStagingFile()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let payload = Data((0..<20_000).map { UInt8($0 % 251) })
+        let provider = realProvider(cache: cache, producerBase: 1)
+        let server = HLSLocalServer(provider: provider)
+        try server.start()
+        defer { server.stop() }
+
+        let writer = Thread {
+            Thread.sleep(forTimeInterval: 0.3)
+            guard let fh = try? FileHandle(forWritingTo: path) else { return }
+            fh.write(payload[0..<8000])
+            cache.progressive.commit(index: 1, path: path, bytes: 8000)
+            Thread.sleep(forTimeInterval: 0.2)
+            fh.write(payload[8000...])
+            cache.progressive.commit(index: 1, path: path, bytes: payload.count)
+            try? fh.close()
+            cache.progressive.complete(index: 1, path: path, bytes: payload.count)
+        }
+        writer.start()
+
+        let (raw, firstByteAfter) = Self.rawGET(
+            port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 3.0)
+        while !writer.isFinished { Thread.sleep(forTimeInterval: 0.005) }
+        let (header, body) = Self.splitResponse(raw)
+        #expect(header.contains("Transfer-Encoding: chunked"))
+        #expect(!header.contains("Content-Length"))
+        #expect(Self.decodeChunkedBody(body) == payload)
+        #expect(firstByteAfter >= 0)
+        #expect(firstByteAfter < 0.5,
+                "first byte must ride the first commit (~0.3 s), not the completion (got \(firstByteAfter)s)")
+    }
+
+    @Test("an entry that never appears falls back to the legacy serve")
+    func missingEntryFallsBackToLegacy() throws {
+        let cache = SegmentCache(forwardWindow: 5, backwardWindow: 5)
+        defer { cache.close() }
+        let payload = Data(repeating: 0x66, count: 4096)
+        let provider = realProvider(cache: cache, producerBase: 1)
+        let server = HLSLocalServer(provider: provider)
+        try server.start()
+        defer { server.stop() }
+
+        // No muxer ever registers; the segment lands in the cache just after the 2 s entry wait
+        // expires, so the ordinary blocking serve picks it up.
+        let writer = Thread {
+            Thread.sleep(forTimeInterval: 2.5)
+            cache.store(index: 1, data: payload)
+        }
+        writer.start()
+
+        let start = Date()
+        let (raw, _) = Self.rawGET(
+            port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 3.0)
+        let elapsed = Date().timeIntervalSince(start)
+        while !writer.isFinished { Thread.sleep(forTimeInterval: 0.005) }
+        let (header, body) = Self.splitResponse(raw)
+        #expect(elapsed >= VideoSegmentProvider.progressiveEntryWaitSeconds - 0.2,
+                "the request must have burned the entry wait before falling back (took \(elapsed)s)")
+        #expect(header.contains("200 OK"))
+        #expect(body.suffix(payload.count) == payload)
     }
 
     @Test("progressiveVODServe=false makes the provider vend no handle (exact legacy behaviour)")

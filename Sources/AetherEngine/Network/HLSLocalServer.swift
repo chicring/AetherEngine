@@ -1027,12 +1027,15 @@ final class HLSLocalServer: @unchecked Sendable {
                     // — after one more file-path try, since the likeliest reason the staging file
                     // could not be opened is the adopt that just landed.
                     let requestLines = text.components(separatedBy: "\r\n")
-                    if Self.requestHeader(named: "range", in: requestLines) == nil,
-                       let handle = provider?.progressiveSegment(at: index) {
-                        if let response = serveProgressive(fd: fd, path: normalizedPath,
+                    if Self.requestHeader(named: "range", in: requestLines) == nil {
+                        if let handle = provider?.progressiveSegment(at: index),
+                           let response = serveProgressive(fd: fd, path: normalizedPath,
                                                            index: index, handle: handle) {
                             return response
                         }
+                        // Whether the board never vended a handle (a segment completed during the
+                        // provider's entry wait) or the staging file vanished mid-serve, the adopt
+                        // that just landed is the likeliest cause; try the cache path once.
                         if let response = fileBackedServe() { return response }
                     }
                     // #93 round 3: a serve outliving the provider's slow threshold (wedge-window
