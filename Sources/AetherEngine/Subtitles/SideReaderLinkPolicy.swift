@@ -39,16 +39,27 @@ enum SideReaderLinkPolicy {
     /// never trips it and only a stuck signal does.
     static let maxYieldSeconds: Double = 60
 
+    /// Kill switch for the startup rule, for measurement and tests. When false, rule 3 below and
+    /// the startup half of `shouldDeferOpen` are skipped — exact previous behaviour.
+    nonisolated(unsafe) static var sideReadersYieldDuringStartup = true
+
     /// Whether the side reader must leave the link to the video path right now.
     ///
     /// Ordered so each rule is decidable on its own:
     /// 1. the cap fires first, because its whole purpose is to override a signal that is not clearing
     /// 2. a seek in flight yields unconditionally: the landing budget is what this exists to protect
-    /// 3. inside its anchor grace the reader fetches, so a fresh selection is not left with an empty
+    /// 3. playback startup with a fetching producer yields, and the grace does NOT override it:
+    ///    startup is the one window where playback has no buffer yet, the pump's own keep-set
+    ///    harvests the cues at the playhead, and the field trace showed the reader's anchor grace
+    ///    halving the pump exactly there (the first segment's ~4 s watchdog does not wait). A
+    ///    paused or parked startup — videoProducing false — still lets the reader fetch, so a
+    ///    load that never plays is not starved of lookahead
+    /// 4. inside its anchor grace the reader fetches, so a fresh selection is not left with an empty
     ///    store on a busy link
-    /// 4. an actively fetching producer wins the link
+    /// 5. an actively fetching producer wins the link
     static func shouldYield(
         seeking: Bool,
+        startingUp: Bool,
         videoProducing: Bool,
         inAnchorGrace: Bool,
         yieldedSeconds: Double,
@@ -56,6 +67,7 @@ enum SideReaderLinkPolicy {
     ) -> Bool {
         if yieldedSeconds >= maxYieldSeconds { return false }
         if seeking { return true }
+        if sideReadersYieldDuringStartup, startingUp, videoProducing { return true }
         if inAnchorGrace { return false }
         return videoProducing
     }
@@ -69,6 +81,10 @@ enum SideReaderLinkPolicy {
 final class SideReaderLinkGate: @unchecked Sendable {
     private let lock = NSLock()
     private var seeking = false
+    /// Defaults to startup: until a session's first roll reports otherwise, holding the link for
+    /// playback is the safe read (rule 3 also requires `videoProducing`, so an idle engine is not
+    /// treated as starting up).
+    private var startingUp = true
     private var producingCount = 0
 
     init() {}
@@ -77,6 +93,14 @@ final class SideReaderLinkGate: @unchecked Sendable {
     func setSeeking(_ inFlight: Bool) {
         lock.lock()
         seeking = inFlight
+        lock.unlock()
+    }
+
+    /// Wired to `AetherEngine.hasTransportRolled` (inverted): true from each session reset until
+    /// this load's transport has actually rolled once.
+    func setStartingUp(_ inFlight: Bool) {
+        lock.lock()
+        startingUp = inFlight
         lock.unlock()
     }
 
@@ -94,10 +118,10 @@ final class SideReaderLinkGate: @unchecked Sendable {
         lock.unlock()
     }
 
-    var state: (seeking: Bool, videoProducing: Bool) {
+    var state: (seeking: Bool, startingUp: Bool, videoProducing: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (seeking, producingCount > 0)
+        return (seeking, startingUp, producingCount > 0)
     }
 }
 
@@ -106,7 +130,7 @@ final class SideReaderLinkGate: @unchecked Sendable {
 /// Holds the state source plus the tuning, so a reader loop asks one question and the tests can
 /// drive every rule without an engine, a producer or a network.
 struct SideReaderLinkArbiter: Sendable {
-    let state: @Sendable () -> (seeking: Bool, videoProducing: Bool)
+    let state: @Sendable () -> (seeking: Bool, startingUp: Bool, videoProducing: Bool)
     var anchorGraceSeconds: Double = SideReaderLinkPolicy.anchorGraceSeconds
     var maxYieldSeconds: Double = SideReaderLinkPolicy.maxYieldSeconds
     /// How long the reader keeps the link once the cap has fired, before it starts asking again.
@@ -121,20 +145,33 @@ struct SideReaderLinkArbiter: Sendable {
         self.state = { gate.state }
     }
 
-    init(state: @escaping @Sendable () -> (seeking: Bool, videoProducing: Bool)) {
+    init(state: @escaping @Sendable () -> (seeking: Bool, startingUp: Bool, videoProducing: Bool)) {
         self.state = state
     }
 
     /// Whether the arbiter would hold a reader that has banked nothing yet. Used by the open path,
     /// which has no lead of its own: a session being built has read zero seconds ahead.
     func shouldDeferOpen() -> Bool {
-        state().seeking
+        let now = state()
+        return now.seeking
+            || (SideReaderLinkPolicy.sideReadersYieldDuringStartup
+                && now.startingUp && now.videoProducing)
+    }
+
+    /// Whether the reader is currently held by the startup rule (3) specifically, for the
+    /// once-per-session log line. A seek wins over startup in the rule order, so it is checked
+    /// first; the grace does not reach this question (rule 3 sits above it).
+    func isHoldingForStartup() -> Bool {
+        let now = state()
+        return SideReaderLinkPolicy.sideReadersYieldDuringStartup
+            && !now.seeking && now.startingUp && now.videoProducing
     }
 
     func shouldYield(inAnchorGrace: Bool, yieldedSeconds: Double) -> Bool {
         let now = state()
         return SideReaderLinkPolicy.shouldYield(
             seeking: now.seeking,
+            startingUp: now.startingUp,
             videoProducing: now.videoProducing,
             inAnchorGrace: inAnchorGrace,
             yieldedSeconds: yieldedSeconds,

@@ -1858,6 +1858,8 @@ extension AetherEngine {
         var valveGrantedUntil: DispatchTime? = nil
         let anchorGraceUntil = DispatchTime.now()
             + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
+        /// Startup-rule holds are logged once per session, not per poll.
+        var startupHoldLogged = false
         var parkLogged = false
         var timeBaseCache: [Int32: AVRational] = [:]
         var totalCues = 0
@@ -1872,6 +1874,13 @@ extension AetherEngine {
                 while !Task.isCancelled,
                       link.shouldYield(inAnchorGrace: DispatchTime.now() < anchorGraceUntil,
                                        yieldedSeconds: yielded) {
+                    if yielded == 0, !startupHoldLogged, link.isHoldingForStartup() {
+                        startupHoldLogged = true
+                        EngineLog.emit(
+                            "[AetherEngine] native subtitle readers holding the link "
+                            + "for playback startup",
+                            category: .engine)
+                    }
                     guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime })
                     else { break readLoop }
                     playheadSnapshot = fresh

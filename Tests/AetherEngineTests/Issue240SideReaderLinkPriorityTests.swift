@@ -29,16 +29,23 @@ struct Issue240SideReaderLinkPriorityTests {
     @Test("a seek in flight takes the link, grace window or not")
     func seekWins() {
         #expect(SideReaderLinkPolicy.shouldYield(
-            seeking: true, videoProducing: false, inAnchorGrace: false, yieldedSeconds: 0))
+            seeking: true, startingUp: false, videoProducing: false,
+            inAnchorGrace: false, yieldedSeconds: 0))
         #expect(SideReaderLinkPolicy.shouldYield(
-            seeking: true, videoProducing: true, inAnchorGrace: true, yieldedSeconds: 0))
+            seeking: true, startingUp: false, videoProducing: true,
+            inAnchorGrace: true, yieldedSeconds: 0))
+        // Seeking sits above the startup rule too.
+        #expect(SideReaderLinkPolicy.shouldYield(
+            seeking: true, startingUp: true, videoProducing: true,
+            inAnchorGrace: true, yieldedSeconds: 0))
     }
 
     /// A pump that is pulling from the source outranks lookahead.
     @Test("a fetching producer takes the link from a settled side reader")
     func producerWinsOutsideGrace() {
         #expect(SideReaderLinkPolicy.shouldYield(
-            seeking: false, videoProducing: true, inAnchorGrace: false, yieldedSeconds: 0))
+            seeking: false, startingUp: false, videoProducing: true,
+            inAnchorGrace: false, yieldedSeconds: 0))
     }
 
     /// The grace window: a freshly anchored reader has nothing in the store for the new position,
@@ -49,16 +56,19 @@ struct Issue240SideReaderLinkPriorityTests {
     @Test("a just-anchored reader fetches through a busy pump, a settled one does not")
     func anchorGraceIsBounded() {
         #expect(!SideReaderLinkPolicy.shouldYield(
-            seeking: false, videoProducing: true, inAnchorGrace: true, yieldedSeconds: 0))
+            seeking: false, startingUp: false, videoProducing: true,
+            inAnchorGrace: true, yieldedSeconds: 0))
         #expect(SideReaderLinkPolicy.shouldYield(
-            seeking: false, videoProducing: true, inAnchorGrace: false, yieldedSeconds: 0))
+            seeking: false, startingUp: false, videoProducing: true,
+            inAnchorGrace: false, yieldedSeconds: 0))
     }
 
     /// A parked pump has a full buffer and no use for the link.
     @Test("an idle video path leaves the link to the side reader")
     func idleVideoPathYieldsTheLink() {
         #expect(!SideReaderLinkPolicy.shouldYield(
-            seeking: false, videoProducing: false, inAnchorGrace: false, yieldedSeconds: 0))
+            seeking: false, startingUp: false, videoProducing: false,
+            inAnchorGrace: false, yieldedSeconds: 0))
     }
 
     /// The valve. A wedged pump never parks and a host that reports no producer at all never claims
@@ -66,11 +76,56 @@ struct Issue240SideReaderLinkPriorityTests {
     @Test("a continuous yield past the cap takes the link back")
     func yieldCapIsAValve() {
         #expect(SideReaderLinkPolicy.shouldYield(
-            seeking: true, videoProducing: true, inAnchorGrace: false,
+            seeking: true, startingUp: false, videoProducing: true, inAnchorGrace: false,
             yieldedSeconds: SideReaderLinkPolicy.maxYieldSeconds - 0.01))
         #expect(!SideReaderLinkPolicy.shouldYield(
-            seeking: true, videoProducing: true, inAnchorGrace: false,
+            seeking: true, startingUp: false, videoProducing: true, inAnchorGrace: false,
             yieldedSeconds: SideReaderLinkPolicy.maxYieldSeconds))
+    }
+
+    /// Startup is the one window where playback has no buffer yet: while the transport has not
+    /// rolled and the pump is fetching, the side reader yields even inside its anchor grace —
+    /// the grace's unconditional fetch is exactly what halved the pump on the field trace. A
+    /// startup whose pump is parked (paused load, buffer already full) keeps the old rules.
+    @Test("playback startup yields through the grace, a parked startup does not")
+    func startupYieldsThroughGrace() {
+        #expect(SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: true,
+            inAnchorGrace: true, yieldedSeconds: 0))
+        #expect(SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: true,
+            inAnchorGrace: false, yieldedSeconds: 0))
+        // Parked pump: the grace still fetches, and outside it the idle path leaves the link.
+        #expect(!SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: false,
+            inAnchorGrace: true, yieldedSeconds: 0))
+        #expect(!SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: false,
+            inAnchorGrace: false, yieldedSeconds: 0))
+    }
+
+    /// The cap is rule 1 on purpose: a startup signal that never clears cannot mute lookahead.
+    @Test("the yield cap still overrides playback startup")
+    func capOverridesStartup() {
+        #expect(!SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: true,
+            inAnchorGrace: true, yieldedSeconds: SideReaderLinkPolicy.maxYieldSeconds))
+    }
+
+    /// The A/B kill switch: with it off, startup behaves exactly as before — the grace fetches
+    /// and outside the grace the producing pump still wins by rule 5.
+    @Test("sideReadersYieldDuringStartup=false makes the startup rule inert")
+    func startupRuleKillSwitch() {
+        SideReaderLinkPolicy.sideReadersYieldDuringStartup = false
+        defer { SideReaderLinkPolicy.sideReadersYieldDuringStartup = true }
+        #expect(!SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: true,
+            inAnchorGrace: true, yieldedSeconds: 0))
+        #expect(SideReaderLinkPolicy.shouldYield(
+            seeking: false, startingUp: true, videoProducing: true,
+            inAnchorGrace: false, yieldedSeconds: 0))
+        #expect(!SideReaderLinkArbiter(
+            state: { (seeking: false, startingUp: true, videoProducing: true) }).shouldDeferOpen())
     }
 
     // MARK: - The gate
@@ -102,6 +157,32 @@ struct Issue240SideReaderLinkPriorityTests {
         #expect(gate.state.seeking)
         gate.setSeeking(false)
         #expect(gate.state.seeking == false)
+    }
+
+    /// Startup is the default until a session's first roll reports otherwise: a gate that has
+    /// never been written still reads as starting up, and `setStartingUp` mirrors its input.
+    @Test("the startup flag defaults to starting up and mirrors what it is set to")
+    func gateMirrorsStartingUp() {
+        let gate = SideReaderLinkGate()
+        #expect(gate.state.startingUp)
+        gate.setStartingUp(false)
+        #expect(gate.state.startingUp == false)
+        gate.setStartingUp(true)
+        #expect(gate.state.startingUp)
+    }
+
+    // MARK: - The arbiter
+
+    /// The open path has no lead of its own, so it asks the same question the loop asks of a
+    /// reader that has banked nothing: startup + a fetching pump holds the open; a parked
+    /// startup does not; a seek still does.
+    @Test("a session open defers to a startup pump, not to a parked one")
+    func deferOpenFollowsStartup() {
+        #expect(Self.arbiter(startingUp: true, videoProducing: true).shouldDeferOpen())
+        #expect(!Self.arbiter(startingUp: true, videoProducing: false).shouldDeferOpen())
+        #expect(Self.arbiter(seeking: true).shouldDeferOpen())
+        // Past the first roll the open follows the video path alone.
+        #expect(!Self.arbiter(startingUp: false, videoProducing: true).shouldDeferOpen())
     }
 
     // MARK: - The prefetch loop
@@ -157,12 +238,12 @@ struct Issue240SideReaderLinkPriorityTests {
     }
 
     private static func arbiter(
-        seeking: Bool = false, videoProducing: Bool = false,
+        seeking: Bool = false, startingUp: Bool = false, videoProducing: Bool = false,
         maxYieldSeconds: Double = SideReaderLinkPolicy.maxYieldSeconds,
         valveGrantSeconds: Double = SideReaderLinkPolicy.maxYieldSeconds,
         anchorGraceSeconds: Double = 0
     ) -> SideReaderLinkArbiter {
-        var a = SideReaderLinkArbiter(state: { (seeking, videoProducing) })
+        var a = SideReaderLinkArbiter(state: { (seeking, startingUp, videoProducing) })
         a.maxYieldSeconds = maxYieldSeconds
         a.valveGrantSeconds = valveGrantSeconds
         a.anchorGraceSeconds = anchorGraceSeconds
@@ -330,6 +411,28 @@ struct Issue240SideReaderLinkPriorityTests {
         #expect(pts >= 8 - 0.001,
                 "the backscan starts at the anchor minus \(SubtitleForwardPrefetcher.anchorBackscanSeconds)s")
         #expect(pts <= 10, "and not so far back that the whole gap is re-read")
+    }
+}
+
+/// Engine wiring: `hasTransportRolled` is the startup signal's source — its didSet writes the
+/// inverted value into the gate, so each session reset re-arms the hold and the first real roll
+/// releases it.
+@Suite("AetherEngine side-reader startup gate wiring (#240)")
+@MainActor
+struct SideReaderStartupGateWiringTests {
+
+    @Test("the gate follows hasTransportRolled")
+    func gateFollowsRoll() throws {
+        let engine = try AetherEngine()
+        // A fresh engine has never rolled: the gate's default already reads as startup.
+        #expect(engine.sideReaderLinkGate.state.startingUp)
+
+        engine.hasTransportRolled = true
+        #expect(engine.sideReaderLinkGate.state.startingUp == false)
+
+        // Every load/reload runs stopInternal, which resets the flag and re-arms the gate.
+        engine.hasTransportRolled = false
+        #expect(engine.sideReaderLinkGate.state.startingUp)
     }
 }
 

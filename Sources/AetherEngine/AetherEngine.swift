@@ -139,7 +139,14 @@ public final class AetherEngine: ObservableObject {
     /// the paths that publish no transport status set it when their host is wired, so nothing about them
     /// changes. Reset with the session.
     var hasTransportRolled = false {
-        didSet { recomputePlaybackPhase() }
+        didSet {
+            // #240 startup rule: until this load's transport has rolled, a fetching pump owns the
+            // link outright (the grace does not override it). `stopInternal` resets this to false
+            // on every load/reload before the side readers start, so each startup re-arms the
+            // gate; the software/audio paths credit the roll at wiring and clear it immediately.
+            sideReaderLinkGate.setStartingUp(!hasTransportRolled)
+            recomputePlaybackPhase()
+        }
     }
 
     /// Whether a `.paused` transport reading is this session's own pause, or the status its mount is
