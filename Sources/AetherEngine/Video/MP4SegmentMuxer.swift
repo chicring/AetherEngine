@@ -224,6 +224,11 @@ final class MP4SegmentMuxer {
     /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
     private var fragmentWindowFirstVideoDts: Int64 = Int64.min
 
+    /// progressive VOD serve: publishes each flushed fragment boundary so the server can stream the
+    /// staging file while this muxer is still writing it. nil = legacy behaviour (live, or the
+    /// feature switched off); nothing is published then.
+    private let progressiveBoard: ProgressiveSegmentBoard?
+
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
@@ -242,12 +247,14 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
+        progressiveBoard: ProgressiveSegmentBoard? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
         self.audioDelaySeconds = audioDelaySeconds
+        self.progressiveBoard = progressiveBoard
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
@@ -698,6 +705,20 @@ final class MP4SegmentMuxer {
             moovFlushed = true
             _ = av_write_frame(ctx, nil)
         }
+        // progressive VOD serve: publish the fragment boundary just emitted. avio_flush first so the
+        // tail of the AVIO buffer has passed through FragmentSplitter onto the fd; committed bytes
+        // must be a whole number of boxes on disk. Never publish while moov is unflushed: AE#222's
+        // prime can still ftruncate the staging file, so earlier bytes are not stable.
+        if moovFlushed, let pb {
+            avio_flush(pb)
+            if byteCounter.writeFailed {
+                progressiveBoard?.abandon(index: currentSegmentIndex, path: currentStagingPath)
+            } else {
+                progressiveBoard?.commit(index: currentSegmentIndex,
+                                         path: currentStagingPath,
+                                         bytes: byteCounter.bytesWrittenCurrentSegment)
+            }
+        }
     }
 
     /// Bytes staged for the segment currently being written. Zero right after a moov prime, whose fragment
@@ -833,6 +854,8 @@ final class MP4SegmentMuxer {
         byteCounter.bytesWrittenCurrentSegment = 0
 
         if completedFailed || completedBytes == 0 {
+            // progressive VOD serve: this staging file is gone; any parked serve must fall back.
+            progressiveBoard?.abandon(index: currentSegmentIndex, path: completedPath)
             try? FileManager.default.removeItem(at: completedPath)
             return .failed
         }
@@ -846,6 +869,10 @@ final class MP4SegmentMuxer {
             self.currentStagingPath = nextPath
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
+            // progressive VOD serve: register the fresh staging file at 0 bytes (moov is already
+            // flushed by now) so a request for the next segment takes the progressive path
+            // immediately instead of blocking on the full segment.
+            progressiveBoard?.commit(index: nextIdx, path: nextPath, bytes: 0)
         } catch {
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
             EngineLog.emit(
@@ -870,6 +897,7 @@ final class MP4SegmentMuxer {
         guard let ctx = formatContext, headerWritten,
               !(audioNeedsParsedPacketForMoov && !audioPacketWritten && !moovFlushed) else {
             if fd >= 0 { close(fd); fd = -1 }
+            progressiveBoard?.abandon(index: currentSegmentIndex, path: currentStagingPath)
             try? FileManager.default.removeItem(at: currentStagingPath)
             return nil
         }
@@ -888,6 +916,7 @@ final class MP4SegmentMuxer {
         }
 
         if finalFailed || finalBytes == 0 {
+            progressiveBoard?.abandon(index: currentSegmentIndex, path: finalPath)
             try? FileManager.default.removeItem(at: finalPath)
             return nil
         }
@@ -950,6 +979,9 @@ final class MP4SegmentMuxer {
         if fd >= 0 {
             close(fd)
         }
+        // progressive VOD serve: a muxer torn down without a successful adopt leaves its staging
+        // file unpublished; terminal entries already set (completed) are not overwritten.
+        progressiveBoard?.abandon(index: currentSegmentIndex, path: currentStagingPath)
         cleanup()
     }
 

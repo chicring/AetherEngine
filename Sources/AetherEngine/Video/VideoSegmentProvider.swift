@@ -1226,6 +1226,22 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return cache.peekURL(index: index)
     }
 
+    /// progressive VOD serve: kill switch, internal so tests can turn the whole feature off and
+    /// exercise the exact pre-feature serve path (muxers get a nil board, the provider vends no
+    /// handle, the server never sees the progressive branch).
+    nonisolated(unsafe) static var progressiveVODServe = true
+
+    /// progressive VOD serve: the in-production staging file for `index`, or nil when the feature
+    /// is off, the session is live, the index is out of range, or nothing is being produced for it
+    /// right now. Deliberately does NOT drive handleTargetChange: the server calls this only after
+    /// mediaSegmentURL(at:) already did, and declaring the target twice per request would double
+    /// the fetch accounting.
+    func progressiveSegment(at index: Int) -> ProgressiveSegmentBoard.Handle? {
+        guard Self.progressiveVODServe, !isLive,
+              index >= 0, index < currentSegmentCount else { return nil }
+        return cache.progressive.handle(for: index)
+    }
+
     /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog
     /// reads this after a wedge re-anchor: an unchanged count means AVPlayer stopped requesting
     /// entirely and needs a host-side nudge (#93 residual).

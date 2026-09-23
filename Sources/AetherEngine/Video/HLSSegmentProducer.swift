@@ -663,6 +663,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// program boundary or a renumbered clock, not a cadence.
     static let maxSynthesizedStrideSeconds: Double = 1.0
 
+    /// progressive VOD serve: VOD muxers flush a fragment ~every second of buffered video instead of
+    /// holding the AE#195 8 s floor, because the fragment granularity is the delivery step size the
+    /// server streams to AVPlayer while the segment is still being produced.
+    static let progressiveFragmentSeconds: Double = 1.0
+
     /// How far a repaired timestamp advances when the source carried neither dts nor pts.
     ///
     /// It used to advance one tick, which satisfies the muxer's monotonic invariant and nothing
@@ -2093,11 +2098,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
                 // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
                 // must not shrink the cap below typical TS A/V interleave skew.
-                maxBufferedFragmentSeconds: max(8.0, 2 * targetSegmentDurationSeconds),
+                // progressive VOD serve: on VOD the fragment granularity IS the delivery step size,
+                // so the bound drops to 1 s to hand AVPlayer a publishable fragment ~every second;
+                // live keeps the AE#195 8 s floor.
+                maxBufferedFragmentSeconds: (isLive || !VideoSegmentProvider.progressiveVODServe)
+                    ? max(8.0, 2 * targetSegmentDurationSeconds)
+                    : Self.progressiveFragmentSeconds,
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
+                // progressive VOD serve: VOD muxers publish flushed fragment boundaries; live and
+                // the kill switch keep nil (= no publishing, exact legacy behaviour).
+                progressiveBoard: (isLive || !VideoSegmentProvider.progressiveVODServe)
+                    ? nil : cache.progressive,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
