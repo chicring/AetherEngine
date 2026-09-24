@@ -11,6 +11,18 @@ import AetherLibavutil
 /// Intentionally skips EAC3+JOC and DV HDMI handshake (AV1 sources rarely carry Atmos or DV).
 @MainActor
 final class SoftwarePlaybackHost {
+    /// Codecs whose presentation reordering has an established bound get the read-ahead's
+    /// successor-PTS coverage; every other codec keeps strict packet-duration coverage. HEVC's bound
+    /// is FFmpeg's own: `sps_max_num_reorder_pics > HEVC_MAX_DPB_SIZE - 1` (15) is rejected
+    /// (n8.1.2 hevc/ps.c:1397-1403), inside the 32-timestamp queue. On the duration model a Matroska
+    /// file muxed with 41 ms durations against 41/42 ms deltas split at every 42 ms step (#613).
+    nonisolated static func presentationReorderDepth(codecID: UInt32) -> Int? {
+        switch codecID {
+        case AV_CODEC_ID_H264.rawValue, AV_CODEC_ID_HEVC.rawValue: return 32
+        default: return nil
+        }
+    }
+
 
     // MARK: - Published state (mirrors NativeAVPlayerHost surface)
 
@@ -945,7 +957,7 @@ final class SoftwarePlaybackHost {
                           denominator: $0.pointee.time_base.den)
                 } : nil
             let initialSourceClock = initialClockTime.seconds
-            let videoReorderDepth: Int? = vCodecID == AV_CODEC_ID_H264.rawValue ? 32 : nil
+            let videoReorderDepth = Self.presentationReorderDepth(codecID: vCodecID)
             let cacheResult = await Task.detached(priority: .utility) { () throws -> SoftwarePacketReadAhead? in
                 let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 let available = (try? temp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
@@ -1432,6 +1444,40 @@ final class SoftwarePlaybackHost {
                 }
                 continuation.resume(
                     returning: extractor.still(from: ring, targetPts: targetSource, maxWidth: maxWidth))
+            }
+        }
+    }
+
+    /// AE#605: true when this VOD session keeps a packet cache a still can be decoded from. A local
+    /// file has none (it is read directly, see the spool's setup), and neither does a session whose
+    /// cache could not be built.
+    var servesPacketCacheStills: Bool { !isLive && vodPacketReadAhead != nil }
+
+    /// AE#605: the VOD twin of `liveScrubStill`, decoded out of the retained packet cache.
+    ///
+    /// Same queue, same newest-wins ticket and same extractor as the live still, and the same session
+    /// axis conversion `seek` uses, so the card and the commit name one moment. The disk read runs on
+    /// the still queue too, never on the demux or feed loop.
+    func vodScrubStill(atSessionSeconds seconds: Double, maxWidth: Int) async -> CGImage? {
+        guard !isLive, let cache = vodPacketReadAhead, let extractor = resolveStillExtractor() else {
+            return nil
+        }
+        let targetSource = sourceSeconds(forSession: seconds)
+        let limits = SoftwareStillExtractor.Limits.vod
+        let requests = stillRequests
+        let ticket = requests.next()
+        return await withCheckedContinuation { continuation in
+            stillQueue.async {
+                guard ticket == requests.latest,
+                      let run = cache.stillRun(atSeconds: targetSource,
+                                               maxPackets: limits.maxPackets,
+                                               maxSpanSeconds: limits.maxSpanSeconds,
+                                               reorderTail: limits.reorderTail) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(
+                    returning: extractor.still(from: run, targetPts: targetSource, maxWidth: maxWidth))
             }
         }
     }

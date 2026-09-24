@@ -1425,9 +1425,10 @@ public final class AetherEngine: ObservableObject {
     /// where the per-title repetition it was built to prevent would have happened.
     ///
     /// Deliberately not keyed to a fingerprint of the display configuration, which would be more
-    /// precise: the latch can only be set while `eligibleForHDRPlayback` is true, so the capability
-    /// table at refusal time may be identical to the table afterwards, and a fingerprint built on that
-    /// assumption would hold the stale latch silently. The return needs no such assumption.
+    /// precise: the latch is only set while `eligibleForHDRPlayback` reads true (enforced since AE#535,
+    /// see `MasterFallbackDecision.shouldLatchPanelRefusal`), so the capability table at refusal time
+    /// may be identical to the table afterwards, and a fingerprint built on that would hold the stale
+    /// latch silently. The return needs no such assumption.
     nonisolated static func clearPanelRefusalOnForegroundReturn() {
         guard panelRefusedHDRMaster else { return }
         panelRefusedHDRMaster = false
@@ -2171,6 +2172,14 @@ public final class AetherEngine: ObservableObject {
     /// every live source, every source without declared sidecars, and every refused rewrite.
     var remoteHLSSubtitleProxy: RemoteHLSSubtitleProxy.Prepared?
 
+    /// AE#616: measures how far AVPlayer's item time leads the presented frame on the bypass, off the
+    /// injected renditions. Nil whenever `remoteHLSSubtitleProxy` serves none.
+    var remoteHLSCueClock: RemoteHLSCueClockObserver?
+
+    /// AE#616: the last offset `remoteHLSCueClock` measured, subtracted from item time to publish
+    /// `sourceTime`. Zero on every other path and until the first injected line is presented.
+    var remoteHLSItemOffset: Double = 0
+
     /// #316: external track id -> the NAME its injected rendition carries in the served master. Selecting
     /// one of these must drive AVMediaSelection, not the sidecar overlay, or the two draw on top of
     /// each other. Empty when no proxy is standing.
@@ -2463,12 +2472,22 @@ public final class AetherEngine: ObservableObject {
         }
         masterFallbackUsed = true
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
+        // AE#535: and only while the display is eligible for HDR, or the answer is about the window.
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
-            Self.panelRefusedHDRMaster = true
-            EngineLog.emit(
-                "[DisplayCriteria] panel refused an HDR master (code=\(rejection.code)); this process "
-                + "routes HDR sources media-direct until it restarts",
-                category: .engine)
+            let eligibleNow = AVPlayer.eligibleForHDRPlayback
+            if MasterFallbackDecision.shouldLatchPanelRefusal(
+                code: rejection.code, displayEligibleForHDRNow: eligibleNow) {
+                Self.panelRefusedHDRMaster = true
+                EngineLog.emit(
+                    "[DisplayCriteria] panel refused an HDR master (code=\(rejection.code)); this process "
+                    + "routes HDR sources media-direct until it returns from the background (#588)",
+                    category: .engine)
+            } else {
+                EngineLog.emit(
+                    "[DisplayCriteria] AE#535 HDR master refused (code=\(rejection.code)) while the display "
+                    + "reads hdrEligible=no; this item falls back, the process does not latch the refusal",
+                    category: .engine)
+            }
         }
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
@@ -2558,12 +2577,21 @@ public final class AetherEngine: ObservableObject {
     /// survived cut `seg0+` on a title 15 s in. While a load is in flight the position that describes
     /// the session is the one THAT load was handed, which it received before the clock was cleared.
     ///
-    /// `.loading` is the whole of that window and nothing else: the only other writer of it holds it
-    /// through startup before the first roll (`host.$timeControlStatus`, which cannot reach it once
-    /// the session has played), so the parked value can never be read after the load it belongs to.
+    /// Round 5 (cmcpherson274, E8-F4): `.loading` was NOT the whole window. The autostart at the tail
+    /// of `load()` writes `.playing` before the new host has published a position, so for the next
+    /// ~50 ms the clock still reads the zero `load()` wrote, and a correction raised the moment a
+    /// rebuild returned rebuilt at the head. `setAudioDelay`'s own catch-up pass sits exactly there,
+    /// and so did a second stepper press 50-90 ms after the first on `.loopback` (measured on the CLI:
+    /// `#3 mount seek: item axis 0.00s`, `cutting seg0+`). A playable session whose clock reads exactly
+    /// the reset zero has not published yet, and the parked value is what it is mounted at. A seek
+    /// retires the parked value (`seek(to:origin:)`), so a genuine seek to 0 is never overridden.
     nonisolated static func rebuildPosition(state: PlaybackState, clock: Double, underReconstruction: Double?) -> Double {
-        guard state == .loading, let parked = underReconstruction else { return clock }
-        return parked
+        guard let parked = underReconstruction else { return clock }
+        switch state {
+        case .loading: return parked
+        case .playing, .paused: return clock == 0 ? parked : clock
+        case .idle, .seeking, .ended, .error: return clock
+        }
     }
 
     /// #227 round 2: whether a finishing session-preserving rebuild is the one that owns the held
@@ -3238,9 +3266,10 @@ public final class AetherEngine: ObservableObject {
 
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
-    /// Written at the two sites that raise `state = .loading` for a load; read only through
-    /// `positionForSessionRebuild`, which is what makes a reload stacked behind another one rebuild at
-    /// the playhead instead of at the head.
+    /// Written at the two sites that raise `state = .loading` for a load, retired by an accepted seek;
+    /// read only through `positionForSessionRebuild`, which is what makes a reload stacked behind
+    /// another one, or raised the moment one returned (round 5), rebuild at the playhead instead of at
+    /// the head.
     var positionUnderReconstruction: Double?
 
     /// AE#464 round 3: the transport intent the load in flight was handed, parked across the same
@@ -3723,6 +3752,7 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleProxy?.tearDown()   // #316
         remoteHLSSubtitleProxy = nil
         injectedSubtitleRenditionNames = [:]
+        detachRemoteHLSCueClock()   // AE#616
         stallRecoveryWindowUntil = .distantPast
         stallRecoveryReasserts = 0
         stallReengageTask?.cancel()
@@ -5080,6 +5110,9 @@ public final class AetherEngine: ObservableObject {
                 + (held ? ", the place it held" : ", which is as close to it as the cache still reaches"),
                 category: .engine)
         }
+        // AE#464 round 5: from here the seek target describes the session, not the load before it,
+        // so a landing at exactly 0 is never read as a clock that has not published yet.
+        positionUnderReconstruction = nil
         state = .seeking
         // Span isSeeking across the real landing, not just the optimistic .playing flip (#38).
         // Generation guard at each finalize point prevents a superseded seek from clearing it.
@@ -5786,6 +5819,7 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleProxy?.tearDown()
         remoteHLSSubtitleProxy = nil
         injectedSubtitleRenditionNames = [:]
+        detachRemoteHLSCueClock()   // AE#616
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []
@@ -7076,6 +7110,7 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleProxy?.tearDown()
         remoteHLSSubtitleProxy = nil
         injectedSubtitleRenditionNames = [:]
+        detachRemoteHLSCueClock()   // AE#616
         EngineLog.emit(
             "[AetherEngine] #597 background teardown: remote-HLS subtitle proxy released",
             category: .engine)

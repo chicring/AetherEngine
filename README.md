@@ -42,10 +42,11 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [Syravo](https://syravo.app): Xtream Codes, Jellyfin and radio client for iPhone, iPad and Apple TV.
 - [KIPTV](https://kiptv.app): Premium, cross-platform IPTV Player.
 - [Silo](https://github.com/Silo-Server/silo-apple): native iOS, tvOS and macOS client for the Silo self-hosted media server.
-- [File Box](https://apps.apple.com/app/id6765818194): File Box is a simple and practical local file manager that makes it easy to manage, view, organize, and process your files on iPhone and iPad.
+- [File Box](https://apps.apple.com/app/id6765818194): File Box is a simple and practical local file manager on iPhone and iPad.
 - [Moonfin](https://github.com/Moonfin-Client/Moonfin-Core): A multi-platform third party Jellyfin client.
 - [Vivid](https://github.com/blurbery/vivid): open-source media app for iPhone, iPad and Apple TV.
 - [Snappier IPTV](https://apps.apple.com/gb/app/snappier-iptv/id1579702567): IPTV App for iOS/iPadOS and tvOS.
+- [stashy](https://stashy.shelf.am/): iOS/tvOS native player for stash.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -342,7 +343,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.14.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.15.1")
 ```
 
 Three samples ship in `Examples/`:
@@ -589,10 +590,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.14.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.15.1")
 ```
 
-Pin to `.upToNextMinor(from: "7.14.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.15.1")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
