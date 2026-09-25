@@ -545,8 +545,12 @@ public final class Demuxer: @unchecked Sendable {
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
         isLive: Bool = false
     ) throws {
-        try provider.open()
+        // Registered BEFORE open(): provider.open() can block for the whole reconnect budget on
+        // a stalled origin, and markClosed() during that window must reach the reader — with the
+        // assignment after open() it found avioProvider nil and the in-flight open kept issuing
+        // connections past engine.stop().
         avioProvider = provider
+        try provider.open()
         onOpenProgress?(.sourceOpened)   // #361
 
         // AE#460 follow-up: a live source rebuilt on a RETAINED reader resumes where that reader

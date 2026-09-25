@@ -34,6 +34,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// socket alive dripping `tickBytes` every `tickUs` forever. Every drip is a delivery,
         /// so a gap watchdog re-arms on each one while the read starves all the same.
         case serveThenTrickle(afterBytes: Int64, tickBytes: Int, tickUs: useconds_t)
+        /// True blackhole: the request was accepted and read, and NOTHING is ever written back —
+        /// not even a response line. Unlike `serveThenGoSilent(afterBytes: 0)` (headers, then
+        /// silence), the client cannot tell a hung handshake from an origin sitting on the GET.
+        /// The serving thread parks on the socket until the client hangs up or `stop()` runs.
+        case blackhole
     }
 
     let port: UInt16
@@ -51,6 +56,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
     private let respond: @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive
+    /// Optional override consulted before `respond`: returns a Directive, or nil to fall through
+    /// to `respond`. Carries `isSuffix` so a test can target "the first non-suffix data request"
+    /// (the suffix tail prefetch is otherwise indistinguishable by offset alone), and `rangeEnd`
+    /// so a data connection's large range can be told apart from a byte-0 size probe.
+    private let respondEx: @Sendable (_ requestIndex: Int, _ offset: Int64, _ rangeEnd: Int64?, _ path: String, _ isSuffix: Bool) -> Directive?
     /// #388: how many requests this origin tolerates at once before it answers 509, the way a
     /// connection-capped panel does. nil keeps every existing test on the unmetered behaviour.
     private let refuseAboveConcurrency: Int?
@@ -138,7 +148,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
           refuseAboveConcurrency: Int? = nil,
           ignoreRangeEnd: Bool = false,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
-          respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
+          respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 },
+          respondEx: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ rangeEnd: Int64?, _ path: String, _ isSuffix: Bool) -> Directive? = { _, _, _, _, _ in nil }) {
+        self.respondEx = respondEx
         self.totalSize = totalSize
         self.ignoreRangeEnd = ignoreRangeEnd
         self.chunkBytes = chunkBytes
@@ -304,7 +316,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
         var trickle: (after: Int64, tick: Int, us: useconds_t)? = nil
-        switch respond(requestIndex, offset, path) {
+        switch respondEx(requestIndex, offset, rangeEnd, path, isSuffix) ?? respond(requestIndex, offset, path) {
         case .serve206:
             break
         case .serveThenGoSilent(let afterBytes):
@@ -328,6 +340,16 @@ final class ThrottledOriginServer: @unchecked Sendable {
         case .dropConnection:
             // Returning false ends `serve`, which closes the fd exactly once.
             shutdown(fd, SHUT_RDWR)
+            return false
+        case .blackhole:
+            // Park on the socket: a client close (n == 0) or `stop()`'s shutdown (n < 0) ends it.
+            // `firstByteDelayUs` below is never reached for this request, which is what makes the
+            // shape a blackhole rather than a slow answer.
+            var drain = [UInt8](repeating: 0, count: 4096)
+            while !stopped {
+                let n = recv(fd, &drain, drain.count, 0)
+                if n <= 0 { return false }
+            }
             return false
         }
 

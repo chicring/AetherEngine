@@ -622,6 +622,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// In-flight live reopen demuxer, registered before its blocking open so `stop()` can abort it
     /// (prevents orphan reconnect loops across channel zaps).
     var reopenDemuxer: Demuxer?
+    /// In-flight fallback demuxer inside `start()`, registered before its blocking open for the
+    /// same reason (restartLock-guarded, cleared when open returns).
+    var openingDemuxer: Demuxer?
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
@@ -1084,12 +1087,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
             dem = preopened
             preopenedDemuxer = nil
         } else {
-            dem = Demuxer()
+            let opening = Demuxer()
+            // Registered BEFORE open() runs: a stop() landing while the source open is blocked
+            // markClosed()es it, the same abort in-flight load opens get on the engine side.
+            restartLock.lock()
+            openingDemuxer = opening
+            restartLock.unlock()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
+                try opening.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
             } catch {
+                restartLock.lock()
+                openingDemuxer = nil
+                restartLock.unlock()
                 throw Self.openFailure(from: error)
             }
+            restartLock.lock()
+            openingDemuxer = nil
+            restartLock.unlock()
+            dem = opening
         }
         demuxer = dem
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged   // surface source stall/reconnect to playbackPhase (#85)
@@ -2436,12 +2451,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         ownedCodecParams = []
         let reopening = reopenDemuxer
         reopenDemuxer = nil
+        // A demuxer mid-open inside start() is not yet `demuxer`; without this slot a stop()
+        // during that open left it reconnecting past teardown.
+        let opening = openingDemuxer
+        openingDemuxer = nil
         // #199: factory-vended ingest reader feeding the current demuxer; session-owned, closed here.
         let reopenReader = reopenCustomReader
         reopenCustomReader = nil
         segmentPlan = []
         restartLock.unlock()
         reopening?.markClosed()
+        opening?.markClosed()
         // Close before waitForFinish: cancels the reader's FIFO so a pump parked in a blocking
         // custom-IO read unblocks (mirrors markClosed for URL demuxers).
         reopenReader?.close()

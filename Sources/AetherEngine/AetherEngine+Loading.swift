@@ -1889,13 +1889,18 @@ extension AetherEngine {
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
+        // The fallback open runs detached below; register it on the main actor FIRST so a stop()
+        // landing mid-open can markClosed() it (in-flight opens otherwise outlive the session).
+        let openingDemuxer: Demuxer? = preopenedDemuxer == nil ? Demuxer() : nil
+        if let openingDemuxer { noteInFlightOpen(openingDemuxer) }
+        defer { if let openingDemuxer { forgetInFlightOpen(openingDemuxer) } }
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, openingDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
-                dem = Demuxer()
+                dem = openingDemuxer!
                 try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
@@ -1966,13 +1971,18 @@ extension AetherEngine {
             Task { @MainActor in self?.setReaderNetworkPhase(phase) }
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
+        // Same registration as loadSoftware: the detached fallback open must be markClosed-able
+        // by a stop() that lands while it is still running.
+        let openingDemuxer: Demuxer? = preopenedDemuxer == nil ? Demuxer() : nil
+        if let openingDemuxer { noteInFlightOpen(openingDemuxer) }
+        defer { if let openingDemuxer { forgetInFlightOpen(openingDemuxer) } }
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, openingDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
-                dem = Demuxer()
+                dem = openingDemuxer!
                 try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
@@ -2231,14 +2241,16 @@ extension AetherEngine {
             do {
                 let isLiveReload = loadedOptions.isLive
                 let discCacheKey = url.absoluteString
+                let reopening = Demuxer()
+                noteInFlightOpen(reopening)
+                defer { forgetInFlightOpen(reopening) }
                 customPreopened = try await Task.detached(priority: .userInitiated) {
-                    let d = Demuxer()
                     // isLive preserved: a live custom source must not trigger SEEK_END on reopen.
                     // selectTitleID rebuilds the disc concat stream for the chosen title (#67).
                     // discCacheKey reuses the disc recognition cached at load so an audio switch on a
                     // remote ISO does not re-parse the UDF directory / playlists (#76).
-                    try d.open(reader: reader, formatHint: hint, profile: reloadProfile, isLive: isLiveReload, selectTitleID: titleToReopen, discCacheKey: discCacheKey)
-                    return d
+                    try reopening.open(reader: reader, formatHint: hint, profile: reloadProfile, isLive: isLiveReload, selectTitleID: titleToReopen, discCacheKey: discCacheKey)
+                    return reopening
                 }.value
             } catch {
                 EngineLog.emit("[AetherEngine] reload: custom reader reopen failed: \(error)", category: .engine)
@@ -2260,10 +2272,12 @@ extension AetherEngine {
             // survives the reload (#67).
             let headers = loadedOptions.httpHeaders
             do {
+                let reopening = Demuxer()
+                noteInFlightOpen(reopening)
+                defer { forgetInFlightOpen(reopening) }
                 customPreopened = try await Task.detached(priority: .userInitiated) {
-                    let d = Demuxer()
-                    try d.open(url: url, extraHeaders: headers, profile: reloadProfile, selectTitleID: titleToReopen)
-                    return d
+                    try reopening.open(url: url, extraHeaders: headers, profile: reloadProfile, selectTitleID: titleToReopen)
+                    return reopening
                 }.value
             } catch {
                 EngineLog.emit("[AetherEngine] reload: disc URL reopen failed: \(error)", category: .engine)
@@ -2296,10 +2310,12 @@ extension AetherEngine {
                                       declaredDuration: loadedOptions.declaredDurationSeconds)
                 .withHeldSourceConnection(loadedOptions.heldSourceConnection)
             do {
+                let reopening = Demuxer()
+                noteInFlightOpen(reopening)
+                defer { forgetInFlightOpen(reopening) }
                 customPreopened = try await Task.detached(priority: .userInitiated) {
-                    let d = Demuxer()
-                    try d.open(url: url, extraHeaders: headers, profile: urlReloadProfile, isLive: isLiveReload)
-                    return d
+                    try reopening.open(url: url, extraHeaders: headers, profile: urlReloadProfile, isLive: isLiveReload)
+                    return reopening
                 }.value
             } catch {
                 customPreopened = nil

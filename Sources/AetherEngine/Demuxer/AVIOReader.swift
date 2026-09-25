@@ -751,6 +751,120 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connRetryAfter: TimeInterval = 0
     // Bumped on every (re)connect; stale delegate callbacks are ignored.
     private var connGeneration = 0
+    /// Monotonic issuer behind `connGeneration`. A standby generation promoted back to current
+    /// restores its own (smaller) number to `connGeneration`; only this counter guarantees the
+    /// next issued generation is still unique.
+    private var generationSeq = 0
+    /// Caller holds winCond. Every point that takes the link over from the previous generation
+    /// issues through here rather than bumping `connGeneration` in place.
+    private func issueGeneration() -> Int {
+        generationSeq &+= 1
+        connGeneration = generationSeq
+        return generationSeq
+    }
+    /// A never-delivered VOD generation that reached its first-byte verdict is parked here rather
+    /// than cancelled: it stays on the link while the replacement races it, and whichever answers
+    /// first wins. The loser is cancelled. At most one parked generation exists per reader, so the
+    /// reader holds at most two origin slots (active + standby). winCond-guarded.
+    private var standbyTransfer: (any PersistentTransfer)?
+    private var standbyGeneration = 0
+    private var standbyOffset: Int64 = 0
+    private var standbyRangeEnd: Int64?
+    private var standbyStartedAt = DispatchTime.now()
+    /// Bumped when a standby takes the link over. The read loop's fast-stall clock can span a
+    /// promotion (the parked generation restores its own number to `connGeneration`, which may
+    /// equal the generation the clock was armed on), so it re-arms on this as well as on the
+    /// generation itself, and a verdict taken before a promotion must not kill what answered
+    /// during the backoff. winCond-guarded.
+    private var promotionEpoch = 0
+    /// Caller holds winCond; the returned transfer is cancelled + ticket-released by the caller
+    /// AFTER the lock is dropped (cancelTransfer is never invoked under winCond).
+    private func evictStandbyLocked() -> (any PersistentTransfer)? {
+        let evicted = standbyTransfer
+        standbyTransfer = nil
+        return evicted
+    }
+    /// Caller holds winCond. Parks `transfer` (the generation's still-live connection) into the
+    /// standby slot. `toCancel` is the transfer the caller must cancel outside the lock — the
+    /// evicted previous standby, or the newcomer itself when a standby with more flight time is
+    /// already parked: the older one has waited longer and is the closer of the two to answering,
+    /// so on a slow origin the slot keeps the request with the most flight time invested.
+    /// `parked` reports whether this generation actually took the slot.
+    private func parkStandbyLocked(transfer: any PersistentTransfer, generation: Int,
+                                   offset: Int64, rangeEnd: Int64?,
+                                   startedAt: DispatchTime)
+        -> (toCancel: (any PersistentTransfer)?, parked: Bool) {
+        if standbyTransfer != nil {
+            let standbyAge = Double(DispatchTime.now().uptimeNanoseconds
+                                    - standbyStartedAt.uptimeNanoseconds) / 1_000_000_000
+            if standbyAge < connStallTimeout {
+                return (transfer, false)
+            }
+        }
+        let evicted = standbyTransfer
+        standbyTransfer = transfer
+        standbyGeneration = generation
+        standbyOffset = offset
+        standbyRangeEnd = rangeEnd
+        standbyStartedAt = startedAt
+        return (evicted, true)
+    }
+    /// A parked generation's lease: unanswered after `connStallTimeout` it is finally cancelled.
+    private func armStandbyExpiry(generation: Int) {
+        Self.deliveryGapQueue.asyncAfter(deadline: .now() + connStallTimeout) { [weak self] in
+            self?.expireStandby(generation: generation)
+        }
+    }
+    private func expireStandby(generation: Int) {
+        if isClosed { return }
+        winCond.lock()
+        guard generation == standbyGeneration, let transfer = standbyTransfer else {
+            winCond.unlock()
+            return
+        }
+        standbyTransfer = nil
+        winCond.unlock()
+        transfer.cancelTransfer()
+        transfer.releaseOriginTicket()
+        EngineLog.emit(
+            "[AVIOReader] \(label) standby gen=\(generation) never answered within "
+            + "\(Int(connStallTimeout))s; cancelled",
+            category: .demux, level: .verbose)
+    }
+    /// Caller holds winCond; returns the doomed current transfer (to cancel after unlock) when the
+    /// standby was promoted, or the evicted standby when it lost / was dropped. `answeredFor`
+    /// distinguishes the promoted log line. The promoted generation keeps its ORIGINAL number:
+    /// `generationSeq` is already ahead, so no future issue collides.
+    private func resolveStandbyLocked(generation: Int, answered: Bool)
+        -> (doomed: (any PersistentTransfer)?, doomedGeneration: Int, promoted: Bool) {
+        guard generation == standbyGeneration, let parked = standbyTransfer else {
+            return (nil, 0, false)
+        }
+        standbyTransfer = nil
+        // The standby wins only while the current generation has not won the link itself — no
+        // successful (2xx) response, no first byte. A REFUSED current (429/509/4xx) does not count
+        // as answered: it lost the race, and dropping the standby over it would cancel the one
+        // connection that was actually going to deliver.
+        let currentSilent = !(connStatus == 200 || connStatus == 206) && !connFirstDataSeen
+        guard answered, currentSilent else {
+            return (parked, 0, false)
+        }
+        let doomed = activeTransfer
+        let doomedGeneration = connGeneration
+        activeTransfer = parked
+        connGeneration = generation
+        connRequestedOffset = standbyOffset
+        connRangeEnd = standbyRangeEnd
+        connStartedAt = standbyStartedAt
+        connEnded = false
+        connEndedByBackpressure = false
+        connEndedAtRangeEnd = false
+        connStatus = 0
+        connRetryAfter = 0
+        promotionEpoch += 1
+        winCond.broadcast()
+        return (doomed, doomedGeneration, true)
+    }
     /// #377: what is on the link for this reader. Either shape is ONE request against the
     /// origin holding one slot of its budget; they differ only in who decides when bytes
     /// move, and every other piece of this reader (window, frontier, reconnect ladder,
@@ -1322,7 +1436,24 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func awaitFirstPersistentData() -> Bool {
         winCond.lock()
         let deadline = Date(timeIntervalSinceNow: 15)
-        while window.isEmpty && !connEnded && !isClosed {
+        var lastHedgeIssue = Date.distantPast
+        while window.isEmpty && !isClosed {
+            if connEnded {
+                guard standbyTransfer != nil else { break }
+                // The connection was parked on standby, not answered dead — the read loop is not
+                // running during open(), so the replacement the watchdog broadcast for has to be
+                // issued here, and the wait continues on whichever side answers first. Spaced so a
+                // connection-capped origin refusing the extras is not hammered while the standby
+                // still holds its slot.
+                if Date().timeIntervalSince(lastHedgeIssue) >= 0.5 {
+                    lastHedgeIssue = Date()
+                    let offset = connRequestedOffset
+                    winCond.unlock()
+                    startPersistentConnection(at: offset)
+                    winCond.lock()
+                    continue
+                }
+            }
             if !winCond.wait(until: deadline) { break }
         }
         let gotData = !window.isEmpty
@@ -1422,7 +1553,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { winCond.unlock() }
         if fileSize > 0 { return (true, nil, connStatus) }
         let status = connStatus
-        connGeneration &+= 1
+        _ = issueGeneration()
         let transfer = activeTransfer
         activeTransfer = nil
         window = Data()
@@ -1508,7 +1639,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if wasSuspended { sTask?.resume() }
         sTask?.cancel()
         winCond.lock()
-        connGeneration &+= 1
+        _ = issueGeneration()
         // #93/#96 residual: cancel the persistent Range GET here, not only in close(). markClosed is
         // the abort used by the #79 reopen path (dem.markClosed() to unblock a wedged read); leaving
         // its long-lived open-ended connection alive lets it keep draining the origin for the whole
@@ -1519,6 +1650,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let transfer = activeTransfer
         activeTransfer = nil
         connEnded = true
+        // A parked standby dies with the reader like the active connection does.
+        let parked = evictStandbyLocked()
         // #281: a speculative fetch outlives nothing. Same reasoning as the persistent GET above:
         // an abandoned reader's in-flight request fair-shares the origin with the fresh reader's
         // cold read, which is the starvation this whole area keeps paying for.
@@ -1530,6 +1663,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.unlock()
         transfer?.cancelTransfer()
         transfer?.releaseOriginTicket()   // #377: the fresh reader asks for this slot next
+        parked?.cancelTransfer()
+        parked?.releaseOriginTicket()
         tailTask?.cancel()
     }
 
@@ -1575,10 +1710,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         sSession?.invalidateAndCancel()
 
         winCond.lock()
-        connGeneration &+= 1
+        _ = issueGeneration()
         connEnded = true
         let transfer = activeTransfer
         activeTransfer = nil
+        let parked = evictStandbyLocked()
         window = Data()
         // #281: both spans hold real bytes (up to headSpanMaxBytes + tailPrefetchBytes), so they
         // are released with the window rather than living until the reader is deallocated.
@@ -1595,6 +1731,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // explicitly. Invalidating used to be what released this connection.
         transfer?.cancelTransfer()
         transfer?.releaseOriginTicket()
+        parked?.cancelTransfer()
+        parked?.releaseOriginTicket()
     }
 
     // MARK: - Read (called by FFmpeg on demux thread)
@@ -1828,6 +1966,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // on a path that is not this connection — and slid forward whenever the generation
         // delivers at least `fastStallMinDelivery` within one window.
         var fastStallGeneration = -1
+        var fastStallEpoch = -1
         var fastStallFrontier: Int64 = 0
         var fastStallSince: Date?
         func msSince(_ t: DispatchTime) -> Double {
@@ -2167,6 +2306,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let status = connStatus
             let retryAfter = connRetryAfter
             let rangeRefused = rangeIgnoredExceeded()
+            // The ended-ladder verdict below is re-checked after its backoff: a standby
+            // promoted meanwhile owns the link again.
+            let endedGenAtVerdict = connGeneration
+            let endedEpochAtVerdict = promotionEpoch
+            let endedFirstDataAtVerdict = connFirstDataSeen
 
             if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
                 winCond.unlock()
@@ -2209,18 +2353,34 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // ended/refill paths own that recovery); one that delivered the floor
                 // slides the window; one that did neither is judged below.
                 let frontierNow = winStart + Int64(window.count)
-                let deliveryGapNow = secondsSinceNetworkDelivery()
+                // The stall verdict below is this GENERATION's business: `lastDeliveryAt` is
+                // rebased at every connection start, so a recovery attempt gets its own
+                // connStallTimeout window. The reader-level secondsSinceNetworkDelivery() would
+                // carry a previous blackout's silence into each new generation and retire it at
+                // the first ~1 s poll — inside its own TTFB.
+                let deliveryGapNow = Double(DispatchTime.now().uptimeNanoseconds
+                                            - lastDeliveryAt.uptimeNanoseconds) / 1_000_000_000
                 // `ended` was sampled before the wait; a generation can end while the wait
                 // sleeps. Route that through the ended ladder next iteration rather than
                 // letting a stall verdict act on a connection that is already over.
                 let endedNow = connEnded
+                // A verdict taken below belongs to THIS generation. A standby promotion during
+                // the backoff swaps the link back to a generation that has already answered,
+                // so each reconnect site re-checks these before acting.
+                let genAtVerdict = connGeneration
+                let epochAtVerdict = promotionEpoch
+                let firstDataAtVerdict = connFirstDataSeen
                 var fastStallFired = false
                 var starveElapsed: TimeInterval = 0
                 var starveDelivered: Int64 = 0
                 if !isLive && !endedNow {
+                    // A promotion restores the parked generation's own number, which can equal
+                    // the one the clock was armed on; the epoch keeps the timer from spanning it.
                     if activeTransfer == nil || connGeneration != fastStallGeneration
+                        || promotionEpoch != fastStallEpoch
                         || frontierNow < fastStallFrontier {
                         fastStallGeneration = connGeneration
+                        fastStallEpoch = promotionEpoch
                         fastStallFrontier = frontierNow
                         fastStallSince = Date()
                     } else if frontierNow - fastStallFrontier >= Self.fastStallMinDelivery {
@@ -2263,7 +2423,26 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     let backoffStart = DispatchTime.now()
                     backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
                     diag.recordBackoff(ms: msSince(backoffStart))
-                    timedReconnect(seek: false, at: frontierNow)
+                    // A standby promoted during the backoff — or the judged connection having
+                    // delivered — makes the verdict stale: the link is live again.
+                    winCond.lock()
+                    let recovered = !connEnded && activeTransfer != nil
+                        && (connGeneration != genAtVerdict
+                            || promotionEpoch != epochAtVerdict
+                            || (connFirstDataSeen && !firstDataAtVerdict))
+                    let recoveredGen = connGeneration
+                    winCond.unlock()
+                    if recovered {
+                        EngineLog.emit(
+                            "[AVIOReader] \(label) recovered during backoff (gen=\(recoveredGen)); skipping reconnect",
+                            category: .demux)
+                        // Re-arm the clock against whatever now owns the link — a generation
+                        // that delivered once can still starve underneath it.
+                        fastStallSince = Date()
+                        fastStallFrontier = frontierNow
+                    } else {
+                        timedReconnect(seek: false, at: frontierNow)
+                    }
                     continue
                 }
                 // A false return now means the ~1 s poll elapsed with no wake, not the
@@ -2284,7 +2463,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     let backoffStart = DispatchTime.now()
                     backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
                     diag.recordBackoff(ms: msSince(backoffStart))
-                    timedReconnect(seek: false, at: frontier)
+                    // The judged connection may have delivered its first byte during the backoff,
+                    // or a standby may have been promoted over it; a live, delivering generation
+                    // is not the one the verdict was about.
+                    winCond.lock()
+                    let rescued = !connEnded && activeTransfer != nil
+                        && (connGeneration != genAtVerdict
+                            || promotionEpoch != epochAtVerdict
+                            || (connFirstDataSeen && !firstDataAtVerdict))
+                    let rescuedGen = connGeneration
+                    winCond.unlock()
+                    if rescued {
+                        EngineLog.emit(
+                            "[AVIOReader] \(label) recovered during backoff (gen=\(rescuedGen)); skipping reconnect",
+                            category: .demux)
+                    } else {
+                        timedReconnect(seek: false, at: frontier)
+                    }
                 }
                 continue
             }
@@ -2346,7 +2541,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // the source belongs to the same origin.
             backoffBeforeReconnect(streak: repinned ? 0 : backoffStreak, retryAfter: retryAfter)
             diag.recordBackoff(ms: msSince(backoffStart))
-            timedReconnect(seek: false, at: frontier)
+            winCond.lock()
+            let recovered = !connEnded && activeTransfer != nil
+                && (connGeneration != endedGenAtVerdict
+                    || promotionEpoch != endedEpochAtVerdict
+                    || (connFirstDataSeen && !endedFirstDataAtVerdict))
+            let recoveredGen = connGeneration
+            winCond.unlock()
+            if recovered {
+                EngineLog.emit(
+                    "[AVIOReader] \(label) recovered during backoff (gen=\(recoveredGen)); skipping reconnect",
+                    category: .demux)
+            } else {
+                timedReconnect(seek: false, at: frontier)
+            }
         }
 
         return Int32(totalRead)
@@ -2757,7 +2965,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         var request = URLRequest(url: url)
         request.setValue("bytes=-\(Self.tailPrefetchBytes)", forHTTPHeaderField: "Range")
-        request.timeoutInterval = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
+        // A speculative parallel request, not an interactive fetch: it only leaves when a slot
+        // is free (tryAcquire below), so it can afford to wait out a slow TTFB that the tight
+        // detour budget would abandon — the serial detour read keeps the short budget.
+        request.timeoutInterval = max(
+            Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout),
+            connStallTimeout)
         applyExtraHeaders(&request)
 
         // A delegate rather than a completion handler, and the distinction is load-bearing: a
@@ -2960,8 +3173,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// connection are ignored.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil) {
         winCond.lock()
-        connGeneration &+= 1
-        let generation = connGeneration
+        // The outgoing generation's bookkeeping is still installed here; capture it before the
+        // reset below so a never-delivered connection being replaced in place can be parked on
+        // standby instead of cancelled.
+        let oldGeneration = connGeneration
+        let oldFirstDataSeen = connFirstDataSeen
+        let oldConnEnded = connEnded
+        let oldOffset = connRequestedOffset
+        let oldRangeEnd = connRangeEnd
+        let oldStartedAt = connStartedAt
+        let generation = issueGeneration()
         // #220: VOD asks for a fixed amount at a time, so the origin cannot deliver more than
         // was requested and the window is bounded by construction rather than by reaction. Two
         // cases keep the open-ended form: live, where the material is produced in real time so
@@ -3028,15 +3249,47 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // faulted lineage.
         let oldTransfer = activeTransfer
         activeTransfer = nil
+        // F1: a never-delivered VOD connection being replaced in place (the same offset the read
+        // loop re-asks for) is parked on standby rather than cancelled — it may still answer
+        // first, and whichever does wins the link back. A reposition abandons the parked range:
+        // its bytes would append at the wrong place, so a standby whose offset no longer matches
+        // is evicted here.
+        var parkedOld = false
+        var toCancel: (any PersistentTransfer)? = nil
+        var cancelOldTransfer = true
+        if let oldTransfer, !isLive, !heldConnectionEnabled, !oldFirstDataSeen, !oldConnEnded,
+           offset == oldOffset {
+            let parked = parkStandbyLocked(transfer: oldTransfer, generation: oldGeneration,
+                                           offset: oldOffset, rangeEnd: oldRangeEnd,
+                                           startedAt: oldStartedAt)
+            toCancel = parked.toCancel
+            parkedOld = parked.parked
+            // Parked or not, the slot owns the outgoing transfer's fate: a refused park returns
+            // the transfer itself as `toCancel`, so it is never cancelled twice.
+            cancelOldTransfer = false
+        } else if standbyTransfer != nil, offset != standbyOffset {
+            toCancel = evictStandbyLocked()
+        }
         winCond.broadcast()
         winCond.unlock()
 
-        oldTransfer?.cancelTransfer()
-        // #377: hand the old range's origin slot back HERE rather than waiting for its
-        // `didCompleteWithError`, which arrives asynchronously. On a single-slot origin the pump
-        // would otherwise queue behind its own previous range at every 32 MB boundary and spend
-        // its whole acquire budget waiting for itself.
-        oldTransfer?.releaseOriginTicket()
+        if parkedOld {
+            armStandbyExpiry(generation: oldGeneration)
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(oldGeneration) never delivered; parked on standby, "
+                + "replaced by gen=\(generation)",
+                category: .demux, level: .verbose)
+        }
+        if cancelOldTransfer {
+            oldTransfer?.cancelTransfer()
+            // #377: hand the old range's origin slot back HERE rather than waiting for its
+            // `didCompleteWithError`, which arrives asynchronously. On a single-slot origin the pump
+            // would otherwise queue behind its own previous range at every 32 MB boundary and spend
+            // its whole acquire budget waiting for itself.
+            oldTransfer?.releaseOriginTicket()
+        }
+        toCancel?.cancelTransfer()
+        toCancel?.releaseOriginTicket()
 
         if isClosed { return }
 
@@ -3242,17 +3495,39 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let frontier = winStart + Int64(window.count)
         let ahead = window.count - max(0, Int(position - winStart))
         let sawData = connFirstDataSeen
+        // F1: a VOD generation that never delivered is parked on standby, not cancelled — a slow
+        // origin (TTFB past the witness delay) is indistinguishable from a dead one until it
+        // answers, and cancelling makes a >5.2 s first byte unplayable forever (the reconnect it
+        // replaced raced the same delay). The parked connection still owns its ticket: it is
+        // still on the link, so the slot stays spent until it answers or its lease expires.
+        let parkable = !isLive && !sawData && !heldConnectionEnabled
+        let parked = parkable
+            ? parkStandbyLocked(transfer: transfer, generation: generation,
+                                offset: connRequestedOffset, rangeEnd: connRangeEnd,
+                                startedAt: connStartedAt)
+            : (toCancel: nil, parked: false)
         winCond.broadcast()
         winCond.unlock()
-        transfer.cancelTransfer()
-        transfer.releaseOriginTicket()   // #377: a stalled connection must not hold the slot
-        // The witness the field case had no line for: `bytesFetched` sat frozen for minutes and
-        // nothing said so. Release-visible, and rare by construction (one per faulted generation).
-        EngineLog.emit(
-            "[AVIOReader] \(label) gen=\(generation) no delivery for \(String(format: "%.1f", gap))s"
-            + " at offset \(frontier) (\(ahead / 1024)KB read-ahead held,"
-            + " \(sawData ? "had delivered" : "never delivered") data); ending it",
-            category: .demux)
+        if parked.parked {
+            armStandbyExpiry(generation: generation)
+            parked.toCancel?.cancelTransfer()
+            parked.toCancel?.releaseOriginTicket()
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(generation) no first byte for "
+                + "\(String(format: "%.1f", gap))s at offset \(frontier); "
+                + "keeping it on standby, replacing",
+                category: .demux)
+        } else {
+            transfer.cancelTransfer()
+            transfer.releaseOriginTicket()   // #377: a stalled connection must not hold the slot
+            // The witness the field case had no line for: `bytesFetched` sat frozen for minutes and
+            // nothing said so. Release-visible, and rare by construction (one per faulted generation).
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(generation) no delivery for \(String(format: "%.1f", gap))s"
+                + " at offset \(frontier) (\(ahead / 1024)KB read-ahead held,"
+                + " \(sawData ? "had delivered" : "never delivered") data); ending it",
+                category: .demux)
+        }
     }
 
     /// Force-copies `data` into the sliding window and applies backpressure by ENDING the
@@ -3263,11 +3538,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// releases source dispatch_data per delivery (same leak control as the chunk path).
     fileprivate func appendPersistentData(_ data: Data, generation: Int) {
         winCond.lock()
+        var standbyToCancel: (any PersistentTransfer)? = nil
+        if generation == standbyGeneration, standbyTransfer != nil {
+            // F1: the parked generation delivered while the replacement is still silent —
+            // promote it so its bytes append through the normal current-generation path. A
+            // current generation that already answered won the race; the parked one loses
+            // and its late bytes are dropped with it.
+            let resolved = resolveStandbyLocked(generation: generation, answered: true)
+            standbyToCancel = resolved.doomed
+            if !resolved.promoted {
+                staleGenDroppedBytes += Int64(data.count)
+                winCond.unlock()
+                standbyToCancel?.cancelTransfer()
+                standbyToCancel?.releaseOriginTicket()
+                return
+            }
+        } else if generation == connGeneration, standbyTransfer != nil {
+            // First byte on the current generation ends the race: the standby leaves the link.
+            standbyToCancel = evictStandbyLocked()
+        }
         guard generation == connGeneration, !isFullyClosed else {
             // #93: a slow read's summary line reports how much data the stale-generation
             // guard discarded while the read waited.
             staleGenDroppedBytes += Int64(data.count)
             winCond.unlock()
+            standbyToCancel?.cancelTransfer()
+            standbyToCancel?.releaseOriginTicket()
             return
         }
         lastDeliveryAt = DispatchTime.now()   // #309: the delivery-gap watchdog's only input
@@ -3350,6 +3646,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.broadcast()
         }
         winCond.unlock()
+        if let standbyToCancel {
+            standbyToCancel.cancelTransfer()
+            standbyToCancel.releaseOriginTicket()
+        }
         if let toCancel {
             EngineLog.emit(
                 "[AVIOReader] \(label) window high water: \(ahead / 1024 / 1024)MB ahead; ending the "
@@ -3400,7 +3700,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                               respondedBy: respondedBy)
         }
         var headerMs: Double? = nil
+        var toCancelOutside: (any PersistentTransfer)? = nil
+        var promotion: (answeredAfter: TimeInterval, cancelledGen: Int)? = nil
         winCond.lock()
+        if generation == standbyGeneration, standbyTransfer != nil {
+            // F1: the parked generation answered while the replacement is still silent — it wins
+            // the link back and the doomed current is cancelled below. A non-2xx answer loses
+            // silently: the standby was never judged productive, so there is nothing to charge.
+            let resolved = resolveStandbyLocked(generation: generation,
+                                                answered: status == 200 || status == 206)
+            toCancelOutside = resolved.doomed
+            if resolved.promoted {
+                promotion = (Double(DispatchTime.now().uptimeNanoseconds
+                                    - connStartedAt.uptimeNanoseconds) / 1_000_000_000,
+                             resolved.doomedGeneration)
+            } else {
+                winCond.unlock()
+                toCancelOutside?.cancelTransfer()
+                toCancelOutside?.releaseOriginTicket()
+                return false
+            }
+        } else if generation == connGeneration, standbyTransfer != nil,
+                  status == 200 || status == 206 {
+            // A SUCCESSFUL response on the current generation ends the race; a refusal (429/509)
+            // does not — the parked standby may still be the one that delivers.
+            toCancelOutside = evictStandbyLocked()
+        }
         if generation == connGeneration {
             connStatus = status
             connRetryAfter = retryAfter
@@ -3466,6 +3791,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
         }
         winCond.unlock()
+        if let promotion {
+            EngineLog.emit(
+                "[AVIOReader] \(label) standby gen=\(generation) answered after "
+                + "\(String(format: "%.1f", promotion.answeredAfter))s; promoted, "
+                + "cancelling gen=\(promotion.cancelledGen)",
+                category: .demux)
+            // The promoted generation has no live watchdog (its gap closure already ran and
+            // parked it); re-arm so a headers-no-body answer is still judged on the witness clock.
+            armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
+        }
+        toCancelOutside?.cancelTransfer()
+        toCancelOutside?.releaseOriginTicket()
         if let headerMs, headerMs > 2000 {
             EngineLog.emit(
                 "[AVIOReader] gen=\(generation) response headers after \(Int(headerMs))ms status=\(status)",
@@ -3515,6 +3852,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
         winCond.lock()
         let isCurrentGen = (generation == connGeneration)
+        // A parked standby that ends on its own (transport error, or the bounded range actually
+        // completing) leaves the slot silently: it was never judged, so there is nothing to
+        // charge, and its ticket was already returned by the delegate's completion.
+        let wasStandby = !isCurrentGen && generation == standbyGeneration && standbyTransfer != nil
+        if wasStandby { standbyTransfer = nil }
         if isCurrentGen {
             connEnded = true
             // #220: the refill below keys off there being no live connection, so the finished
@@ -3528,7 +3870,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let windowAhead = isCurrentGen ? (window.count - max(0, Int(position - winStart))) : 0
         winCond.broadcast()
         winCond.unlock()
-        if let error, !(deliberateEnd && (error as? URLError)?.code == .cancelled) {
+        if let error, !wasStandby, !(deliberateEnd && (error as? URLError)?.code == .cancelled) {
             EngineLog.emit("[AVIOReader] \(label) conn gen=\(generation) ended with error: \(error.localizedDescription)", category: .demux)
             noteTransportSecurityFailure(error)
         }
@@ -4943,6 +5285,14 @@ final class SuffixRangeSupport: @unchecked Sendable {
         denied.removeAll()
         transportFailures.removeAll()
     }
+
+    /// Tests arm the denial directly to keep the speculative suffix request out of scenarios
+    /// where a second concurrent request is the variable under test (e.g. a one-slot origin).
+    func denyForTesting(_ url: URL) {
+        guard let key = Self.originKey(for: url) else { return }
+        lock.lock(); defer { lock.unlock() }
+        denied[key] = "armed by test"
+    }
 }
 
 /// #281: collects the speculative tail fetch, and refuses everything that is not the tail.
@@ -5042,7 +5392,14 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
 
     private func outcome(error: Error?) -> Outcome {
         if let (reason, verdict) = rejection { return .rejected(reason, verdict: verdict) }
-        if let error { return .rejected("transport: \(error.localizedDescription)", verdict: .transportFailure) }
+        if let error {
+            // A timeout says the network was slow this once, not that the origin cannot do
+            // suffix ranges: it must not strike toward the session-long denial. Genuinely
+            // refused forms still arrive as statuses above and keep their verdicts.
+            let verdict: Verdict = (error as? URLError)?.code == .timedOut
+                ? .unrelated : .transportFailure
+            return .rejected("transport: \(error.localizedDescription)", verdict: verdict)
+        }
         guard let start = spanStart else {
             return .rejected("no usable response header", verdict: .declinedByOrigin)
         }

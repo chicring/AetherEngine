@@ -2078,9 +2078,20 @@ public final class AetherEngine: ObservableObject {
     /// Reset to AV_CODEC_ID_NONE in stopInternal.
     var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
 
-    /// In-flight probe demuxer. Registered before the detached open so stopInternal can markClosed() it:
-    /// without this, player dismissal/channel zapping left the probe reconnecting through subsequent sessions.
-    private var inFlightProbeDemuxer: Demuxer?
+    /// Demuxers whose open() is currently in flight during a load/reload. Each is registered
+    /// BEFORE its detached open starts so stopInternal can markClosed() every one of them:
+    /// without this, player dismissal/channel zapping left an in-flight open's reader
+    /// reconnecting through subsequent sessions (origin kept seeing fresh requests ~13 s after
+    /// stop on a stalled source).
+    private var inFlightOpenDemuxers: [ObjectIdentifier: Demuxer] = [:]
+
+    /// Main-actor only: callers are load()/reload() scopes and stopInternal.
+    func noteInFlightOpen(_ demuxer: Demuxer) {
+        inFlightOpenDemuxers[ObjectIdentifier(demuxer)] = demuxer
+    }
+    func forgetInFlightOpen(_ demuxer: Demuxer) {
+        inFlightOpenDemuxers.removeValue(forKey: ObjectIdentifier(demuxer))
+    }
 
     /// One entry per native mov_text track in muxer-declaration order (#55). Built at load from the merged
     /// subtitleTracks (probed non-bitmap streams + load-declared external tracks, #88). sourceStreamIndex is
@@ -3883,10 +3894,10 @@ public final class AetherEngine: ObservableObject {
         // Register so stopInternal can markClosed(): avformat_open_input/find_stream_info can block for the
         // full AVIOReader reconnect budget (device repro: a 500-looping channel kept reconnecting across three
         // subsequent sessions until the budget ran out).
-        inFlightProbeDemuxer = probe
-        // Identity-guarded: a superseding load() has already registered its own probe; unconditioned nil here
-        // would strip the successor's abort handle.
-        defer { if inFlightProbeDemuxer === probe { inFlightProbeDemuxer = nil } }
+        noteInFlightOpen(probe)
+        // Keyed by identity: a superseding load() registers its own probe under a different key,
+        // so this defer cannot strip the successor's abort handle.
+        defer { forgetInFlightOpen(probe) }
         // #361: the open runs detached and is the longest unobservable stretch of a slow load. Its
         // stages hop back onto the actor carrying the generation they started under, so an open that
         // is still unwinding when a newer load has taken over cannot move that load's bar.
@@ -6718,8 +6729,11 @@ public final class AetherEngine: ObservableObject {
         // session-preserving reload runs through stopInternal too; clearing would re-pay the pass on
         // every audio switch. A new item invalidates it in startAtmosConfirmation().
         cancelAtmosConfirmation()
-        // markClosed() aborts a probe blocked in avformat_open_input/find_stream_info (lock-free, idempotent).
-        inFlightProbeDemuxer?.markClosed()
+        // markClosed() aborts an open blocked in avformat_open_input/find_stream_info (lock-free,
+        // idempotent) — every demuxer whose open is in flight, not only the probe's.
+        let inFlightOpens = inFlightOpenDemuxers
+        inFlightOpenDemuxers.removeAll()
+        for demuxer in inFlightOpens.values { demuxer.markClosed() }
         liveTelemetrySampler?.stop()
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
