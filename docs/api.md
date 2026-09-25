@@ -534,11 +534,12 @@ Time lives on `player.clock`, a separate `ObservableObject`, so ~10 Hz ticks nev
 | --- | --- |
 | `clock.$currentTime` | playback clock, the scrubber axis |
 | `clock.$sourceTime` | source PTS of the displayed frame; render subtitle overlays against this. On `nativeRemoteHLS` it is item time, corrected by the lead over the picture the engine measures on its injected #316 renditions while one is selected (AE#616); see below the table. |
+| `clock.$sourceTimeFollowsPicture` | whether `sourceTime` is known to follow the displayed frame. Always true except on `nativeRemoteHLS`, where it is true only while the lead is measured since the last time jump (AE#616); see below the table. |
 | `clock.$progress` | `currentTime / duration` |
 | `clock.$bufferedPosition` | source-axis position buffered ahead |
 | `clock.$liveEdgeTime`, `clock.$seekableLiveRange`, `clock.$behindLiveSeconds`, `clock.$isAtLiveEdge` | live-window surfaces. `seekableLiveRange` is the intersection of the DVR window (policy) and what the segment cache actually holds and can play forward from (fact), so it is honest to scale a rewind strip on and `seek(to:)` clamps to the same floor (AE#441). The two diverge for the whole first `dvrWindowSeconds` of a session and again whenever retention evicts faster than the window slides. Software live sessions have no such cache and keep the arithmetic bound. |
 | `$residentRanges` | where the loopback segment cache holds picture right now, as disjoint ascending spans on the `currentTime` axis. This is the cache's own truth, not AVPlayer's `loadedTimeRanges`: a measured session held 64 segments over four minutes across several islands while AVPlayer exposed roughly twelve seconds around the playhead and forgot a seeked-ahead island as soon as the playhead left it. Empty is the nil-equivalent, and a live session publishes empty always (its rewind depth is `seekableLiveRange`, which answers a different question). Residency is not a promise that a seek inside a span is instant: the player may still re-anchor and decode at the target, and a segment can start mid-GOP (AE#412). Coalesced to at most four updates a second, cleared on `load()` and teardown. |
-| `player.currentTime`, `sourceTime`, `progress`, `bufferedPosition`, `liveEdgeTime`, `seekableLiveRange`, `behindLiveSeconds`, `isAtLiveEdge` | non-published mirrors of the same values for one-shot reads |
+| `player.currentTime`, `sourceTime`, `sourceTimeFollowsPicture`, `progress`, `bufferedPosition`, `liveEdgeTime`, `seekableLiveRange`, `behindLiveSeconds`, `isAtLiveEdge` | non-published mirrors of the same values for one-shot reads |
 | `$duration` | seconds; a `LoadOptions.declaredDurationSeconds` outranks the container's |
 
 **`sourceTime` on `nativeRemoteHLS` (AE#616).** The engine sees no segment on that route, so the clock is
@@ -551,7 +552,9 @@ AVPlayer's legible output at its cue start plus that lead. The engine watches it
 non-suppressing legible output, matches each presented line back to the cue it wrote, and publishes
 `sourceTime` as item time less the measured lead (log line `AE#616: item time leads the presented
 frame by ...`). It re-measures on every line; between a seek and the next line it keeps the previous
-value. Without an injected rendition selected nothing is measured and `sourceTime` is item time.
+value, and `clock.sourceTimeFollowsPicture` is false from the time jump until that line, so a host can
+hold its overlay instead of detecting seeks itself. Without an injected rendition selected nothing is
+measured, `sourceTime` is item time and `sourceTimeFollowsPicture` stays false.
 `currentTime`, `seek(to:)` and the scrubber stay on item time throughout, so a seek round-trips. A host
 drawing its own overlay from `sourceTime` (libass) can keep the rendition selected behind its own
 suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
@@ -896,6 +899,7 @@ as well.
 | `EngineLog.handler` | Mirror every info-level line into a host capture path. Fires from whatever thread emitted it, so it must be thread-safe and non-blocking. |
 | `EngineLog.subsystem`, `EngineLog.Category` | `de.superuser404.AetherEngine`, one category per subsystem: `engine`, `ffmpeg`, `session`, `muxer`, `demux`, `hls.server`, `audio.bridge`, `sw.playback`, `scrub`. |
 | `EngineLog.Level` | `.info` reaches os_log and the host handler; `.verbose` is per-segment trace and reaches os_log's debug level **only**, never the handler, which is what keeps a mirrored stream readable. Read the verbose ones with `log stream --level debug`. |
+| `EngineLog.registerSecret(_:)`, `EngineLog.unregisterSecret(_:)` | Name a value that must never be logged, such as an IPTV password the host holds. Every line reaching os_log or the handler has it replaced, raw or percent-encoded, wherever it sits. The engine already strips named parameters, userinfo, encoded payloads and the Xtream Codes path layout on its own; this covers what only the host can know, such as a provider URL carrying the password as a bare path segment. Returns false for a value under four bytes. |
 | `EngineLog.emit(_:category:level:)` | Emit a host line into the same stream, for a host that wants its own events interleaved with the engine's. |
 | `demuxerBytesFetched` | Cumulative bytes the demuxer has pulled from the network, for a host-side fetch-rate display. |
 | `segmentCacheDiskBytes`, `softwareHostFramesEnqueued` | Point reads for a stats overlay. |

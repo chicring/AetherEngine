@@ -12,6 +12,71 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.16.1] - 2026-09-24
+
+### Fixed
+
+- **The media fallback comes back where the rejected item was placed, not where the session
+  started (#98).** The fallback replayed the start position of the session's first mount. The
+  #93/#65 stage-2 recovery swaps a fresh item in at the position playback held, so when THAT item
+  was refused at startup (-11868), the session rewound to wherever it had first been loaded. Field
+  log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska opened with a resume at 1844 s:
+  paused at 2099.69 s, the item died behind the screensaver, the recovery item was refused, and
+  playback resumed at 1834.79 s, the keyframe before the session's first mount and four minutes
+  behind the pause. A title started from its beginning resumes at its first frame. `NativeAVPlayerHost`
+  now records where every mount places its item, in-place swaps included, and the fallback reads
+  that.
+- **A recovery reload leaves a paused viewer paused (#93, #98).** Item death parks AVPlayer at
+  `.paused` whatever the viewer wanted, so the #93/#65 stage-2 reload runs for a paused consumer
+  too, and it and the #98 media fallback then called `play()` on the fresh item unconditionally.
+  Field log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska: paused, the tvOS screensaver
+  took the display two minutes later, the item died with -11868, and the recovery started the
+  title and dismissed the screensaver. Both now resume only when the host's durable intent (#122),
+  which the in-place swap keeps, says the viewer was playing; a playing viewer is resumed as before.
+  `aetherctl play --host-calls pausereload,playreload,extplayreload` drills it headless: before,
+  a paused session came back from a forced stage-2 reload at `+7.20 s, state=playing`; after, it
+  holds at `+0.00 s, state=paused`, and a session resumed past the engine through AVKit still
+  comes back playing.
+
+## [7.16.0] - 2026-09-24
+
+### Added
+- `clock.sourceTimeFollowsPicture` (and the `sourceTimeFollowsPicture` mirror): false on `nativeRemoteHLS` from a time jump until an injected rendition line has re-measured the lead, so a host can hold its overlay across that window instead of detecting seeks itself (AE#616 follow-up).
+- `EngineLog.registerSecret(_:)` / `unregisterSecret(_:)`: a host names a value that must never be logged, and every line has it replaced, raw or percent-encoded, before it reaches os_log or the handler.
+
+### Security
+- **Log redaction covers credentials carried as plain path segments.** IPTV panels speaking the Xtream Codes API put the account password in the path of every stream URL (`/live/{user}/{password}/{id}.ts`, likewise `/movie/`, `/series/`, `/timeshift/`, and the `/hls/` and `/hlsr/` redirect targets), where no named parameter, userinfo or encoded payload points at it, so `load url=` lines carried it in clear text. The layout is now matched, the user name stays readable, and ordinary paths such as `/live/master.m3u8` are untouched. The short form without a prefix has no layout to match, which is what `registerSecret(_:)` is for.
+
+## [7.15.2] - 2026-09-24
+
+### Fixed
+
+- **`sourceTime` on the `nativeRemoteHLS` bypass follows the presented frame (AE#616).** It was
+  AVPlayer's item time. An origin whose playlist places a segment at its slot while the segment
+  starts at the keyframe before it (a Jellyfin transcode restarted with `-noaccurate_seek -copyts`)
+  makes item time lead the picture, by 1.1 to 8.3 s in the report. A legible output on the bypass
+  item now matches presented lines of the injected #316 WebVTT renditions back to the cues the
+  engine wrote, and `sourceTime` is item time less that measured lead. `currentTime` and
+  `seek(to:)` stay on item time. With no injected rendition selected nothing is measured and
+  `sourceTime` stays item time, which the API docs now say.
+
+### Performance
+
+- **The persistent HTTP reader no longer copies its read window on every trim (AE#619).**
+  `AVIOReader` dropped the consumed head of its window with `subdata(in:)`, copying up to ~18 MB
+  once per 4 MB read, and grew the fresh buffer again on every append. The window now keeps the
+  chunks as delivered and a trim only advances an offset. CPU is unchanged within noise. Peak
+  memory footprint on a 91.6 Mbit/s 4K HEVC session over HTTP fell from 828 to 911 MB to 551 to
+  553 MB on the native route and from 604 to 651 MB to 193 to 197 MB on the software route
+  (M1, `/usr/bin/time -l`, three runs per arm). Local files are read by `FileIOReader` and are
+  not affected.
+- **The software VOD packet spool no longer serializes through a property list (AE#592).** The
+  binary plist encoder uniqued every object through a `Set`, hashing the whole payload of every
+  packet written to the read-ahead spool. The envelope is now a fixed little-endian header and the
+  raw bytes. Encode fell from 375 to 43 us per 425 KB packet, and process CPU on the same session
+  from 0.220 to 0.223 to 0.205 to 0.208 cores. The spool is per session, so there is no format
+  compatibility to keep.
+
 ## [7.15.1] - 2026-09-23
 
 ### Fixed

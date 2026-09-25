@@ -579,21 +579,31 @@ extension AetherEngine {
     /// Without injected renditions nothing is measurable and `sourceTime` stays item time.
     private func attachRemoteHLSCueClock(host: NativeAVPlayerHost, expectedGeneration: UInt64) {
         detachRemoteHLSCueClock()
+        // Item time until a line says otherwise, and for the whole session without injected renditions.
+        clock.sourceTimeFollowsPicture = false
         guard let provider = remoteHLSSubtitleProxy?.provider,
               let item = host.currentPlayerItem else { return }
-        remoteHLSCueClock = RemoteHLSCueClockObserver(item: item, provider: provider) { [weak self] offset in
-            guard let self, self.loadGeneration == expectedGeneration else { return }
-            self.remoteHLSItemOffset = offset
-            if let rendered = self.nativeHost?.renderedTime {
-                self.clock.sourceTime = max(0, rendered - offset)
-            }
-        }
+        remoteHLSCueClock = RemoteHLSCueClockObserver(
+            item: item, provider: provider,
+            onOffset: { [weak self] offset in
+                guard let self, self.loadGeneration == expectedGeneration else { return }
+                self.remoteHLSItemOffset = offset
+                if let rendered = self.nativeHost?.renderedTime {
+                    self.clock.sourceTime = max(0, rendered - offset)
+                }
+                self.clock.sourceTimeFollowsPicture = true
+            },
+            onTimeJump: { [weak self] in
+                guard let self, self.loadGeneration == expectedGeneration else { return }
+                self.clock.sourceTimeFollowsPicture = false
+            })
     }
 
     func detachRemoteHLSCueClock() {
         remoteHLSCueClock?.detach()
         remoteHLSCueClock = nil
         remoteHLSItemOffset = 0
+        clock.sourceTimeFollowsPicture = true
     }
 
     /// Stand a loopback origin in front of the remote master and return the URL AVPlayer should open.
@@ -1652,7 +1662,6 @@ extension AetherEngine {
         // appliesPerFrameHDRDisplayMetadata unconditionally true: DV P5 has no HDR10 base layer, so the per-frame RPU is what AVPlayer's tone-mapper needs on a non-DV panel (DrHurt #4 2026-05-26). Prior servingMasterPlaylist gate broke P5. Apple's default is also true; explicit write surfaces the live value in diagnostics.
         // forwardBufferDuration default (4 s): deep buffer lets AVPlayer race to the live edge and hit the transcode warm-up gap head-on (-12888); 4 s PACES consumption. Verified: 8 s worsened startup pause (8-10 s vs ~1 s).
         // Live REJOIN: skip initial seek so AVPlayer picks edge-minus-holdback instead; seek-to-0 against the re-served backlog wedged the reloaded item in waitingToPlay (device repro: tvOS 26, Jellyfin stream.ts). See LiveReloadPolicy.
-        lastNativeVideoStartPosition = startPosition ?? 0
         // Sequential append playlist: AVPlayer treats the growing playlist as an EVENT and
         // defaults to edge-minus-holdback (~6 s in on a fresh session, more once the producer
         // has raced ahead). The load-time seek to 0 fires before readyToPlay and the item

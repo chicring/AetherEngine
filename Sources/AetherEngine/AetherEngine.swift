@@ -1988,6 +1988,10 @@ public final class AetherEngine: ObservableObject {
     /// offset by the session zero on live / mid-stream-joined sources (#107). Forwarder; subscribe to `clock.$sourceTime`.
     public var sourceTime: Double { clock.sourceTime }
 
+    /// Whether `sourceTime` is known to follow the displayed frame (AE#616). Forwarder; subscribe to
+    /// `clock.$sourceTimeFollowsPicture`.
+    public var sourceTimeFollowsPicture: Bool { clock.sourceTimeFollowsPicture }
+
     /// Source-axis buffer frontier ahead of the playhead (AetherEngine#54). Forwarder; subscribe to `clock.$bufferedPosition`.
     public var bufferedPosition: Double { clock.bufferedPosition }
 
@@ -2316,10 +2320,6 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
 
-    /// Start position of the current loopback video load, replayed if the master is rejected and we
-    /// reload the media playlist (a startup-failed item has no reliable renderedTime).
-    var lastNativeVideoStartPosition: Double = 0
-
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
     /// re-anchor and the remembered rendition selection replays (its deselect/reselect busts
@@ -2509,8 +2509,10 @@ public final class AetherEngine: ObservableObject {
         // #130: a live fallback is a REJOIN of the running ingest (the window may have slid since
         // the failed master attempt); a stale explicit position can wedge AVPlayer against the
         // backlog, so skip the initial seek and let it pick edge-minus-holdback (LiveReloadPolicy).
-        // VOD keeps the explicit pre-failure position.
-        let position = lastNativeVideoStartPosition
+        // VOD reloads where the rejected item was placed. That is not always where the session
+        // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
+        // rejection of THAT item has to come back there, not rewind to the first mount.
+        let position = host.mountedStartPosition ?? 0
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
@@ -2519,7 +2521,9 @@ public final class AetherEngine: ObservableObject {
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        host.play()
+        // Resume only a viewer who was playing; the host's intent (#122) survives the in-place swap.
+        // A paused title refused behind the tvOS screensaver used to start itself and wake it.
+        if host.transportIntentIsPlaying { host.play() }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as
@@ -2952,7 +2956,11 @@ public final class AetherEngine: ObservableObject {
         // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
         // the only one whose axis the playlist will state.
         if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
-        host.play()
+        // Item death parks AVPlayer at .paused whatever the viewer wanted, which is why this reload may
+        // run for a paused consumer at all; resuming is still the viewer's call, read from the host's
+        // intent (#122), which the in-place swap keeps. Playing a paused title here woke the tvOS
+        // screensaver its item had died behind.
+        if host.transportIntentIsPlaying { host.play() }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so
