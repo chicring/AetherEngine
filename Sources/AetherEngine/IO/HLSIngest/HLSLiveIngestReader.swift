@@ -18,8 +18,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     private let playlistURL: URL
     private let httpHeaders: [String: String]
+    /// The URL the host gave `httpHeaders` for. A companion inherits its parent's, since its own
+    /// playlist URL is one the master named (audit NET-7).
+    private let credentialOrigin: URL
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
+    /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
+    /// legitimately long playlist, and this one is refetched every few seconds rather than once.
+    static let maximumPlaylistBytes = 8 * 1024 * 1024
     private let session: URLSession
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
@@ -134,7 +140,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// `httpHeaders` ride on every fetch (playlist, segment, AES key) and inherit to the companion audio
     /// reader, so header-enforcing IPTV origins (Referer / User-Agent / Authorization, #119) accept the
-    /// ingest the same way they accept the AVPlayer bypass (AetherEngine#168).
+    /// ingest the same way they accept the AVPlayer bypass (AetherEngine#168). Credential headers go
+    /// only to `playlistURL`'s origin with no TLS downgrade (audit NET-7).
     public convenience init(playlistURL: URL, httpHeaders: [String: String]) {
         self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
     }
@@ -148,9 +155,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
     }
 
-    init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role) {
+    init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
+         credentialOrigin: URL? = nil) {
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
+        self.credentialOrigin = credentialOrigin ?? playlistURL
         self.role = role
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
@@ -479,7 +488,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     + "starting companion reader on \(audioURL.lastPathComponent)",
                     category: .engine
                 )
-                installCompanion(HLSLiveIngestReader(playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio))
+                installCompanion(HLSLiveIngestReader(
+                    playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio,
+                    credentialOrigin: credentialOrigin))
             }
             // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
             // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
@@ -545,10 +556,12 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
-    /// Applies the configured origin headers to every ingest fetch. Internal for the header-contract tests.
+    /// Applies the configured origin headers to every ingest fetch, credentials only where the host's
+    /// origin is (audit NET-7). Internal for the header-contract tests.
     func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
-        for (field, value) in httpHeaders {
+        for (field, value) in RedirectHeaderPolicy.scoped(
+            httpHeaders, grantedFor: credentialOrigin, sentTo: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         return request
@@ -556,7 +569,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// Fetch + parse a playlist. Returns parsed playlist and final URL after redirects (relative segment URIs resolve against it).
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await session.data(for: makeRequest(url))
+        let (data, response) = try await BoundedPlaylistFetch.data(
+            for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)

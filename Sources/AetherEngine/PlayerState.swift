@@ -103,8 +103,9 @@ public enum VideoRoute: String, Sendable, Equatable {
 public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     /// No session: pre-load, or torn down.
     case none
-    /// The source carries no audio stream (or none was selected). Silence is the source's, not the
-    /// engine's, and no ladder rung can change it.
+    /// The source carries no audio stream. Silence is the source's, not the engine's, and no ladder
+    /// rung can change it. A source whose audio stream the pick passed over (its parameters left
+    /// empty by the probe) is `.droppedNoPipeline`, not this (AE#641).
     case noAudioInSource
     /// The source's audio bitstream is muxed into fMP4 unchanged: Atmos, DTS-HD and every other
     /// bitstream reach the renderer exactly as authored.
@@ -116,9 +117,11 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     /// libavcodec decodes the audio and the engine renders it itself (the software path and the
     /// software audio-only host).
     case decoded
-    /// The source HAS audio and none of it could be delivered: no libavcodec decoder for it, or the
-    /// bridge could not be built or could not write its header. The session plays video-only and
-    /// silently. This is the one value a fallback ladder acts on.
+    /// The source HAS audio and none of it could be delivered: no libavcodec decoder for it, the
+    /// bridge could not be built or could not write its header, no stream could be picked because the
+    /// probe left its parameters empty, or a live bridge was built and its decoder produced nothing,
+    /// after which the engine rebuilt the session without the track (AE#641). The session plays
+    /// video-only and silently. This is the one value a fallback ladder acts on.
     case droppedNoPipeline
     /// AVFoundation owns the audio: the remote-HLS bypass and the native audio-only host both hand
     /// the source to AVPlayer, which does its own media selection. The engine has no pipeline of its
@@ -841,6 +844,19 @@ public struct LoadOptions: Sendable, Equatable {
     /// is demuxed), so this has nothing to act on there and the engine says so in the log.
     public var preferredDecodePath: DecodePath = .automatic
 
+    /// Whether a native session AVPlayer refuses on its merits may be rebuilt on the software path
+    /// (AE#561). Default `true`.
+    ///
+    /// When AVPlayer fails the item with a verdict on the MEDIA (`CoreMediaErrorDomain`), every native
+    /// recovery answers the same bytes again, so the engine spends one rebuild per session on
+    /// `SoftwarePlaybackHost`, whose libavcodec skips the frame Apple's parser refused. `false`
+    /// declines that rung: the failure surfaces as `.error` with `PlaybackErrorKind.nativeItemFailed`,
+    /// the way it did before 7.9.0, for a host that re-plans a failing title with a ladder of its own
+    /// (AE#629). Either way `softwarePathEscalations` says when the rung is taken.
+    ///
+    /// A tuning field: correctable on a playing session through `reloadAtCurrentPosition(applying:)`.
+    public var escalatesToSoftwarePath: Bool = true
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -892,7 +908,8 @@ public struct LoadOptions: Sendable, Equatable {
         audioDelaySeconds: Double = 0,
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
-        preferredDecodePath: DecodePath = .automatic
+        preferredDecodePath: DecodePath = .automatic,
+        escalatesToSoftwarePath: Bool = true
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -935,6 +952,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
         self.preferredDecodePath = preferredDecodePath
+        self.escalatesToSoftwarePath = escalatesToSoftwarePath
     }
 }
 
@@ -1049,6 +1067,10 @@ public struct SoftwareDecodeProbeResult: Sendable {
     /// container that withheld its PTS and had one invented from decode order produces a sawtooth,
     /// which is the one shape no packet-level or renderer-level counter can see.
     public let frameTimesSeconds: [Double]
+    /// AE#654: the colour tags the first picture reached the display layer with, as
+    /// `primaries / transfer / matrix` in CoreVideo's names, `-` for a missing one. An untagged source
+    /// reads `ITU_R_709_2` in all three here, the same as VideoToolbox's own output for it.
+    public let firstFrameColor: String?
 
     public init(
         codecName: String,
@@ -1064,9 +1086,11 @@ public struct SoftwareDecodeProbeResult: Sendable {
         firstFrameWidth: Int,
         firstFrameHeight: Int,
         firstError: String?,
-        frameTimesSeconds: [Double] = []
+        frameTimesSeconds: [Double] = [],
+        firstFrameColor: String? = nil
     ) {
         self.frameTimesSeconds = frameTimesSeconds
+        self.firstFrameColor = firstFrameColor
         self.codecName = codecName
         self.codecID = codecID
         self.width = width

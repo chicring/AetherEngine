@@ -77,6 +77,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Caller-chosen audio stream index; nil falls back to `av_find_best_stream`. Enables
     /// host-driven track switching via `AetherEngine.selectAudioTrack(index:)` reload.
     private let audioSourceStreamIndexOverride: Int32?
+    /// AE#641: a source audio stream this session already found undecodable (its bridge decoded
+    /// nothing). When the pick lands on it again, the cascade goes straight to its video-only tail.
+    let undecodableAudioStreamIndex: Int32?
 
     /// AE#443: whoever REPLACES one of these two mid-session owes the session the totals the outgoing
     /// instance held (`retireDemuxer` / `retireProducer` below). They carry the session's byte and
@@ -625,11 +628,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// In-flight fallback demuxer inside `start()`, registered before its blocking open for the
     /// same reason (restartLock-guarded, cleared when open returns).
     var openingDemuxer: Demuxer?
+    /// The #79 / #169 restart's replacement demuxer, from before its open until the restart installs
+    /// or drops it, so `stop()` can abort that open and the seek after it (audit SEG-3 follow-up).
+    private var restartReopenDemuxer: Demuxer?
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
     /// Fires on `PumpExitReason.sourceReplay`; host must re-negotiate a fresh session.
     var onLiveSourceReset: (@Sendable () -> Void)?
+    /// AE#627: the first join read video for the whole keyframe wait and found no point the native
+    /// route can open a segment on. Reopening joins the same bitstream, so the engine decides between
+    /// the software path and telling the host (`escalateLiveReopenExhaustion`) instead. Unset, the
+    /// session falls back to the ordinary reopen budget.
+    var onLiveJoinWithoutEntryPoint: (@Sendable () -> Void)?
+    /// AE#641: the live audio bridge decoded not one frame of the selected stream (index, bridge
+    /// summary). Nothing inside the session can recover it: a producer rebuild hands the same decoder
+    /// the same bytes, and the served media keeps an audio track that will never be filled.
+    var onLiveAudioDecodesNothing: (@Sendable (Int32, String) -> Void)?
     /// #126: fires when a VOD pump dies on a read error having produced nothing (zero packets
     /// written, empty cache). The playlist exists but no segment will ever land, so AVPlayer
     /// would sit in waitingToPlay forever; the engine surfaces a fatal error instead.
@@ -652,9 +667,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Pairing the release with the surface makes that structural instead of a call site to remember.
     func surfaceVODSourceFailure(_ code: Int32, _ reason: String,
                                  kind: PlaybackErrorKind = .vodSourceFailed) {
+        // AE#641: a silent bridge is reported the moment it is structural and again by the muxer arms
+        // that follow it on the E-AC-3 route; the session learns it once.
+        if kind == .audioBridgeProducedNoOutput {
+            silentBridgeSurfaceLock.lock()
+            let first = !silentBridgeFailureSurfaced
+            silentBridgeFailureSurfaced = true
+            silentBridgeSurfaceLock.unlock()
+            guard first else { return }
+        }
         provider?.abortSequentialStartupWait()
         onVODSourceFailed?(code, reason, kind)
     }
+    private let silentBridgeSurfaceLock = NSLock()
+    private var silentBridgeFailureSurfaced = false
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?
@@ -861,6 +887,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
+        undecodableAudioStreamIndex: Int32? = nil,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -905,6 +932,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
+        self.undecodableAudioStreamIndex = undecodableAudioStreamIndex
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
@@ -1842,6 +1870,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             streamCopyAudio: streamCopyAudio,
             sourceAudioStreamIndex: audioStreamIndex,
             sourceAudioStream: audioStreamIndex >= 0 ? audioDem.stream(at: audioStreamIndex) : nil,
+            sourceCarriesAudio: audioDem.firstAudioStreamIndexByType >= 0,
             audioHLSCodecs: &audioHLSCodecs,
             audioLanguage: audioLanguage
         )
@@ -2405,15 +2434,29 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return prov?.sealedLiveTargetDurationSeconds
     }
 
-    func scrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, segmentIndex: Int)? {
+    /// A resident segment a scrub still can decode from. Resolving it reads nothing, so an extractor
+    /// LRU hit costs no I/O; `makeReader()` maps the segment file rather than reading it into the heap
+    /// (audit SEG-2). SegmentCache only ever replaces or unlinks a segment file, never rewrites it in
+    /// place, so a mapping stays valid for as long as the reader holds it.
+    struct ScrubThumbnailSource: Sendable {
+        let segmentIndex: Int
+        let initData: Data
+        let segmentURL: URL
+
+        func makeReader() -> DataIOReader? {
+            guard let segment = try? Data(contentsOf: segmentURL, options: .alwaysMapped) else { return nil }
+            return DataIOReader(parts: [initData, segment])
+        }
+    }
+
+    func scrubThumbnailSource(atSeconds seconds: Double) -> ScrubThumbnailSource? {
         restartLock.lock()
         let prov = provider
         restartLock.unlock()
         guard let prov else { return nil }
-        guard let seg = prov.thumbnailSegment(atSeconds: seconds) else { return nil }
-        guard let initData = prov.peekInitSegment(),
-              let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
-        return (initData + segData, seg.index)
+        guard let seg = prov.thumbnailSegment(atSeconds: seconds),
+              let initData = prov.peekInitSegment() else { return nil }
+        return ScrubThumbnailSource(segmentIndex: seg.index, initData: initData, segmentURL: seg.fileURL)
     }
 
     public func stop() {
@@ -2455,6 +2498,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // during that open left it reconnecting past teardown.
         let opening = openingDemuxer
         openingDemuxer = nil
+        let restartReopening = restartReopenDemuxer
+        restartReopenDemuxer = nil
         // #199: factory-vended ingest reader feeding the current demuxer; session-owned, closed here.
         let reopenReader = reopenCustomReader
         reopenCustomReader = nil
@@ -2462,6 +2507,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.unlock()
         reopening?.markClosed()
         opening?.markClosed()
+        // The restart that opened it closes it once it sees the epoch moved.
+        restartReopening?.markClosed()
         // Close before waitForFinish: cancels the reader's FIFO so a pump parked in a blocking
         // custom-IO read unblocks (mirrors markClosed for URL demuxers).
         reopenReader?.close()
@@ -3482,7 +3529,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         anchorShiftLock.lock()
         recutIndices.insert(index)
         anchorShiftLock.unlock()
-        requestRestart(at: index, authoritative: true)
+        // Audit HLS-4: off this task, so the gate wait below bounds the whole re-cut. Inline, an idle
+        // coalescer ran the restart here (a 5 s stop wait, a #79 reopen, the demuxer seek) before the
+        // wait began, all outside the seek's 8 s landing bound.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.requestRestart(at: index, authoritative: true)
+        }
         guard let opened = awaitGateOpen(forIndex: index, timeout: Self.recutGateWaitSeconds) else {
             anchorShiftLock.lock()
             recutIndices.remove(index)
@@ -3835,6 +3887,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return parts.joined(separator: " ")
     }
 
+    /// A new demuxer for the #79 / #169 reopen, registered for `stop()` before its blocking open, or
+    /// nil when a stop already superseded the restart at `epoch`.
+    func registerRestartReopenDemuxer(epoch: UInt64) -> Demuxer? {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        guard sessionEpoch == epoch else { return nil }
+        let fresh = Demuxer()
+        restartReopenDemuxer = fresh
+        return fresh
+    }
+
+    private func unregisterRestartReopenDemuxer(_ dem: Demuxer) {
+        restartLock.lock()
+        if restartReopenDemuxer === dem { restartReopenDemuxer = nil }
+        restartLock.unlock()
+    }
+
     // Driven exclusively through requestRestart(at:) so bursts coalesce (#35).
     private func performRestart(at idx: Int) {
         restartGate.lock()
@@ -3893,9 +3962,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // AE#169 round 2 takes the same path when the pump exited BECAUSE the demuxer's read
             // threw: the connection is known-bad, so the revive gets one fresh connection instead
             // of seeking the demuxer that just failed.
-            if !isLiveSession, sideAudioDemuxer == nil {
+            if !isLiveSession, sideAudioDemuxer == nil, let fresh = registerRestartReopenDemuxer(epoch: epoch) {
                 let reopenStart = DispatchTime.now()
-                let fresh = Demuxer()
                 do {
                     // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
@@ -3918,6 +3986,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         category: .session
                     )
                 } catch {
+                    unregisterRestartReopenDemuxer(fresh)
                     fresh.close()
                     EngineLog.emit(
                         "[HLSVideoEngine] restart at idx=\(idx): "
@@ -3953,6 +4022,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // Re-validate: a stop() landing during waits bumped sessionEpoch; don't resurrect into a torn-down session.
         restartLock.lock()
+        if let freshDemuxer, restartReopenDemuxer === freshDemuxer { restartReopenDemuxer = nil }
         guard sessionEpoch == epoch else {
             restartLock.unlock()
             // #79: a reopened demuxer (replacing a wedged one) must not leak when stop() superseded us.

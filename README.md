@@ -47,6 +47,8 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [Vivid](https://github.com/blurbery/vivid): open-source media app for iPhone, iPad and Apple TV.
 - [Snappier IPTV](https://apps.apple.com/gb/app/snappier-iptv/id1579702567): IPTV App for iOS/iPadOS and tvOS.
 - [stashy](https://stashy.shelf.am/): iOS/tvOS native player for stash.
+- [Gflix](https://gflixhub.app/): A flawless media app for your media.
+- [Melon Video](https://apps.apple.com/ca/app/melon-video/id6811750997): Video Player for Vision Pro.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -59,8 +61,8 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | --- | --- |
 | Containers | MKV, MP4, WebM, MPEG-TS, AVI, ASF / WMV, OGG, FLV |
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
-| Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 where HW AV1 exists |
-| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE, the Flash tail (Sorenson Spark, On2 VP6) and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
+| Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 Main profile where HW AV1 exists |
+| Video (SW) | AV1 (dav1d) without HW, and AV1 High / Professional (4:4:4, 4:2:2, 12-bit) everywhere, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE, the Flash tail (Sorenson Spark, On2 VP6) and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
 | HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG |
 | Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / LPCM (incl. Blu-ray, G.711) / WMA (Standard, Pro, Lossless, Voice) / Nellymoser / ADPCM-SWF / Speex bridge to EAC3 5.1 (default) or lossless FLAC |
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
@@ -382,7 +384,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.16.1")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.19.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -491,7 +493,7 @@ For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g
 
 A live channel whose master advertises HEVC (or Dolby Vision / AV1) while delivering MPEG-TS segments is carriage AVFoundation builds no video track for, so the bypass would play it as audio over black. The engine recognizes that signature and reroutes the session onto the live ingest above (#168). The recognition runs alongside the mount: the playlist and the head of one segment are read while AVPlayer starts, so the reroute does not wait out a grace window, and a media playlist URL with no master to judge is covered too (#293). Only a codec the HLS Authoring Spec sanctions in fMP4 alone reaches that read, so an H.264 channel spends no extra request on it. `LoadOptions.nativeRemoteHLSIngestFallback = false` turns the whole recovery off.
 
-A LIVE remote `m3u8` handed to the default (loopback) path routes the other way, onto the live ingest above (#363). The raw live path reads bytes, not playlists, so it used to reject an `.m3u8` with a typed `hlsPlaylistOnRawLivePath` error naming the reader the host should have built. It builds that reader itself now, with `LoadOptions.httpHeaders` on the playlist, on every segment and on every AES key, which is what a tokenized IPTV origin enforces per request. A custom `IOReader` carrying the same misroute still gets the typed error: it has no playlist URL to ingest from.
+A LIVE remote `m3u8` handed to the default (loopback) path routes the other way, onto the live ingest above (#363). The raw live path reads bytes, not playlists, so it used to reject an `.m3u8` with a typed `hlsPlaylistOnRawLivePath` error naming the reader the host should have built. It builds that reader itself now, with `LoadOptions.httpHeaders` on the playlist, on every segment and on every AES key, which is what a tokenized IPTV origin enforces per request. Credential headers stay with the playlist's own origin: a segment or key on another host, or on http:// behind an https:// playlist, gets the rest of the headers but not the token. A custom `IOReader` carrying the same misroute still gets the typed error: it has no playlist URL to ingest from.
 
 If a live `nativeRemoteHLS` bypass is refused by the origin outright (HTTP 401 or 403, which reach the item as `NSURLError` -1013 / -1102), the engine hands that session to the same ingest instead of failing the load (#363). The ingest fetcher is a different client at that origin: it carries the configured headers on every request, caps itself at four concurrent fetches, and sends no AVFoundation user agent, so a UA filter or a per-token connection cap that turned AVPlayer away can still serve it. The refusal is not remembered for the next load the way a carriage verdict is; a token expires, a cap frees up. `LoadOptions.nativeRemoteHLSIngestFallback = false` turns this off along with the carriage recovery.
 
@@ -629,10 +631,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.16.1")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.19.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.16.1")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.19.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

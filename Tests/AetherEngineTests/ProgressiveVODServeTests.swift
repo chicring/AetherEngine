@@ -476,7 +476,7 @@ struct MP4SegmentMuxerProgressiveCommitTests {
 
         // Every published boundary is a whole number of (moof,mdat) pairs — read from the adopted
         // file (same bytes the staging file carried).
-        let adopted = try Data(contentsOf: cache.sessionDir.appendingPathComponent("seg-0.m4s"))
+        let adopted = try Data(contentsOf: #require(cache.peekURL(index: 0)))
         for n in commits {
             #expect(Self.isWholeFragmentSequence(Array(adopted.prefix(n))),
                     "commit \(n) is not a clean fragment boundary")

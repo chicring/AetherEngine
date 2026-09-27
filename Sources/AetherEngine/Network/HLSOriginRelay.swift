@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// AE#495: fetches a remote origin on the engine's behalf and sends every URI a playlist
@@ -17,9 +18,19 @@ import Foundation
 final class HLSOriginRelay: @unchecked Sendable {
 
     /// The single route the player is ever pointed at, under the server's session token.
-    /// The origin rides in the query, so one route covers playlists, keys and segments.
+    /// A sealed reference to the origin rides in the query, so one route covers playlists, keys
+    /// and segments.
     static let route = "/aether-origin-relay"
-    private static let originQueryKey = "origin"
+    private static let referenceQueryKey = "ref"
+
+    /// Audit NET-1: the origin URL carries the media server's access token, and the local URL is
+    /// logged on every request, handed to AirPlay receivers and written into rewritten playlists.
+    /// So the local URL names the origin only through a reference sealed with keys that live and
+    /// die with this relay. Sealing rather than an id table keeps the state constant: a VOD
+    /// playlist registers every segment URI at once, and an evicted table entry would be a 404
+    /// in the middle of a film.
+    private let sealingKey = SymmetricKey(size: .bits256)
+    private let nonceKey = SymmetricKey(size: .bits256)
 
     /// What a relayed request produced, for the server to write.
     struct Response {
@@ -42,6 +53,11 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// now points at the local server.
     private var upstreamHeaders: [String: String] = [:]
 
+    /// The URLs the host itself pointed the relay at. Credential headers follow a fetch only to
+    /// one of these origins with no TLS downgrade; an origin a playlist revealed gets the rest of
+    /// the headers but not the token (audit NET-7).
+    private var credentialOrigins: [URL] = []
+
     /// The NSURLError code of the last upstream handshake this relay lost to system trust, if any.
     ///
     /// 6.69.0 classifies a refused certificate off the failed item's `NSUnderlyingErrorKey` chain,
@@ -59,7 +75,10 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// invalidated.
     private let session: URLSession
 
-    init() {
+    private let heldBodyLimit: Int
+
+    init(maximumHeldBodyBytes: Int = HLSOriginRelay.maximumHeldBodyBytes) {
+        heldBodyLimit = maximumHeldBodyBytes
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
@@ -131,6 +150,7 @@ final class HLSOriginRelay: @unchecked Sendable {
         stateLock.lock()
         allowedOrigins.insert(key)
         if !httpHeaders.isEmpty { upstreamHeaders = httpHeaders }
+        if !credentialOrigins.contains(origin) { credentialOrigins.append(origin) }
         stateLock.unlock()
         return key
     }
@@ -146,52 +166,76 @@ final class HLSOriginRelay: @unchecked Sendable {
 
     // MARK: - Addressing
 
-    /// The local address standing in for `origin`.
-    static func localURL(
+    /// The local address standing in for `origin`. Does not admit it.
+    func localURL(
         for origin: URL, host: String = "127.0.0.1", port: UInt16, token: String
     ) -> URL? {
-        // Encoding everything outside the alphanumerics keeps the origin's own query, which
-        // on a Jellyfin stream carries the api key and the play session, from being read as
-        // part of this URL's query.
-        guard
-            let encoded = origin.absoluteString.addingPercentEncoding(
-                withAllowedCharacters: .alphanumerics)
-        else { return nil }
-        return URL(string: "http://\(host):\(port)/\(token)\(route)?\(originQueryKey)=\(encoded)")
+        guard let reference = seal(origin) else { return nil }
+        return URL(
+            string: "http://\(host):\(port)/\(token)\(Self.route)?\(Self.referenceQueryKey)=\(reference)")
     }
 
-    /// The origin a relay request names, or nil when the query does not carry one.
+    /// The origin a relay request names, or nil when the query carries no reference this relay
+    /// sealed.
     ///
     /// Every other field the client put on the URL is carried onto the origin's own query rather
     /// than dropped. AVPlayer appends `_HLS_msn` / `_HLS_part` / `_HLS_skip` to a playlist URL when
     /// the playlist advertises `CAN-BLOCK-RELOAD` (#441), and a reload that should have blocked
     /// until the next segment exists answers immediately without them, so the player asks again at
     /// once and the origin is polled as fast as the loopback can answer.
-    static func originURL(fromQuery query: String) -> URL? {
+    func originURL(fromQuery query: String) -> URL? {
         var origin: URL?
         var carried: [String] = []
         for field in query.split(separator: "&") {
             let pair = field.split(separator: "=", maxSplits: 1)
-            guard pair.count == 2, pair[0] == originQueryKey else {
+            guard pair.count == 2, pair[0] == Self.referenceQueryKey else {
                 carried.append(String(field))
                 continue
             }
-            guard let decoded = String(pair[1]).removingPercentEncoding, !decoded.isEmpty else {
-                return nil
-            }
-            origin = URL(string: decoded)
+            guard let opened = open(String(pair[1])) else { return nil }
+            origin = opened
         }
         guard let origin else { return nil }
         guard !carried.isEmpty,
             var components = URLComponents(url: origin, resolvingAgainstBaseURL: false)
         else { return origin }
-        // percentEncoded, because both halves are already encoded: the origin's query came out of
-        // the round trip through `localURL`, and the client's fields arrived off the wire.
+        // percentEncoded, because both halves are already encoded: the origin's query is the one
+        // it was sealed with, and the client's fields arrived off the wire.
         var fields: [String] = []
         if let existing = components.percentEncodedQuery, !existing.isEmpty { fields.append(existing) }
         fields.append(contentsOf: carried)
         components.percentEncodedQuery = fields.joined(separator: "&")
         return components.url ?? origin
+    }
+
+    /// AES-GCM under a nonce derived from the plaintext, so one origin always seals to the same
+    /// reference: a live playlist refreshed every few seconds names the same segment by the same
+    /// local URL each time. Equal plaintexts are the only nonce reuse, and they reveal nothing
+    /// beyond their equality. base64url without padding, which a query carries as it stands.
+    private func seal(_ origin: URL) -> String? {
+        let plaintext = Data(origin.absoluteString.utf8)
+        let derived = HMAC<SHA256>.authenticationCode(for: plaintext, using: nonceKey)
+        guard let nonce = try? AES.GCM.Nonce(data: Data(derived).prefix(12)),
+            let sealed = try? AES.GCM.seal(plaintext, using: sealingKey, nonce: nonce),
+            let combined = sealed.combined
+        else { return nil }
+        return combined.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func open(_ reference: String) -> URL? {
+        var base64 = reference
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard let combined = Data(base64Encoded: base64),
+            let box = try? AES.GCM.SealedBox(combined: combined),
+            let plaintext = try? AES.GCM.open(box, using: sealingKey),
+            let string = String(data: plaintext, encoding: .utf8), !string.isEmpty
+        else { return nil }
+        return URL(string: string)
     }
 
     /// The authority a rewritten playlist should point its sub-resources at: whatever the
@@ -238,12 +282,12 @@ final class HLSOriginRelay: @unchecked Sendable {
     func respond(query: String, host: String?, range: String?, port: UInt16, token: String,
                  sink: Sink) -> Outcome?
     {
-        guard let origin = Self.originURL(fromQuery: query) else { return nil }
+        guard let origin = originURL(fromQuery: query) else { return nil }
         guard let key = Self.originKey(for: origin) else { return nil }
 
         stateLock.lock()
         let permitted = allowedOrigins.contains(key)
-        let headers = upstreamHeaders
+        let headers = Self.headers(upstreamHeaders, for: origin, grantedFor: credentialOrigins)
         stateLock.unlock()
         guard permitted else {
             EngineLog.emit(
@@ -286,6 +330,17 @@ final class HLSOriginRelay: @unchecked Sendable {
         }
     }
 
+    /// Everything the host sent, with the credentials only when `target` is one of the host's own
+    /// origins (same host, same port, no downgrade).
+    static func headers(_ headers: [String: String], for target: URL, grantedFor anchors: [URL])
+        -> [String: String]
+    {
+        if anchors.contains(where: { RedirectHeaderPolicy.credentialsAllowed(from: $0, to: target) }) {
+            return headers
+        }
+        return RedirectHeaderPolicy.scoped(headers, grantedFor: nil, sentTo: target)
+    }
+
     private static func looksLikePlaylist(url: URL, contentType: String?) -> Bool {
         if let type = contentType?.lowercased(), type.contains("mpegurl") || type.contains("m3u") {
             return true
@@ -311,6 +366,13 @@ final class HLSOriginRelay: @unchecked Sendable {
         /// Never got a response head. The trust refusal, if that is what it was, is already recorded.
         case failed
     }
+
+    /// Audit NET-10: a held body is buffered whole, and the resource timeout alone let a hostile or
+    /// broken origin grow one for two minutes at link rate. A playlist larger than this is not one a
+    /// player will get through; a held media body (a segment served without a length) gets the wider
+    /// cap, and an error body is dropped past it while its status still goes through.
+    static let maximumHeldPlaylistBytes = 16 * 1024 * 1024
+    static let maximumHeldBodyBytes = 64 * 1024 * 1024
 
     /// The answers that mean "you are asking too often", which arm the pacer for this origin.
     private static let refusalStatuses: Set<Int> = [429, 503, 509]
@@ -372,11 +434,20 @@ final class HLSOriginRelay: @unchecked Sendable {
         // A length the origin did not state cannot be framed for the player without buffering the
         // body to measure it, and a playlist has to be read whole to be rewritten at all.
         let declaredLength = http.expectedContentLength
-        let mustHold = declaredLength < 0
-            || !(200..<300).contains(http.statusCode)
-            || Self.looksLikePlaylist(url: origin, contentType: contentType)
+        let isPlaylist = Self.looksLikePlaylist(url: origin, contentType: contentType)
+        let isSuccess = (200..<300).contains(http.statusCode)
+        let mustHold = declaredLength < 0 || !isSuccess || isPlaylist
         guard !mustHold else {
-            let body = pump.awaitWholeBody()
+            let limit = isPlaylist ? min(Self.maximumHeldPlaylistBytes, heldBodyLimit) : heldBodyLimit
+            guard let body = pump.awaitWholeBody(limit: limit) else {
+                EngineLog.emit(
+                    "[HLSOriginRelay] \(origin.host ?? "origin") answered \(http.statusCode) with a body over "
+                        + "\(limit) bytes; not holding it", category: .hlsServer)
+                if isSuccess { return .failed }
+                return .held(
+                    Fetched(status: http.statusCode, body: Data(), contentType: contentType,
+                            contentRange: contentRange))
+            }
             if let error = pump.awaitFailure() {
                 // A playlist read halfway is not a playlist, and the framing of a held answer is its
                 // own length, so there is nothing here worth passing on.
@@ -438,7 +509,7 @@ final class HLSOriginRelay: @unchecked Sendable {
         let rewriteOne: (String) -> String = { raw in
             if absoluteOnly, URL(string: raw)?.host == nil { return raw }
             guard let resolved = URL(string: raw, relativeTo: origin)?.absoluteURL,
-                let local = Self.localURL(
+                let local = self.localURL(
                     for: resolved, host: authority, port: port, token: token)
             else { return raw }
             if let key = Self.originKey(for: resolved) { discovered.insert(key) }
@@ -516,14 +587,20 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         return head
     }
 
-    /// Every byte of the body, for the answers that have to be read whole.
-    func awaitWholeBody() -> Data {
+    /// Every byte of the body, for the answers that have to be read whole, or nil once it passes
+    /// `limit`, which also stops the transfer.
+    func awaitWholeBody(limit: Int) -> Data? {
+        if let head = awaitHead(), head.expectedContentLength > Int64(limit) {
+            abandon()
+            return nil
+        }
         var body = Data()
-        _ = drain { chunk in
+        let complete = drain { chunk in
+            guard body.count + chunk.count <= limit else { return false }
             body.append(chunk)
             return true
         }
-        return body
+        return complete ? body : nil
     }
 
     /// Hands each chunk to `write` as it arrives, until the body ends or a write fails. Returns

@@ -155,6 +155,27 @@ extension HLSVideoEngine {
         }
     }
 
+    /// AE#627: a keyframe starvation on the session's FIRST join (no segment ever produced) while video
+    /// kept arriving says the bitstream has no entry point this route accepts, not that the link
+    /// hiccupped. The same starvation after segments were produced is a mid-session loss and keeps its
+    /// reopens, and a wait that saw no video at all is a source problem a reopen can fix.
+    static func liveJoinFoundNoEntryPoint(
+        reason: HLSSegmentProducer.PumpExitReason,
+        segmentsProduced: Int,
+        starvedVideoDrops: Int
+    ) -> Bool {
+        guard case .keyframeStarvation = reason else { return false }
+        return segmentsProduced == 0 && starvedVideoDrops > 0
+    }
+
+    /// AE#627: the engine's answer to `onLiveJoinWithoutEntryPoint` when the software path is not on
+    /// offer. The reopens this skipped would have ended here too, a minute later.
+    func giveUpLiveJoinWithoutEntryPoint() {
+        escalateLiveReopenExhaustion(transport: Self.liveReopenTransport(
+            sourceReopenableByURL: sourceReopenableByURL,
+            hasCustomSourceReopenFactory: customSourceReopenFactory != nil))
+    }
+
     /// The whole escalation, so the two exhaustion sites (barren-cycle cap, reopen attempt cap)
     /// cannot drift apart: the decision plus BOTH of its effects. The halt is the half that is easy
     /// to lose, and losing it is what the -15410 zombie is made of; onLiveSourceReset alone (what
@@ -167,6 +188,21 @@ extension HLSVideoEngine {
 
     func handlePumpFinished(_ prod: HLSSegmentProducer,
                                     reason: HLSSegmentProducer.PumpExitReason) {
+        // Audit HLS-1: a superseded pump (the #79 markClosed of a wedged read, or stop()) reports
+        // an aborted read as `.readError`. Acting on it spent the session-lifetime revive gate,
+        // doomed the replacement demuxer and queued an authoritative restart at a stale position.
+        restartLock.lock()
+        let isCurrent = producer === prod
+        restartLock.unlock()
+        guard isCurrent else {
+            if case .stopRequested = reason {} else {
+                EngineLog.emit(
+                    "[HLSVideoEngine] superseded producer exited (reason=\(reason)); not the session's pump, ignored",
+                    category: .session
+                )
+            }
+            return
+        }
         // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
         // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
         if case .backpressureWedge = reason {
@@ -344,8 +380,19 @@ extension HLSVideoEngine {
                 return
             }
         }
-        restartLock.lock()
         let segmentsNow = provider?.liveContinuationPoint().nextIndex ?? 0
+        if let onLiveJoinWithoutEntryPoint,
+           Self.liveJoinFoundNoEntryPoint(
+               reason: reason, segmentsProduced: segmentsNow, starvedVideoDrops: prod.starvedVideoDrops) {
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#627 live join read \(prod.starvedVideoDrops) video packets without an "
+                + "entry point the native route can open; a reopen joins the same bitstream, so not reopening",
+                category: .session
+            )
+            onLiveJoinWithoutEntryPoint()
+            return
+        }
+        restartLock.lock()
         let reopenDecision = Self.liveRecoveryBudgetDecision(
             progressIndex: segmentsNow,
             lastProgressIndex: lastReopenSegmentCount,
@@ -903,7 +950,9 @@ extension HLSVideoEngine {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
 
             let dem = Demuxer()
-            registerReopenDemuxer(dem)  // register before blocking open so stop() can abort via markClosed
+            // Audit HLS-2: a zap during the sleep above must not open the old channel; on a
+            // single-slot tuner that orphan open takes the slot the new channel needs.
+            guard registerReopenDemuxer(dem, failedProducer: failedProducer) else { return }
             defer { unregisterReopenDemuxer(dem) }
             var freshReader: IOReader?
             do {
@@ -973,10 +1022,14 @@ extension HLSVideoEngine {
         return producer === p
     }
 
-    private func registerReopenDemuxer(_ dem: Demuxer) {
+    /// Registers `dem` for `stop()` to abort, atomically with the check that the session still
+    /// belongs to `failedProducer`. False means a stop or a newer producer already took over.
+    func registerReopenDemuxer(_ dem: Demuxer, failedProducer: HLSSegmentProducer) -> Bool {
         restartLock.lock()
+        defer { restartLock.unlock() }
+        guard producer === failedProducer else { return false }
         reopenDemuxer = dem
-        restartLock.unlock()
+        return true
     }
 
     private func unregisterReopenDemuxer(_ dem: Demuxer) {

@@ -39,6 +39,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// silence), the client cannot tell a hung handshake from an origin sitting on the GET.
         /// The serving thread parks on the socket until the client hangs up or `stop()` runs.
         case blackhole
+        /// Audit DMX-5: a 206 that starts `start` rather than where it was asked, the way an edge
+        /// that aligns ranges to its own chunk boundary answers. The body is that range's.
+        case serve206From(start: Int64)
     }
 
     let port: UInt16
@@ -331,6 +334,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
         switch respondEx(requestIndex, offset, rangeEnd, path, isSuffix) ?? respond(requestIndex, offset, path) {
         case .serve206:
             break
+        case .serve206From(let start):
+            offset = max(0, min(start, totalSize - 1))
         case .serveThenGoSilent(let afterBytes):
             silentAfter = max(0, afterBytes)
         case .serveThenDrop(let afterBytes):

@@ -218,6 +218,14 @@ final class NativeAVPlayerHost {
     /// uses this as authoritative presented-frame evidence when that publication wins the MainActor
     /// queue race against the resumed deadline continuation.
     private(set) var latestSeekRenderedTimePublished = false
+    /// AE#629: an in-place swap whose fresh item has not landed its mount seek yet. The swap keeps the
+    /// outgoing item's clock and picture, and until the landing AVPlayer reads first the target, then
+    /// the start of the segment it decodes up from (12.00 s under a 15.97 s revive on the harness).
+    /// Published, that second reading rewinds the playhead, and a software-path rebuild raised in the
+    /// window resumed there and replayed the gap. So neither reading is a landing: only the seek's own
+    /// completion is, or the item playing, which it cannot do short of the target. A seek of the host's
+    /// own takes the clock over from here as well.
+    private var inPlaceSwapMountPending = false
 
     // MARK: - Output
 
@@ -441,6 +449,7 @@ final class NativeAVPlayerHost {
 
         self.sessionContract = contract
         mountedStartPosition = skipInitialSeek ? nil : (startPosition ?? 0)
+        inPlaceSwapMountPending = inPlaceSwap && !skipInitialSeek
         let forwardBufferDuration = contract.forwardBufferDuration
         let httpHeaders = contract.httpHeaders
         let armIngestFallback = contract.armIngestFallback
@@ -682,7 +691,10 @@ final class NativeAVPlayerHost {
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
-                if status == .playing { self.hasEverPlayed = true }
+                if status == .playing {
+                    self.hasEverPlayed = true
+                    self.inPlaceSwapMountPending = false
+                }
                 if status == .playing, !self.didSampleSettledRoute {
                     self.didSampleSettledRoute = true
                     Task { @MainActor [weak self] in
@@ -800,6 +812,7 @@ final class NativeAVPlayerHost {
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
+                if self.inPlaceSwapMountPending { return }
                 // renderedTime tracks the parked on-screen frame mid-seek (issue #49).
                 self.renderedTime = value
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
@@ -859,7 +872,13 @@ final class NativeAVPlayerHost {
                 category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
             avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
-                          toleranceBefore: .zero, toleranceAfter: .zero)
+                          toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+                guard finished else { return }
+                Task { @MainActor in
+                    guard let self, self.sessionID == sid else { return }
+                    self.inPlaceSwapMountPending = false
+                }
+            }
         }
     }
 
@@ -1278,10 +1297,16 @@ final class NativeAVPlayerHost {
         else { return }
         liveJoinImmediateStartProbeInFlight = true
         let probeStart = DispatchTime.now()
+        let sid = sessionID
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.liveJoinImmediateStartProbeInFlight = false }
             let reading = await Self.liveJoinBufferReading(item)
+            // Audit NAT-4: a load during the read reset the one-shot and the in-flight flag for its own
+            // item, and a swap replaced the item this reading describes. Neither is this probe's to
+            // spend or clear.
+            guard self.sessionID == sid else { return }
+            self.liveJoinImmediateStartProbeInFlight = false
+            guard self.playerItem === item else { return }
             // AE#422: the reading is async, so the hold it described may be over. Decide on the state
             // that exists now, not on the edge that asked.
             guard !self.liveJoinImmediateStartSpent,
@@ -1783,6 +1808,8 @@ final class NativeAVPlayerHost {
         seekGeneration &+= 1
         let gen = seekGeneration
         seekInFlight = true
+        // AE#629: this seek's own landing publishes the clock from here on.
+        inPlaceSwapMountPending = false
         latestSeekRenderedTimePublished = false
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
@@ -2253,7 +2280,7 @@ final class NativeAVPlayerHost {
                     break
                 }
                 let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
-                    url: segmentURL, httpHeaders: httpHeaders)
+                    url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: url)
                 guard !Task.isCancelled, self.sessionID == sid else { return }
                 self.publishCarriageProbeVerdict(verdict, sid: sid, from: "segment PMT")
             }

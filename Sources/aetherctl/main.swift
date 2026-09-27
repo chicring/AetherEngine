@@ -70,7 +70,7 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -235,7 +235,8 @@ func printUsage() {
                 packet's Dolby Vision RPU from Profile 7 to Profile
                 8.1 (and drop the enhancement layer) via
                 DoviRpuConverter, and write the result to
-                /tmp/aetherctl-dovitest.hevc in Annex-B form. Feed
+                aetherctl-dovitest.hevc (Annex-B) in a private
+                per-run temporary directory, printed. Feed
                 that to `dovi_tool extract-rpu` + `info` to validate
                 the rewritten RPU against ground truth.
 
@@ -258,7 +259,8 @@ func printUsage() {
                 to --width. Snapshot mode (--snapshot) decodes
                 frame-accurately at full resolution. Use --loops N
                 with `leaks --atExit` to detect memory leaks.
-                Writes the first frame to /tmp/aetherctl-extract-<mode>.png.
+                Writes the first frame to aetherctl-extract-<mode>.png
+                in a private per-run temporary directory, printed.
 
       audio     Load a source through the engine's audio-only path
                 (LoadOptions.audioOnly=true), play for ~10 seconds,
@@ -472,7 +474,7 @@ if first == "pktdump" {
 if first == "audiotap" {
     var rest = Array(args.dropFirst(2))
     let duration = takeDoubleFlag("--duration", from: &rest) ?? 30
-    let outPath = takeStringFlag("--out", from: &rest) ?? "/tmp/audiotap.wav"
+    let outPath = takeStringFlag("--out", from: &rest) ?? debugOutputPath("audiotap.wav")
     let remote = rest.contains("--remote")
     rest.removeAll { $0 == "--remote" }
     let software = rest.contains("--software")
@@ -634,6 +636,7 @@ if first == "play" {
     let seekCount = takeIntFlag("--seek-count", from: &rest)
     let mallocCensus = takeFlag("--malloc-census", from: &rest)
     let playForceSW = takeFlag("--sw", from: &rest)
+    let playSoftwareEscalation = !takeFlag("--no-sw-escalation", from: &rest)
     // AE#493: `LoadOptions.panelPresentsDolbyVision`, the host assertion. macOS has no per-mode display
     // capability API, so DV is unclaimable from inside the engine and a Mac run routes every DV source
     // as its HDR10 base layer until the host says otherwise.
@@ -884,7 +887,7 @@ if first == "play" {
         }
         done.wait()
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,

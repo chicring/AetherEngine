@@ -195,6 +195,7 @@ enum DiscReader {
             var chapters: [DiscChapter] = []
             // The VOBs carry no track language, so the IFO's attribute tables are the only source (#527).
             var streamLanguages: [Int: String] = [:]
+            var subpictureStreamIDs: [Int]?
             let nn = g.vtsn < 10 ? "0\(g.vtsn)" : "\(g.vtsn)"
             let ifoName = "VTS_\(nn)_0.IFO"
             if let vtsIFO = files.first(where: { $0.name.uppercased() == ifoName }) {
@@ -207,9 +208,11 @@ enum DiscReader {
                     }
                 }
                 streamLanguages = DVDIFOParser.parseStreamLanguages(bytes)
+                subpictureStreamIDs = DVDIFOParser.parseSubpictureStreamIDs(bytes)
             }
             return DiscTitle(id: idx, durationTicks: durationTicks, chapters: chapters, dvdVTSN: g.vtsn,
-                             streamLanguages: streamLanguages)
+                             streamLanguages: streamLanguages,
+                             dvdSubpictureStreamIDs: subpictureStreamIDs)
         }
         storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
                          formatHint: "mpeg", titles: titles, selectedIndex: selectedIndex, extents: extents)

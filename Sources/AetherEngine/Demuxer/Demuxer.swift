@@ -225,8 +225,39 @@ public final class Demuxer: @unchecked Sendable {
     // concurrent access triggers assertion failures in matroskadec.c.
     private let accessLock = NSLock()
 
-    private var avioProvider: AVIOProvider?
+    /// Audit DMX-11: `markClosed()` is the lock-free cross-thread abort, so it loads this reference
+    /// while the demux thread may be clearing it in `close()` or a failed open. A leaf lock of its
+    /// own (never `accessLock`, which `av_read_frame` holds for a whole network read) makes that
+    /// load a retained snapshot instead of a race.
+    private let providerLock = NSLock()
+    private var _avioProvider: AVIOProvider?
+    private var avioProvider: AVIOProvider? {
+        get {
+            providerLock.lock()
+            defer { providerLock.unlock() }
+            return _avioProvider
+        }
+        set {
+            providerLock.lock()
+            _avioProvider = newValue
+            providerLock.unlock()
+        }
+    }
+
+    /// Audit HLS-2: `markClosed()` before the provider exists used to be a no-op, so a teardown
+    /// that raced an in-flight open let it finish its connect and probe.
+    private let closeRequestLock = NSLock()
+    private var closeRequested = false
     private var openProfile: DemuxerOpenProfile = .playback
+
+    /// Audit NAT-7: the stream pointers `stream(at:)` hands out, copied out of `formatContext`
+    /// under `accessLock`. MPEG-TS adds streams inside `av_read_frame`, which reallocates the
+    /// `streams` array, so a caller on another thread must not index the live array while a read
+    /// holds the lock. The `AVStream`s themselves live until `avformat_close_input`. Guarded by
+    /// `streamTableLock`, a leaf lock; `streamTableSize` is its length, guarded by `accessLock`.
+    private let streamTableLock = NSLock()
+    private var streamTable: [UnsafeMutablePointer<AVStream>] = []
+    private var streamTableSize = 0
 
     /// The URL and headers this demuxer was opened from, kept for the recordless Dolby Vision audit's
     /// second open. nil for a custom reader (no second open to give) and for a live source.
@@ -317,6 +348,11 @@ public final class Demuxer: @unchecked Sendable {
     /// language inside the stream, so `trackInfo` backfills undetermined tracks from this; empty for every
     /// non-disc source, where it is a no-op (#527).
     private(set) var discStreamLanguages: [Int: String] = [:]
+    /// #651: the selected DVD title's declared subpicture substream ids, created before the probe.
+    private var discSubpictureStreamIDs: [Int]?
+    /// #651: one assembler per stream `declareDiscSubpictureStreams` created, keyed by stream index.
+    /// Those streams have no libavformat parser, so their fragments are joined here. Under `accessLock`.
+    private var subpictureAssemblers: [Int32: DVDSubpictureAssembler] = [:]
 
     /// Per-clip presentation-offset spans for a selected multi-clip Blu-ray title (empty otherwise). When
     /// non-empty, `readPacket` and `indexedKeyframes` fold each clip's timestamps onto one contiguous
@@ -346,6 +382,7 @@ public final class Demuxer: @unchecked Sendable {
         discTitles = info.titles
         selectedDiscTitleIndex = info.selectedTitleIndex
         discStreamLanguages = info.selectedTitle?.streamLanguages ?? [:]
+        discSubpictureStreamIDs = info.selectedTitle?.dvdSubpictureStreamIDs
         clipTimeline = info.clipTimeline
         lastClipIndex = 0
         lastReadClipIdx = -1
@@ -472,6 +509,9 @@ public final class Demuxer: @unchecked Sendable {
         onOpenProgress?(.containerOpened)
 
         try probeStreams(openedCtx)
+        accessLock.lock()
+        refreshStreamTableLocked()
+        accessLock.unlock()
         onOpenProgress?(.streamsProbed)
     }
 
@@ -507,17 +547,21 @@ public final class Demuxer: @unchecked Sendable {
         // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
         // the source is not a recognizable disc, fall through to the streaming reader.
-        if !isLive, Self.isDiscImageURL(url),
-           let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders) {
-            if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
-                adoptDiscInfo(discInfo)
-                auditSource = nil
-                let bridge = CustomIOReaderBridge(reader: discInfo.reader)
-                let inputFormat = av_find_input_format(discInfo.formatHint)
-                try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
-                return
+        if !isLive, Self.isDiscImageURL(url) {
+            let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
+            if let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
+                if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
+                    adoptDiscInfo(discInfo)
+                    auditSource = nil
+                    let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+                    let inputFormat = av_find_input_format(discInfo.formatHint)
+                    try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
+                    return
+                }
+                discReader.close()
             }
-            discReader.close()
+            // Not a disc: hand the warm back so the streaming reader below adopts it (#647).
+            if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
         }
         let reader = AVIOReader(
             url: url,
@@ -545,11 +589,12 @@ public final class Demuxer: @unchecked Sendable {
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
         isLive: Bool = false
     ) throws {
-        // Registered BEFORE open(): provider.open() can block for the whole reconnect budget on
-        // a stalled origin, and markClosed() during that window must reach the reader — with the
-        // assignment after open() it found avioProvider nil and the in-flight open kept issuing
-        // connections past engine.stop().
-        avioProvider = provider
+        closeRequestLock.lock()
+        let closedBeforeConnect = closeRequested
+        if !closedBeforeConnect { avioProvider = provider }
+        closeRequestLock.unlock()
+        if closedBeforeConnect { throw DemuxerError.openFailed(code: -1) }
+        // The provider must be visible to markClosed while open() is blocked on the origin.
         try provider.open()
         onOpenProgress?(.sourceOpened)   // #361
 
@@ -629,8 +674,12 @@ public final class Demuxer: @unchecked Sendable {
         }
         formatContext = ctxPtr  // avformat_open_input may reallocate
         onOpenProgress?(.containerOpened)   // #361
+        declareDiscSubpictureStreams(ctxPtr!)
 
         try probeStreams(ctxPtr!)
+        accessLock.lock()
+        refreshStreamTableLocked()
+        accessLock.unlock()
         onOpenProgress?(.streamsProbed)     // #361
         // #281: every parse seek this open performs has happened by now, so the provider can drop
         // the cold-start state that only exists to serve them. Deliberately after probeStreams:
@@ -651,14 +700,65 @@ public final class Demuxer: @unchecked Sendable {
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
-        if let probeControl {
-            ctx.pointee.interrupt_callback = AVIOInterruptCB(
-                callback: { opaque in
-                    guard let opaque else { return 0 }
-                    return Unmanaged<ProbeControl>.fromOpaque(opaque).takeUnretainedValue().isStopped ? 1 : 0
-                },
-                opaque: Unmanaged.passUnretained(probeControl).toOpaque())
+        // Installed unconditionally: a local input's URLContext copies the callback at open, so the
+        // input byte budget could not reach it later.
+        ctx.pointee.interrupt_callback = AVIOInterruptCB(
+            callback: { opaque in
+                guard let opaque else { return 0 }
+                return Unmanaged<DemuxInterrupt>.fromOpaque(opaque).takeUnretainedValue()
+                    .shouldInterrupt() ? 1 : 0
+            },
+            opaque: Unmanaged.passUnretained(interrupt).toOpaque())
+    }
+
+    /// #651: the probe budget of a DVD title whose IFO declared its streams.
+    ///
+    /// MPEG-PS sets `AVFMTCTX_NOHEADER` and never clears it, so `find_stream_info` never takes its
+    /// "all info found" exit and reads the whole budget on every open: 50 MB, most of a first frame on
+    /// a remote ISO. The long window only ever existed to discover streams that start late, and on a
+    /// DVD those are the subpictures, which the IFO has already declared. What is left to resolve is
+    /// the continuous streams (MPEG-2 video's rate, the audio's parameters), which a few seconds give.
+    static let declaredDiscTitleProbesize: Int64 = 8 * 1024 * 1024
+    static let declaredDiscTitleMaxAnalyzeDuration: Int64 = 5 * 1_000_000
+
+    /// #651: create the subpicture streams the selected DVD title's IFO declares, before anything is
+    /// read. `mpegps` looks a packet's stream up by `AVStream.id` before it creates one, so these
+    /// receive their packets exactly as if the demuxer had made them on the first one, and a subtitle
+    /// whose first packet is minutes in is a track from the first frame. Mirrors what `mpegps` sets
+    /// on a stream it creates, apart from `need_parsing`, which is internal: `dvdsubdec` reassembles
+    /// a subpicture split across packets itself.
+    private func declareDiscSubpictureStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        guard let ids = discSubpictureStreamIDs, !ids.isEmpty,
+              let name = ctx.pointee.iformat?.pointee.name, String(cString: name) == "mpeg" else { return }
+        var existing = Set<Int32>()
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            if let stream = ctx.pointee.streams[i] { existing.insert(stream.pointee.id) }
         }
+        var declared = 0
+        for id in ids where !existing.contains(Int32(id)) {
+            guard let stream = avformat_new_stream(ctx, nil), let codecpar = stream.pointee.codecpar else { break }
+            stream.pointee.id = Int32(id)
+            subpictureAssemblers[stream.pointee.index] = DVDSubpictureAssembler()
+            stream.pointee.time_base = AVRational(num: 1, den: 90000)
+            stream.pointee.pts_wrap_bits = 64
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
+            codecpar.pointee.codec_id = AV_CODEC_ID_DVD_SUBTITLE
+            declared += 1
+        }
+        if declared > 0 {
+            EngineLog.emit("[Demuxer] declared \(declared) DVD subpicture stream(s) from the IFO (#651)",
+                           category: .demux)
+        }
+    }
+
+    /// #651: shrink the probe to `declaredDiscTitle*` once the IFO has declared the title's streams.
+    /// Never raises a budget: a tighter caller budget (#68) still wins.
+    private func boundProbeForDeclaredDiscTitle(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        guard discSubpictureStreamIDs != nil,
+              let name = ctx.pointee.iformat?.pointee.name, String(cString: name) == "mpeg" else { return }
+        ctx.pointee.probesize = min(ctx.pointee.probesize, Self.declaredDiscTitleProbesize)
+        ctx.pointee.max_analyze_duration = min(ctx.pointee.max_analyze_duration,
+                                               Self.declaredDiscTitleMaxAnalyzeDuration)
     }
 
     /// Demuxer fflags applied to every avformat_open_input.
@@ -718,6 +818,7 @@ public final class Demuxer: @unchecked Sendable {
             return
         }
         reclassifyAttachedPictures(ctx)
+        boundProbeForDeclaredDiscTitle(ctx)
         let parked = parkUnresolvableAudio(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
         unparkUnresolvableAudio(ctx, parked)
@@ -862,6 +963,7 @@ public final class Demuxer: @unchecked Sendable {
         guard let ctx = formatContext else { return }
         reclassifyAttachedPictures(ctx)
         _ = avformat_find_stream_info(ctx, nil)
+        refreshStreamTableLocked()
     }
 
     /// True if the stream at `index` is missing or carries no resolved codec yet (`AV_CODEC_ID_NONE`).
@@ -1313,10 +1415,34 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     func stream(at index: Int32) -> UnsafeMutablePointer<AVStream>? {
-        guard let ctx = formatContext, index >= 0, index < ctx.pointee.nb_streams else {
-            return nil
+        guard index >= 0 else { return nil }
+        // `try`, not `lock`: a read can hold `accessLock` for a whole network stall, and a caller
+        // on the main actor must not wait that out. The table a busy read leaves behind is current
+        // anyway, since `readPacketLocked` refreshes it whenever a read adds a stream.
+        if accessLock.try() {
+            refreshStreamTableLocked()
+            accessLock.unlock()
         }
-        return ctx.pointee.streams[Int(index)]
+        streamTableLock.lock()
+        defer { streamTableLock.unlock() }
+        return Int(index) < streamTable.count ? streamTable[Int(index)] : nil
+    }
+
+    /// Caller holds `accessLock`.
+    private func refreshStreamTableLocked() {
+        var table: [UnsafeMutablePointer<AVStream>] = []
+        if let ctx = formatContext, let streams = ctx.pointee.streams {
+            let count = Int(ctx.pointee.nb_streams)
+            table.reserveCapacity(count)
+            for i in 0..<count {
+                guard let stream = streams[i] else { break }
+                table.append(stream)
+            }
+        }
+        streamTableSize = table.count
+        streamTableLock.lock()
+        streamTable = table
+        streamTableLock.unlock()
     }
 
     /// Sets AVDISCARD_ALL on streams outside `keep`. Without this, matroska reads
@@ -1474,13 +1600,59 @@ public final class Demuxer: @unchecked Sendable {
         return entry.pointee.timestamp
     }
 
-    /// The read itself. Caller holds `accessLock`.
+    /// The read itself, with the fragments of a declared DVD subpicture stream joined (#651).
+    /// Caller holds `accessLock`.
     private func readPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
+        while true {
+            guard let read = try readDemuxedPacketLocked() else { return nil }
+            var packet: UnsafeMutablePointer<AVPacket>? = read
+            let index = read.pointee.stream_index
+            guard var assembler = subpictureAssemblers[index] else { return read }
+            let timing = DVDSubpictureAssembler.Timing(
+                pts: read.pointee.pts, dts: read.pointee.dts,
+                pos: read.pointee.pos, duration: read.pointee.duration)
+            let unit = assembler.ingest(
+                UnsafeRawBufferPointer(start: read.pointee.data, count: Int(max(0, read.pointee.size))),
+                timing: timing)
+            subpictureAssemblers[index] = assembler
+            guard let unit else {
+                trackedPacketFree(&packet)
+                continue
+            }
+            // The first fragment's props, then the joined payload in place of its own.
+            guard let joined = trackedPacketAlloc() else { trackedPacketFree(&packet); return nil }
+            var out: UnsafeMutablePointer<AVPacket>? = joined
+            // `av_new_packet` resets every prop, so the copy comes after it.
+            guard av_new_packet(joined, Int32(unit.data.count)) >= 0,
+                  av_packet_copy_props(joined, read) >= 0 else {
+                trackedPacketFree(&out)
+                trackedPacketFree(&packet)
+                continue
+            }
+            unit.data.withUnsafeBytes { joined.pointee.data.update(from: $0.bindMemory(to: UInt8.self).baseAddress!, count: unit.data.count) }
+            joined.pointee.stream_index = index
+            joined.pointee.pts = unit.timing.pts
+            joined.pointee.dts = unit.timing.dts
+            joined.pointee.pos = unit.timing.pos
+            joined.pointee.duration = unit.timing.duration
+            trackedPacketFree(&packet)
+            return joined
+        }
+    }
+
+    /// #651: drop half-joined subpicture units along with libavformat's own parser state.
+    private func resetSubpictureAssembly() {
+        for key in subpictureAssemblers.keys { subpictureAssemblers[key]?.reset() }
+    }
+
+    /// One `av_read_frame`, as libavformat delivers it. Caller holds `accessLock`.
+    private func readDemuxedPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
         guard let ctx = formatContext else { return nil }
         try probeControl?.willReadPacket()
         var packet: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
         guard packet != nil else { return nil }
         let ret = av_read_frame(ctx, packet)
+        if Int(ctx.pointee.nb_streams) != streamTableSize { refreshStreamTableLocked() }
         do {
             try probeControl?.check()
             if ret >= 0, let packet { try probeControl?.receivedPacket(packet) }
@@ -1591,6 +1763,7 @@ public final class Demuxer: @unchecked Sendable {
             #endif
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         return ret >= 0
     }
@@ -1633,6 +1806,7 @@ public final class Demuxer: @unchecked Sendable {
             )
         }
         avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1
         return ret >= 0
     }
@@ -1644,6 +1818,7 @@ public final class Demuxer: @unchecked Sendable {
             pb.pointee.error = 0
         }
         avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1
     }
 
@@ -1758,6 +1933,7 @@ public final class Demuxer: @unchecked Sendable {
         }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
@@ -1946,6 +2122,7 @@ public final class Demuxer: @unchecked Sendable {
         compositionRepair?.noteSeek()  // #409: re-anchor on the next keyframe
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)
         avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         return ret >= 0
     }
@@ -2020,21 +2197,62 @@ public final class Demuxer: @unchecked Sendable {
     /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
     /// at once. No resource freeing. Call before close() when cancelling a pump.
     func markClosed() {
-        avioProvider?.markClosed()
+        closeRequestLock.lock()
+        closeRequested = true
+        let provider = avioProvider
+        closeRequestLock.unlock()
+        provider?.markClosed()
     }
 
     /// Static metadata probes only. Strong ownership outlives the native interrupt callback.
-    var probeControl: ProbeControl?
+    var probeControl: ProbeControl? {
+        get { interrupt.probeControl }
+        set { interrupt.probeControl = newValue }
+    }
+
+    /// Target of the format context's interrupt callback, owned for the demuxer's whole life so the
+    /// unretained pointer libavformat holds cannot dangle.
+    private let interrupt = DemuxInterrupt()
+
+    /// Caps the source bytes libavformat may consume until `endInputByteBudget`, enforced below
+    /// `av_read_frame`. A pass that sets AVDISCARD_ALL on other streams needs this: the demuxer reads
+    /// and drops their blocks inside one `av_read_frame`, where no packet or packet-byte cap sees them.
+    /// Overshoot is at most one read. Call from the thread that reads packets.
+    func beginInputByteBudget(_ bytes: Int64) {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        if let provider = avioProvider {
+            provider.beginReadByteBudget(bytes)
+        } else if let pb = formatContext?.pointee.pb {
+            interrupt.armInputCeiling(pb: pb, bytes: bytes)
+        }
+    }
+
+    func endInputByteBudget() {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        avioProvider?.endReadByteBudget()
+        interrupt.disarmInputCeiling()
+    }
+
+    /// True when a read was refused because the budget armed by `beginInputByteBudget` was spent.
+    var inputByteBudgetExhausted: Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        return (avioProvider?.readByteBudgetExhausted ?? false) || interrupt.inputCeilingHit
+    }
 
     func close() {
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
+        interrupt.disarmInputCeiling()
         if formatContext != nil {
             avformat_close_input(&formatContext)
         }
         formatContext = nil
         compositionRepair = nil
         compositionRepairEvaluated = false
+        refreshStreamTableLocked()
         accessLock.unlock()
 
         avioProvider?.close()
@@ -2063,4 +2281,35 @@ enum DemuxerError: Error, CustomStringConvertible, LocalizedError {
     }
 
     var errorDescription: String? { description }
+}
+
+/// Answers libavformat's interrupt callback. `probeControl` is set before open; the input ceiling is
+/// armed and read only on the thread that holds the demuxer's access lock for the native call.
+private final class DemuxInterrupt: @unchecked Sendable {
+    var probeControl: ProbeControl?
+    private var pb: UnsafeMutablePointer<AVIOContext>?
+    private var ceiling: Int64 = .max
+    private(set) var inputCeilingHit = false
+
+    /// Local (URLContext) inputs only: a provider-backed input never consults this callback per read.
+    func armInputCeiling(pb: UnsafeMutablePointer<AVIOContext>, bytes: Int64) {
+        self.pb = pb
+        let (sum, overflow) = pb.pointee.bytes_read.addingReportingOverflow(max(0, bytes))
+        ceiling = overflow ? .max : sum
+        inputCeilingHit = false
+    }
+
+    func disarmInputCeiling() {
+        pb = nil
+        ceiling = .max
+    }
+
+    func shouldInterrupt() -> Bool {
+        if probeControl?.isStopped == true { return true }
+        if let pb, pb.pointee.bytes_read >= ceiling {
+            inputCeilingHit = true
+            return true
+        }
+        return false
+    }
 }

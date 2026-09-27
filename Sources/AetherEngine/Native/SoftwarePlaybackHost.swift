@@ -656,8 +656,13 @@ final class SoftwarePlaybackHost {
     /// AE#462: how this host's audio ended up, from the two facts that decide it. Silence has two
     /// causes here exactly as it does in the loopback cascade, and only one of them is a reason for
     /// a host to demote to a source that carries the audio differently.
-    nonisolated static func audioDelivery(resolvedAudioIndex: Int32, decoderOpened: Bool) -> AudioDelivery {
-        guard resolvedAudioIndex >= 0 else { return .noAudioInSource }
+    ///
+    /// AE#641: an unresolved index is not a source without audio. On VOD nothing falls back past
+    /// `av_find_best_stream`, which passes over an audio stream whose parameters the probe left empty,
+    /// so the source's own streams decide which of the two silences this is.
+    nonisolated static func audioDelivery(resolvedAudioIndex: Int32, decoderOpened: Bool,
+                                          sourceCarriesAudio: Bool) -> AudioDelivery {
+        guard resolvedAudioIndex >= 0 else { return sourceCarriesAudio ? .droppedNoPipeline : .noAudioInSource }
         return decoderOpened ? .decoded : .droppedNoPipeline
     }
 
@@ -903,7 +908,8 @@ final class SoftwarePlaybackHost {
         // stream present but unusable (no codecpar) classifies as the drop it is rather than as a
         // source without audio.
         self.audioDelivery = Self.audioDelivery(resolvedAudioIndex: resolvedAudioIdx,
-                                                decoderOpened: self.audioDecoder != nil)
+                                                decoderOpened: self.audioDecoder != nil,
+                                                sourceCarriesAudio: dem.firstAudioStreamIndexByType >= 0)
         // #112 rework: capture embedded subtitle stream indices + time bases for the demux
         // loop's subtitle tap dispatch.
         var subIndices: Set<Int32> = []

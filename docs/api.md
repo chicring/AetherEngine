@@ -35,13 +35,14 @@ A working shape for the live contracts below, compiled against the engine: [`Exa
 | --- | --- | --- |
 | The source could not be opened, probed, or routed | throws | `.error(message)` is published as well |
 | A newer `load()` or a `stop()` superseded this one | throws `CancellationError` | belongs to the successor, untouched |
+| AVPlayer refused the media during startup and the engine rebuilt the session on the software path (AE#561) | keeps waiting, then returns (or throws what the rebuild threw) | whatever the rebuilt session reaches; `softwarePathEscalations` fires with `duringStartup` |
 | A custom `IOReader` whose initial probe failed | throws | `.error` |
 | Dolby Vision with no compatible base layer on the software path | throws `AetherEngineError.dolbyVisionUnplayableOnSoftwarePath` | `.error` |
 | An HLS playlist handed to the raw live path by a custom reader | throws `AetherEngineError.hlsPlaylistOnRawLivePath` | `.error` |
 | The session died after the load returned (source loss, a reload that never became ready, a track switch that failed) | already returned | `.error(message)` only |
 | A live session the engine cannot revive | already returned | no `.error`; `liveSourceReset` fires instead |
 
-**`CancellationError` is not a playback failure.** It is what a superseded load throws at its first checkpoint, so every channel zap, every next-episode call and every `stop()` during a load produces one. A host that retries, falls back to a second engine, or shows an error on "load threw" reacts to its own navigation unless it lets `CancellationError` through untouched.
+**`CancellationError` is not a playback failure.** It is what a superseded load throws at its first checkpoint, so every channel zap, every next-episode call and every `stop()` during a load produces one. A load the ENGINE superseded does not throw it: the software-path rebuild below takes over the startup, and the `load()` the host is awaiting follows it, the way a #361 reroute keeps its wait (AE#629). A host that retries, falls back to a second engine, or shows an error on "load threw" reacts to its own navigation unless it lets `CancellationError` through untouched.
 
 The message inside `.error` is worth logging verbatim, and it comes from two different places. Some are the engine's own sentence and name the cause rather than the symptom (`"AVFoundation built no track for it within 45s and the source's carriage could not be identified"`, `"Live source unavailable"`, the Dolby Vision hardware refusal); a host timeout that fires first replaces that sentence with its own. The rest are forwarded from the failure underneath, and on the native paths that is `AVPlayerItem.error.localizedDescription` verbatim, which AVFoundation localizes into the device language and whose `NSError` domain and code reach the host only as whatever the localized text happens to embed.
 
@@ -117,6 +118,21 @@ player.systemCaptionRequest       // PassthroughSubject<SystemCaptionRequest, Ne
 ```
 
 iOS 26's Automatic Subtitles (show when muted, on skip back, on a language mismatch) turn captions on with no read API behind them, so the selection is the only observable ask. The engine deselects its own rendition, because one rendered in fullscreen draws a caption box over the host's overlay, and forwards the request with the language it named. A host that wants the behaviour answers by selecting its own matching track.
+
+### The engine moves a refused session onto the software path
+
+```swift
+player.softwarePathEscalations   // PassthroughSubject<SoftwarePathEscalationEvent, Never>; subscribe per session
+options.escalatesToSoftwarePath  // default true; false declines the rebuild
+```
+
+When AVPlayer fails a native item with a verdict on the MEDIA (`CoreMediaErrorDomain`, typically `-19602` on a sample Apple's parser refuses), every native recovery reloads the same bytes, so the engine spends one rebuild per session on `SoftwarePlaybackHost` at the session's playhead instead of making the failure terminal (AE#561). libavcodec skips the frame Apple refused and plays on. It is not taken on the remote-HLS bypass, on a session already asked onto `.software`, or for a URL-loading failure, which both paths would read through the same reader; whether the software path can serve the source at all is the same check a `preferredDecodePath` correction runs.
+
+The event fires the moment the rebuild is taken and carries the failure it absorbed, in the `PlaybackErrorInfo` shape it would have surfaced in (`kind` `.nativeItemFailed`), plus the position and whether a `load()` was still waiting. If the rebuild then fails, the original failure is published as `.error` the usual way; if it succeeds, `videoRoute` moves to `.software`. A startup take does not end the host's `load()` with a `CancellationError`: that call keeps waiting across the rebuild and returns the probe it already assembled.
+
+A host that re-plans a failing title with a ladder of its own (a transcode rung, a second player) sets `escalatesToSoftwarePath = false` and gets the failure as `.error` instead, as before 7.9.0. It is a tuning field, correctable through `reloadAtCurrentPosition(applying:)`.
+
+A live join takes the same rung when the source delivers video for the whole keyframe wait (15 s) and none of it is a picture the native route can open a segment on: no IDR and no recovery point with `recovery_frame_cnt` 0, which is what a feed carrying only gradual intra refresh looks like (AE#627). Reopening would join the same bitstream, so the first join does not spend its reopen cycles on it. The absorbed failure carries the domain `AetherEngine.LiveJoin`. With `escalatesToSoftwarePath = false`, or when the rung is not on offer, the join ends as `liveSourceReset` at that point, as the reopen cycles would have ended it a minute later. A starvation after the session has produced segments keeps its reopens.
 
 ### The audio tap ends with its session
 
@@ -227,8 +243,9 @@ try await player.reloadAtCurrentPosition { $0.preferredDecodePath = .software }
 the native path. That is the right default, and occasionally wrong. When VideoToolbox then cannot
 build a decoder for what arrives, the item reaches `readyToPlay` and renders nothing, and in-band
 parameter sets (`hev1` / `avc1` with an empty config record) are the class where the deciding
-evidence genuinely is not present at load time. A live load never reaches that gate at all: the
-capability check is VOD-only, so a live session keeps the native path with no classification step.
+evidence genuinely is not present at load time. A live H.264 / HEVC load never reaches that gate at
+all: for those codecs the capability check is VOD-only, so a live session keeps the native path with
+no classification step. Live AV1 is judged by profile like VOD (High and Professional go software).
 
 Detecting the symptom is a host's own job and is not hard (`AVPlayerItemVideoOutput.hasNewPixelBuffer`
 against `softwareHostFramesEnqueued`, both already exposed). The escape was the missing half. Before
@@ -267,17 +284,21 @@ typed fact rather than as something to reconstruct (AE#462).
 | Value | Meaning |
 | --- | --- |
 | `.none` | no session |
-| `.noAudioInSource` | the source carries no audio track, or none was selected |
+| `.noAudioInSource` | the source carries no audio track |
 | `.streamCopy` | the source bitstream is muxed into fMP4 unchanged (Atmos, DTS-HD and everything else reach the renderer as authored) |
 | `.bridged` | decoded and re-encoded to FLAC or E-AC-3 for the fMP4 pipeline; lossless for the bed channels, object metadata does not survive the PCM intermediate |
 | `.decoded` | libavcodec decodes and the engine renders it (the software path, the FFmpeg audio-only host) |
-| `.droppedNoPipeline` | the source HAS audio and none of it could be delivered: no decoder for it in this build, or the bridge could not be built or could not write its header. The session plays video-only and silently |
+| `.droppedNoPipeline` | the source HAS audio and none of it could be delivered: no decoder for it in this build, the bridge could not be built or could not write its header, the probe left its parameters empty so no stream could be picked, or (live only) the bridge was built and its decoder produced nothing, after which the engine rebuilds the session without the track (AE#641). The session plays video-only and silently |
 | `.playerManaged` | AVFoundation owns the audio (the remote-HLS bypass, the native audio-only host). The engine has no pipeline of its own to classify and does not answer on AVFoundation's behalf |
 
 **`.droppedNoPipeline` is the one a fallback ladder acts on**, the same way it demotes on
 `PlaybackErrorKind.audioBridgeProducedNoOutput`. The two are the same user outcome from opposite
-ends of the cascade: that kind fails loudly when a bridge WAS built and then decoded nothing, this
-value reports a bridge that could never be built at all. Neither ends a ladder: re-serving the
+ends of the cascade: that kind fails loudly when a VOD bridge WAS built and then decoded nothing
+(on the FLAC route as well since AE#641, which used to play silently while reporting `.bridged`),
+this value reports a bridge that could never be built at all. A live session whose bridge decodes
+nothing arrives here as well rather than at the error: its video is playable and a live source has
+no position to hand to a second player, so the engine rebuilds it video-only by itself and the
+value changes from `.bridged` to `.droppedNoPipeline` (AE#641). Neither ends a ladder: re-serving the
 source with audio the pipeline can carry (a server-side transcode, a second player that decodes it
 itself) plays it.
 
@@ -414,7 +435,7 @@ try await player.reloadAtCurrentPosition()
 | `AetherEngine.probeDetectingAtmos(url:options:atmosDetection:)` | `probe` plus a bounded decode pass that authoritatively resolves E-AC-3 JOC for an Atmos badge. Strictly more expensive; never on the playback-start path. Decode-side failures degrade to "not confirmed" rather than throwing. Same thing as `probe(url:detecting: .atmos)`. |
 | `AetherEngine.probe(url:options:detecting:atmosDetection:hdr10PlusDetection:)` / `probe(source:...)` | `probe` plus the opt-in passes named in `ProbeDetail`, over one demuxer: `.atmos` (the bounded JOC decode above) and `.hdr10Plus` (structurally validated ST 2094-40 carriage). Both passes share the optional trailing `limits` and `cancellation`. Empty set is the header probe with the same controls. Both passes only ever SET `isAtmos` / `carriesHDR10PlusMetadata`; ordinary pass failures and per-pass caps leave the detail unconfirmed. A whole-probe stop throws, with no partial result. |
 | `ProbeDetail` | `OptionSet`: `.atmos`, `.hdr10Plus`. |
-| `HDR10PlusDetectionOptions` | Bounds for the HDR10+ scan: `maxPackets` (32), `maxBytes` (16 MiB), `timeBudget` (2 s). The byte cap is the one that binds on UHD remuxes, where a single keyframe runs to several MB. |
+| `HDR10PlusDetectionOptions` | Bounds for the HDR10+ scan: `maxPackets` (32), `maxBytes` (16 MiB), `timeBudget` (2 s). The byte cap is the one that binds on UHD remuxes, where a single keyframe runs to several MB. It also bounds the total source read to four times `maxBytes` (at least 4 MiB), below the demuxer, so blocks of dropped streams count. |
 | `ProbeLimits` | Optional whole-probe controls: `maxInputBytes` (8 MiB), `maxPackets` (128), `maxPacketBytes` (2 MiB), `timeBudget` (5 s). Nonnegative values required; the time budget must be finite. |
 | `ProbeCancellation` | Thread-safe, one-shot token: `init()`, `isCancelled`, `cancel()`. Available on every URL/custom header, detail and `probeDetectingAtmos` overload. Cancellation is a request, not a completion notification. |
 | `ProbeError` | `invalidLimits`, `inputLimit`, `packetLimit`, `packetSizeLimit`, `timedOut`, `invalidReaderResult`, `unsupportedURL`, `sourceBusy`; `errorDescription` describes the stop. Explicit caller cancellation throws `CancellationError` instead. |
@@ -500,6 +521,8 @@ What it fetches: one ranged GET from byte zero for the budget, plus a second one
 
 A warm also hands the load **where the bytes live**. A resolver URL that answers 302 with a temporary edge target is resolved once, by the warm, and the session starts at that target instead of resolving the chain again; a lease that has since run out falls back to the source URL through the same ladder a mid-session expiry uses. Credential headers (`Authorization`, `Cookie`, `X-Emby-Token` and the rest of the #126 set) never travel to a cross-origin target, whether it was reached through a redirect or pinned from a warm.
 
+Remote disc images (`.iso` / `.img` / `.udf` over HTTP) adopt a warm too (#647). The disc reader takes the size from the warm instead of probing for it, answers the disc layer's structure reads and the title's opening extents out of the head, and starts its first request at the warm frontier; its forks (the subtitle side reader, the forward prefetcher) share the same bytes without a copy. It does not pin the warm's redirect target, because that reader follows redirects per request. A disc-image URL that turns out not to be a disc hands the warm on to the streaming reader.
+
 Three limits are part of the contract rather than implementation detail:
 
 - **It never queues for the origin.** A warm takes a request slot only if one is free right now, and declines when the origin is metered down to one request at a time or is pacing the engine (`maxConcurrentSourceRequests`, #377). A prewarm that would have to wait for the playing session's uplink has stopped helping.
@@ -571,8 +594,9 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | `$isSessionReady` | The session is ready in the AVFoundation sense. Not the edge a black cover comes off on. |
 | `$hasFirstFrameReadyForDisplay` | The picture for **this** load is up. A picture, not motion: a live join presents its first frame and can then hold it bit-static for seconds while AVPlayer decides whether to start (AE#440), so a host dropping a spinner here drops it onto a frozen frame. Use `$playbackPhase` for "it is moving". Latched for the load, cleared at the next `load()` / `stop()`. Audio-only sessions never arm it. On an external screen (`isExternalPlaybackActive`) the local layer never reaches readiness, so the item's readiness is the honest edge and the flag latches there (#315). |
 | `$startupProgress` | `StartupProgress?` for a determinate loading bar. |
+| `softwarePathEscalations`, `SoftwarePathEscalationEvent` | A native session AVPlayer refused, rebuilt on the software path, with the failure it absorbed. See [The engine moves a refused session onto the software path](#the-engine-moves-a-refused-session-onto-the-software-path). |
 | `$videoRoute` | `VideoRoute`: which pipeline is actually serving, one of `.none`, `.remoteBypass`, `.loopback`, `.software`, `.audio`. `LoadOptions.nativeRemoteHLS` is only the request; the carriage watchdog, the remembered verdict and the HLS reroutes move a session between routes, mid-session too. Branch on this, above all for who draws subtitles. |
-| `$audioDelivery` | `AudioDelivery`: how the audio reaches the renderer, one of `.none`, `.noAudioInSource`, `.streamCopy`, `.bridged`, `.decoded`, `.droppedNoPipeline`, `.playerManaged`. `.droppedNoPipeline` is a source that HAS audio playing video-only because no pipeline could be built for it: the value a fallback ladder demotes on. See [Reading whether the audio was delivered](#reading-whether-the-audio-was-delivered). |
+| `$audioDelivery` | `AudioDelivery`: how the audio reaches the renderer, one of `.none`, `.noAudioInSource`, `.streamCopy`, `.bridged`, `.decoded`, `.droppedNoPipeline`, `.playerManaged`. `.droppedNoPipeline` is a source that HAS audio playing video-only because no pipeline could be built for it, or because a live bridge decoded nothing (AE#641): the value a fallback ladder demotes on. See [Reading whether the audio was delivered](#reading-whether-the-audio-was-delivered). |
 | `$videoFormat` | The format being presented: `.sdr`, `.hdr10`, `.hdr10Plus`, `.dolbyVision`, `.hlg`. On a platform with no per-mode capability table (macOS), a Dolby Vision session the clamp sent to `.hdr10` is upgraded back to `.dolbyVision` once the item AVFoundation is playing turns out to carry a `dvh1` / `dvhe` sample entry (AE#515). On tvOS the panel term behind it no longer comes from the headroom alone: a session serving an HDR master that AVFoundation has not refused publishes the presented format half a second in, because a display that takes an HDR master is presenting HDR while one that is not refuses in 54 to 61 ms, and `currentEDRHeadroom` has been measured reading 1.00 through exactly that acceptance (AE#459). |
 | `$sourceVideoFormat` | The format the **source** carries, before any panel-driven mapping. The pair is what an honest badge needs: HDR content on an SDR panel differs between the two. |
 | `$sourceDVProfile`, `$sourceVideoFrameRate`, `$sourceVideoBitrate` | Source detail for an info panel. |
@@ -640,7 +664,7 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | `liveResumeClamped`, `LiveResumeClamp` | A resume that found the playhead outside the window and moved it; see above. |
 | `liveScrubThumbnail(atSessionSeconds:maxWidth:)` | Still on the live session axis, decoded from what the session already holds. A native session reads its DVR segment cache; a software session reads its DVR packet ring (#544), so a tuner channel the box decodes in software has a scrub preview too. |
 | `$playlistShiftSeconds` | Seconds the producer subtracted from source PTS. Published values already fold it back; exposed for hosts pairing their own samples against AVPlayer's raw clock. |
-| `HLSLiveIngestReader(playlistURL:)`, `HLSLiveIngestReader(playlistURL:httpHeaders:)` | The ready-made `IOReader` for ingesting an upstream HLS playlist directly, with AES-128 clear-key and SSAI handling. The headers ride the playlist, every segment and every AES key, which is what a tokenized IPTV origin enforces per request. Unsupported shapes surface a typed `HLSIngestError`. |
+| `HLSLiveIngestReader(playlistURL:)`, `HLSLiveIngestReader(playlistURL:httpHeaders:)` | The ready-made `IOReader` for ingesting an upstream HLS playlist directly, with AES-128 clear-key and SSAI handling. The headers ride the playlist, every segment and every AES key, which is what a tokenized IPTV origin enforces per request. Credential headers (`Authorization`, `Cookie`, `X-Emby-Token` and the like) go only to the playlist's own origin with no https to http downgrade; a URI the playlist points at another host gets the other headers without them, the rule a redirect already follows. Unsupported shapes surface a typed `HLSIngestError`. |
 
 ### Where a live start's seconds go
 
@@ -814,6 +838,10 @@ declared from the old source produces a file that is unplayable or silently wron
 host has the event and starts part two if it wants one. `stop()` and a new `load()` end it the same
 way with `.ended(.sessionEnded)`; a recording never outlives its session.
 
+`.ended` is published once the file is closed. The queued tail and the trailer are written off the
+main actor, so it can arrive a moment after the call that ended the recording; `stopRecording()`
+returns only after it, and a `startRecording(to:)` issued in that moment waits for it first.
+
 **Not implemented: recording from the start of what is already buffered.** A recording begins at the
 call, not at the back of the DVR window. On `.loopback` what is retained is remuxed fMP4 with
 **bridged** audio, not source packets, so prepending it would produce one file whose audio codec
@@ -942,7 +970,8 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `keepDvh1TagWithoutDV` | false | Diagnostic lever: force dvh1 tags and a master playlist regardless of display capability. |
 | `forceDolbyVisionOnNonDVDisplay` | false | **Experimental (AE#455).** On a display with no Dolby Vision of its own, serve an HEVC Profile 8.1 source the way a Profile 5 source is served (`dvh1` sample entry, `dvcC` rewritten to profile 5 / compatibility 0, `CODECS="dvh1.05.LL"`), so AVPlayer composes the RPU itself instead of handing the panel the static-metadata HDR10 base layer. The bitstream is untouched; only the container's claim about it changes. Ignored on a display that does Dolby Vision, and Profile 8.1 only. See [formats.md](formats.md#dolby-vision-signaling) for what it buys and what it risks. |
 | `dolbyVisionHandling` | `.automatic` | A `DolbyVisionHandling`. `.baseLayerOnly` presents the HDR10 / HLG base layer of a Dolby Vision source and leaves the Dolby Vision out of the container on every display: plain `hvc1` / `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria, `videoFormat` reads the base layer's format while `sourceVideoFormat` and `sourceDVProfile` keep saying what the file carries. The route a host offers as "Dolby Vision: off (HDR10)", for a source whose Dolby Vision is wrong and whose base layer is right: the reported shape is a remux carrying a Profile 7 RPU under a container record claiming Profile 5, where a player that believes the record decodes YCbCr as IPT and the picture comes out green / violet. Applies to HEVC Profile 7 / 8.1 / 8.4, AV1 Profile 10.1 / 10.4, and a Profile 5 (or AV1 10.0) record whose VUI declares a BT.2020 YCbCr PQ or HLG base; a Profile 5 whose VUI is unspecified carries IPT-PQ-c2, has no base layer to present, keeps its route, and the engine says so in the log. Takes precedence over `forceDolbyVisionOnNonDVDisplay`. A tuning field, correctable through `reloadAtCurrentPosition(applying:)`; a Profile 5 record the VUI contradicts also stops refusing the software path under it. See [formats.md](formats.md#dolby-vision-signaling). |
-| `preferredDecodePath` | `.automatic` | A `DecodePath`. `.software` serves this source through `SoftwarePlaybackHost` whatever the routing concluded, scoped to this session and costing the source nothing (seeks, the audio switch and the title switch all keep working). The escape for the formats `VTCapabilityProbe` deliberately cannot classify, and for live, which never reaches that gate at all. One-way: there is no `.native`. See [Overriding the decode path](#overriding-the-decode-path). |
+| `preferredDecodePath` | `.automatic` | A `DecodePath`. `.software` serves this source through `SoftwarePlaybackHost` whatever the routing concluded, scoped to this session and costing the source nothing (seeks, the audio switch and the title switch all keep working). The escape for the formats `VTCapabilityProbe` deliberately cannot classify, and for live H.264 / HEVC, which never reaches that gate at all. One-way: there is no `.native`. See [Overriding the decode path](#overriding-the-decode-path). |
+| `escalatesToSoftwarePath` | `true` | Whether a native session AVPlayer refuses on its merits (`CoreMediaErrorDomain`), or a live join without an entry point the native route can open (`AetherEngine.LiveJoin`, AE#627), may be rebuilt once on the software path (AE#561). `false` surfaces the failure as `.error` instead, for a host with its own fallback ladder (AE#629). Correctable. |
 | `deinterlaceMode` | `.auto` | A `DeinterlaceMode` for the software path: the Metal / VideoToolbox graph with a CPU bwdif fallback, or `.software` to force the CPU path. |
 | `deinterlaceFieldRate` | `.field` | A `DeinterlaceFieldRate`: the hardware deinterlacer emits one frame per field (25i to 50p) or per frame. The software fallback is always frame rate, because doubling a CPU bwdif is the wrong trade and a fallback should not change cost class. |
 | `probesize`, `maxAnalyzeDuration` | nil | Caller-bounded open-time probe budget (defaults 50 MB / 60 s). They fail **open**: an over-tight budget loads with late-resolving tracks silently missing rather than throwing, so validate track presence if you tighten them. Do not pass `0` for `maxAnalyzeDuration`; FFmpeg maps it to a shorter heuristic. |

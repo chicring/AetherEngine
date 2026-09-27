@@ -351,10 +351,15 @@ extension AetherEngine {
         #endif
     }
 
-    func loadRemoteHLS(url: URL, options: LoadOptions, startPosition: Double? = nil) async throws {
+    func loadRemoteHLS(
+        url: URL, options: LoadOptions, startPosition: Double? = nil, generation: UInt64? = nil
+    ) async throws {
+        // Audit CORE-6: the generation of the load() that routed here, not a fresh read of it, so a
+        // stale caller cannot adopt its successor's generation.
+        if let generation { try checkLoadCurrent(generation) }
         playbackBackend = .native
         // #168 follow-up: detect a superseding load()/stop() between the carriage verdict and the reroute.
-        let bypassGeneration = loadGeneration
+        let bypassGeneration = generation ?? loadGeneration
 
         let host: NativeAVPlayerHost
         if let existing = nativeHost {
@@ -652,10 +657,12 @@ extension AetherEngine {
             return nil
         }
         remoteHLSSubtitleProxy = prepared
+        // Audit NAT-2: the NAMEs the served master carries, which the selection and the legible-list
+        // filter match against, not the names the tracks asked for (the rewriter disambiguates and
+        // escapes them).
         injectedSubtitleRenditionNames = prepared.servesSubtitleRenditions
             ? Dictionary(
-                uniqueKeysWithValues: zip(tracks.map(\.externalID),
-                                          RemoteHLSSubtitleProvider.renditions(for: tracks).map(\.name)))
+                uniqueKeysWithValues: zip(tracks.map(\.externalID), prepared.renditionNames))
             : [:]
         #if os(iOS)
         // #86 / #227: a receiver cannot reach 127.0.0.1. Mounting while already AirPlaying has to hand out
@@ -803,6 +810,7 @@ extension AetherEngine {
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
+            undecodableAudioStreamIndex: undecodableLiveAudioStreamIndex,
             audioBridgeMode: audioBridgeMode,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
@@ -1007,6 +1015,45 @@ extension AetherEngine {
                 // ends here; the host has the event and starts part two if it wants one.
                 self.endRecordingIfRunning(reason: .sourceReset)
                 self.liveSourceReset.send()
+            }
+        }
+        // AE#627: the first join found no entry point the native route can open. Reopening joins the
+        // same bitstream, so the session goes to the software path, or straight to the host when
+        // that rung is not on offer, instead of spending three 15 s reopen cycles first.
+        session.onLiveJoinWithoutEntryPoint = { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session, self.nativeVideoSession === session else { return }
+                let request = SoftwarePathEscalation.Request(
+                    domain: SoftwarePathEscalation.liveJoinErrorDomain,
+                    code: 0,
+                    message: "live join found no entry point the native route can open",
+                    positionSeconds: 0
+                )
+                let offered = SoftwarePathEscalation.shouldEscalate(
+                    errorDomain: request.domain,
+                    availability: SoftwarePathEscalation.Availability(
+                        alreadyEscalated: self.softwarePathEscalationBudget.isSpent,
+                        preferredDecodePath: self.loadedOptions.preferredDecodePath,
+                        nativeRemoteHLS: self.loadedOptions.nativeRemoteHLS,
+                        hostAllowsEscalation: self.loadedOptions.escalatesToSoftwarePath))
+                guard offered else {
+                    EngineLog.emit(
+                        "[AetherEngine] AE#627 software path not on offer for this session; "
+                        + "handing the join failure to the host",
+                        category: .session
+                    )
+                    session.giveUpLiveJoinWithoutEntryPoint()
+                    return
+                }
+                await self.escalateToSoftwarePath(request)
+            }
+        }
+        // AE#641: the live bridge decoded nothing, so the served media carries an audio track that
+        // will never be filled and AVPlayer waits on it forever. The session is rebuilt video-only.
+        session.onLiveAudioDecodesNothing = { [weak self, weak session] streamIndex, summary in
+            Task { @MainActor in
+                guard let self, let session, self.nativeVideoSession === session else { return }
+                await self.dropUndecodableLiveAudio(streamIndex: streamIndex, bridgeSummary: summary)
             }
         }
         // #126: zero-progress VOD pump death (readError before any packet/segment), and #169:
@@ -1608,14 +1655,27 @@ extension AetherEngine {
                         // AE#561: a frozen position across three reloads is the reload answering the
                         // same bytes three times. Offer the source to the engine's own decoder before
                         // the session is left dead.
-                        await self.escalateToSoftwarePath(
-                            SoftwarePathEscalation.Request(
-                                domain: SoftwarePathEscalation.mediaErrorDomain,
-                                code: 0,
-                                message: "item death at a frozen position, revive budget exhausted",
-                                positionSeconds: position.isFinite ? max(0, position) : 0
-                            )
+                        //
+                        // Its own task (audit CORE-1): the rebuild's load() cancels THIS task in its
+                        // prologue, and a rebuild left running in a cancelled task turns every
+                        // `try? await Task.sleep` poll on its way (the panel-switch wait) into a hot
+                        // spin on the main actor. Supersession is answered by the load generation.
+                        let request = SoftwarePathEscalation.Request(
+                            domain: SoftwarePathEscalation.mediaErrorDomain,
+                            code: 0,
+                            message: "item death at a frozen position, revive budget exhausted",
+                            positionSeconds: position.isFinite ? max(0, position) : 0
                         )
+                        // AE#629: a host that declined the rung asked for exactly this failure. Left
+                        // unsaid, the session sits dead, which is what 7.8.1 did here too.
+                        guard self.loadedOptions.escalatesToSoftwarePath else {
+                            EngineLog.emit(
+                                "[AetherEngine] #629 the host declined the software-path rung; "
+                                + "surfacing the item death", category: .engine)
+                            self.publishError(Self.absorbedFailure(request))
+                            return
+                        }
+                        Task { @MainActor [weak self] in await self?.escalateToSoftwarePath(request) }
                         return
                     }
                     EngineLog.emit(
@@ -1645,11 +1705,13 @@ extension AetherEngine {
         let escalationBudget = softwarePathEscalationBudget
         let escalationPreferred = loadedOptions.preferredDecodePath
         let escalationRemoteHLS = loadedOptions.nativeRemoteHLS
+        let escalationAllowed = loadedOptions.escalatesToSoftwarePath
         host.softwarePathAvailability = {
             SoftwarePathEscalation.Availability(
                 alreadyEscalated: escalationBudget.isSpent,
                 preferredDecodePath: escalationPreferred,
-                nativeRemoteHLS: escalationRemoteHLS
+                nativeRemoteHLS: escalationRemoteHLS,
+                hostAllowsEscalation: escalationAllowed
             )
         }
         host.$pendingSoftwarePathEscalation
@@ -2234,6 +2296,7 @@ extension AetherEngine {
         // It follows the TARGET route, not the previous one: a rebuild that flips to software renders
         // into its own layer, and a preserved host would leave AVKit bound to a stale player with
         // audio still flowing into the next load (the release `load()` does by hand on that branch).
+        claimSoftwarePathTakeover()   // AE#629
         stopInternal(resetDisplayCriteria: false, keepNativeHost: !targetSoftwarePath, keepCustomReader: true)
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         let gen = loadGeneration

@@ -14,6 +14,10 @@ import Foundation
 /// range request retries with backoff so a transient network blip does not end playback. The server
 /// MUST honor range requests (any static file host does); if it does not, `init` returns nil after a
 /// clear log and the caller falls back to the plain streaming path.
+///
+/// A source the host warmed with `AetherEngine.prewarm` (#551) is read out of those bytes first
+/// (#647): the warm has already stated the size and proven range support, so the reader neither
+/// probes nor refetches the head, and its first request starts at the warm frontier.
 final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
 
     private let url: URL
@@ -24,6 +28,8 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     private let maxChunkSize: Int
     private let maxRetries: Int
     private let totalSize: Int64
+    /// Warmed bytes (#647), read before the network. Immutable, so a fork shares them without a copy.
+    private let residentSpans: [ResidentSpan]
 
     private let lock = NSLock()
     private var position: Int64 = 0
@@ -39,15 +45,35 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     private let cancelLock = NSLock()
     private var cancelled = false
 
-    /// Probes total size and range support with one (retried) `bytes=0-0` request. Returns nil if
-    /// the source is unreachable or answers `200` (full body, no range support); logs which.
-    init?(url: URL,
-          extraHeaders: [String: String] = [:],
-          baseChunkSize: Int = 256 * 1024,
-          maxChunkSize: Int = 8 * 1024 * 1024,
-          maxRetries: Int = 3,
-          requestTimeout: TimeInterval = 30,
-          sessionConfiguration: URLSessionConfiguration? = nil) {
+    /// Probes total size and range support with one (retried) `bytes=0-0` request, unless
+    /// `prewarmed` has already stated both. Returns nil if the source is unreachable or answers `200`
+    /// (full body, no range support); logs which.
+    convenience init?(url: URL,
+                      extraHeaders: [String: String] = [:],
+                      baseChunkSize: Int = 256 * 1024,
+                      maxChunkSize: Int = 8 * 1024 * 1024,
+                      maxRetries: Int = 3,
+                      requestTimeout: TimeInterval = 30,
+                      sessionConfiguration: URLSessionConfiguration? = nil,
+                      prewarmed: PrewarmedSource? = nil) {
+        self.init(url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
+                  maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
+                  sessionConfiguration: sessionConfiguration,
+                  knownSize: prewarmed?.contentLength,
+                  residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
+    }
+
+    /// `knownSize` skips the range probe. Only a source that has already answered a range request
+    /// with its total may pass it: the warm, or the reader a fork is made from.
+    private init?(url: URL,
+                  extraHeaders: [String: String],
+                  baseChunkSize: Int,
+                  maxChunkSize: Int,
+                  maxRetries: Int,
+                  requestTimeout: TimeInterval,
+                  sessionConfiguration: URLSessionConfiguration?,
+                  knownSize: Int64?,
+                  residentSpans: [ResidentSpan]) {
         self.url = url
         self.extraHeaders = extraHeaders
         self.baseChunkSize = max(64 * 1024, baseChunkSize)
@@ -62,7 +88,12 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         }()
         self.session = URLSession(
             configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+        self.residentSpans = residentSpans.filter { !$0.isEmpty }
 
+        if let knownSize, knownSize > 0 {
+            self.totalSize = knownSize
+            return
+        }
         guard let size = Self.probeSize(
             url: url, extraHeaders: extraHeaders, session: session,
             timeout: requestTimeout, maxRetries: max(0, maxRetries)
@@ -71,6 +102,28 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
             return nil
         }
         self.totalSize = size
+    }
+
+    /// #647: take what a host warmed for this URL, under the rule `AVIOReader` adopts by (#551).
+    ///
+    /// A take, like every adoption: the reader holds the bytes from here on. A caller whose source
+    /// turns out not to be a disc puts them back (`SourcePrewarmStore.store`) so the streaming
+    /// reader it falls back to adopts them instead.
+    static func takePrewarm(for url: URL, extraHeaders: [String: String],
+                            store: SourcePrewarmStore = .shared) -> PrewarmedSource? {
+        guard let warm = store.take(for: url) else { return nil }
+        guard warm.head.start == 0, !warm.head.isEmpty, warm.contentLength > 0 else { return nil }
+        guard warm.requestHeaders == extraHeaders else {
+            EngineLog.emit(
+                "[HTTPDiscIOReader] \(url.lastPathComponent): a warm exists for this URL but was "
+                + "fetched with different headers; opening cold (#647)", category: .demux)
+            return nil
+        }
+        EngineLog.emit(
+            "[HTTPDiscIOReader] \(url.lastPathComponent): adopted a prewarmed source: "
+            + "head=\(warm.head.data.count)B tail=\(warm.tail?.data.count ?? 0)B of "
+            + "\(warm.contentLength)B (#647)", category: .demux)
+        return warm
     }
 
     // MARK: - Pure helpers
@@ -88,6 +141,15 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         return Int64(total)
     }
 
+    /// Start offset from a `Content-Range` value (`bytes 100-200/12345` -> 100). Nil for junk.
+    static func parseContentRangeStart(_ value: String) -> Int64? {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("bytes ") else { return nil }
+        let rest = trimmed.dropFirst("bytes ".count)
+        guard let dash = rest.firstIndex(of: "-") else { return nil }
+        return Int64(rest[rest.startIndex..<dash])
+    }
+
     /// Next adaptive window: `base` when `position` is not the sequential continuation of the last
     /// refill, otherwise the previous window doubled and capped at `maxChunkSize`.
     static func nextChunkSize(position: Int64, lastFetchEnd: Int64, current: Int,
@@ -103,11 +165,26 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if position >= totalSize { return 0 }
 
+        if let span = residentSpans.first(where: { $0.covers(position) }) {
+            let spanOffset = Int(position - span.start)
+            let toCopy = min(Int(n), span.data.count - spanOffset, Int(totalSize - position))
+            span.data.withUnsafeBytes { src in
+                out.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    .advanced(by: spanOffset), count: toCopy)
+            }
+            position += Int64(toCopy)
+            // Reading on past the span is the sequential continuation, so the window grows there.
+            lastFetchEnd = position
+            return Int32(toCopy)
+        }
+
         if position < bufferStart || position >= bufferStart + Int64(buffer.count) {
             currentChunkSize = Self.nextChunkSize(
                 position: position, lastFetchEnd: lastFetchEnd,
                 current: currentChunkSize, base: baseChunkSize, maxChunk: maxChunkSize)
-            let want = Int(min(Int64(currentChunkSize), totalSize - position))
+            // Stop at the next warmed span: its bytes are already here.
+            let limit = residentSpans.lazy.map(\.start).filter { $0 > self.position }.min() ?? totalSize
+            let want = Int(min(Int64(currentChunkSize), limit - position))
             guard want > 0, let data = fetchWithRetry(offset: position, length: want), !data.isEmpty else {
                 return -1
             }
@@ -152,12 +229,20 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     func makeIndependentReader() -> IOReader? {
         HTTPDiscIOReader(url: url, extraHeaders: extraHeaders,
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
-                         maxRetries: maxRetries, requestTimeout: requestTimeout)
+                         maxRetries: maxRetries, requestTimeout: requestTimeout,
+                         sessionConfiguration: nil,
+                         knownSize: totalSize, residentSpans: residentSpans)
     }
 
     // MARK: - HTTP
 
     /// One range GET retried up to `maxRetries` times with linear backoff; aborts early on cancel.
+    ///
+    /// Requires a 206 whose `Content-Range` start matches `offset` exactly: a proxy that answers a
+    /// range request with a full 200 (cache miss, range coalescing, a Range-stripping origin) or a
+    /// 206 that starts somewhere else places its body at `position` regardless, corrupting the disc
+    /// structure or media stream read through it (audit NET-9). The body is also trimmed to `length`
+    /// in case the server sent more than asked.
     private func fetchWithRetry(offset: Int64, length: Int) -> Data? {
         var attempt = 0
         while true {
@@ -165,8 +250,10 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
             if stop { return nil }
             if let r = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
                                      timeout: requestTimeout, offset: offset, length: length),
-               r.status == 206 || r.status == 200, !r.body.isEmpty {
-                return r.body
+               r.status == 206, !r.body.isEmpty,
+               let contentRange = r.contentRange,
+               Self.parseContentRangeStart(contentRange) == offset {
+                return r.body.count > length ? r.body.prefix(length) : r.body
             }
             attempt += 1
             if attempt > maxRetries { return nil }
