@@ -74,4 +74,58 @@ struct SeekReanchorLeadTests {
         #expect(!provider.seekTargetNeedsReanchor(30))
         #expect(!provider.seekTargetNeedsReanchor(0))
     }
+
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored = 0
+        func increment() { lock.lock(); stored += 1; lock.unlock() }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return stored }
+    }
+
+    private func session(sequential: Bool, cache: SegmentCache) -> HLSVideoEngine {
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/archive.ts"),
+                                    dvModeAvailable: false, sequentialOrigin: sequential,
+                                    declaredDurationSeconds: sequential ? 80 : nil)
+        engine.segmentPlan = segments(20)
+        engine.provider = makeProvider(cache: cache, initialRestartIndex: 0)
+        return engine
+    }
+
+    @Test("sequential VOD keeps marching to a nearby forward seek instead of failing the source")
+    func sequentialSeekDoesNotRestart() {
+        let cache = SegmentCache(forwardWindow: 20, backwardWindow: 20)
+        defer { cache.close() }
+        let engine = session(sequential: true, cache: cache)
+        let failures = Counter()
+        engine.onVODSourceFailed = { _, _, _ in failures.increment() }
+
+        let seekEpoch = engine.releaseSupersededAuthoritativeRestart()
+        engine.reanchorForwardSeekTargetIfLagging(playlistSeconds: 12, seekEpoch: seekEpoch)
+
+        #expect(failures.value == 0)
+        #expect(cache.targetIndex == -1)
+    }
+
+    @Test("a superseded or stopped seek cannot issue a detached forward restart")
+    func staleSeekDoesNotRestart() {
+        let cache = SegmentCache(forwardWindow: 20, backwardWindow: 20)
+        defer { cache.close() }
+        let engine = session(sequential: false, cache: cache)
+        let restarts = Counter()
+        engine.onSeekStateChanged = { seeking, _ in if seeking { restarts.increment() } }
+
+        let oldEpoch = engine.releaseSupersededAuthoritativeRestart()
+        let currentEpoch = engine.releaseSupersededAuthoritativeRestart()
+        engine.reanchorForwardSeekTargetIfLagging(playlistSeconds: 12, seekEpoch: oldEpoch)
+        engine.requestRestart(at: 3, earlySeekEpoch: oldEpoch)
+        #expect(restarts.value == 0)
+
+        engine.reanchorForwardSeekTargetIfLagging(playlistSeconds: 12, seekEpoch: currentEpoch)
+        #expect(restarts.value == 1)
+
+        engine.stop()
+        engine.reanchorForwardSeekTargetIfLagging(playlistSeconds: 12, seekEpoch: currentEpoch)
+        engine.requestRestart(at: 3, earlySeekEpoch: currentEpoch)
+        #expect(restarts.value == 1)
+    }
 }

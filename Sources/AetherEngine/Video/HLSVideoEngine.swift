@@ -715,6 +715,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// Coalesces burst seek restart requests (#35). Mutated only under `restartLock`.
     private var restartCoalescer = RestartCoalescer()
+    /// A detached forward-seek re-anchor belongs to exactly one user seek. Guarded by restartLock.
+    private var earlySeekEpoch: UInt64 = 0
 
     /// #65 wedge re-anchor storm guard (under `restartLock`). If AVPlayer never resumes requesting even
     /// after we re-anchor the producer on its real position, the producer re-wedges at the same spot;
@@ -2471,6 +2473,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // while the pump exits a parked HTTP byte-range read).
         restartLock.lock()
         sessionEpoch &+= 1
+        earlySeekEpoch &+= 1
         let p = producer
         producer = nil
         let s = server
@@ -3772,13 +3775,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// would drop the new seek's segment-driven restart and land the producer on the stale
     /// recovery position. Runs before the host seek so AVPlayer's new segment GETs never race a
     /// locked slot.
-    func releaseSupersededAuthoritativeRestart() {
+    @discardableResult
+    func releaseSupersededAuthoritativeRestart() -> UInt64 {
         restartLock.lock()
+        earlySeekEpoch &+= 1
         restartCoalescer.clearSupersededAuthoritativePending()
+        let epoch = earlySeekEpoch
         restartLock.unlock()
+        return epoch
     }
 
-    func requestRestart(at idx: Int, authoritative: Bool = false) {
+    func requestRestart(at idx: Int, authoritative: Bool = false, earlySeekEpoch expectedEpoch: UInt64? = nil) {
         // A sequential origin has no restart. performRestart's demuxer seek has nowhere to land
         // on a non-seekable pb, and it ignores that failure: the new producer would keep reading
         // wherever the stream stands (or from byte 0 after a fresh reopen) and label those bytes
@@ -3795,6 +3802,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             return
         }
         restartLock.lock()
+        guard expectedEpoch == nil || expectedEpoch == earlySeekEpoch else {
+            restartLock.unlock()
+            return
+        }
         let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)
         let seekTime = segmentStartSecondsLocked(idx) // under lock; segmentPlan guarded by restartLock (#38)
         restartLock.unlock()
@@ -3863,16 +3874,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// here, at seek time, so the producer builds the target instead of the dead ground in
     /// between. AVPlayer's request for the target rides the in-flight restart (#93). Callers
     /// must run this off the main actor: requestRestart blocks on the old pump's teardown.
-    func reanchorForwardSeekTargetIfLagging(playlistSeconds: Double) {
-        guard !isLiveSession, let prov = provider else { return }
+    func reanchorForwardSeekTargetIfLagging(playlistSeconds: Double, seekEpoch: UInt64) {
+        // Sequential VOD must let the existing pump march to a nearby segment; even a short
+        // proactive restart would make requestRestart surface a terminal source failure.
+        guard !isLiveSession, !sequentialOriginPinsProducerToZero, let prov = provider else { return }
+        restartLock.lock()
+        let current = seekEpoch == earlySeekEpoch
+        restartLock.unlock()
+        guard current else { return }
         let idx = segmentIndexForPlaylistTime(playlistSeconds)
         guard prov.seekTargetNeedsReanchor(idx) else { return }
-        EngineLog.emit(
-            "[HLSVideoEngine] forward seek target seg\(idx) is past the march front "
-            + "and not resident; re-anchoring the producer at it now",
-            category: .session
-        )
-        requestRestart(at: idx)
+        // requestRestart checks the epoch again under its coalescer lock: a newer seek can arrive
+        // while the cache/provider checks above run, without ever blocking the main actor on I/O.
+        requestRestart(at: idx, earlySeekEpoch: seekEpoch)
     }
 
     /// #93 restart latency: phase split for the "restart took" line, so a slow restart names the

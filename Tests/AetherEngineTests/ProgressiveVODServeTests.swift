@@ -846,6 +846,57 @@ struct HLSLocalServerProgressiveServeTests {
         #expect(body.suffix(payload.count) == payload)
     }
 
+    private final class ResponseBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var raw = Data()
+        func set(_ bytes: Data) { lock.lock(); raw = bytes; lock.unlock() }
+        var bytes: Data { lock.lock(); defer { lock.unlock() }; return raw }
+    }
+
+    @Test("a delayed segment request does not redeclare its target after a newer request", arguments: [true, false])
+    func delayedRequestDoesNotRollBackTarget(adoptBeforeEntryWait: Bool) throws {
+        let cache = SegmentCache(forwardWindow: 5, backwardWindow: 5)
+        defer { cache.close() }
+        let payload = Data(repeating: 0x72, count: 1024)
+        cache.store(index: 3, data: payload)
+        let provider = realProvider(cache: cache, producerBase: 1)
+        let server = HLSLocalServer(provider: provider)
+        try server.start()
+        defer { server.stop() }
+
+        let port = server.port
+        let oldPath = "/\(server.pathToken)/seg1.mp4"
+        let newPath = "/\(server.pathToken)/seg3.mp4"
+        let oldResponse = ResponseBox()
+        let oldRequest = Thread {
+            oldResponse.set(Self.rawGET(port: port, path: oldPath, deadline: 4).bytes)
+        }
+        oldRequest.start()
+        let declarationDeadline = Date().addingTimeInterval(2)
+        while cache.targetIndex != 1, Date() < declarationDeadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        #expect(cache.targetIndex == 1)
+
+        if !adoptBeforeEntryWait {
+            Thread.sleep(forTimeInterval: VideoSegmentProvider.progressiveEntryWaitSeconds + 0.2)
+        }
+        let newer = Self.rawGET(port: port, path: newPath, deadline: 0.5).bytes
+        #expect(Self.splitResponse(newer).header.contains("200 OK"))
+        cache.store(index: 1, data: payload)
+        let completionDeadline = Date().addingTimeInterval(8)
+        while !oldRequest.isFinished, Date() < completionDeadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        #expect(oldRequest.isFinished)
+        let (header, body) = Self.splitResponse(oldResponse.bytes)
+        #expect(header.contains("200 OK"))
+        #expect((header.contains("Transfer-Encoding: chunked") ? Self.decodeChunkedBody(body) : body).prefix(payload.count) == payload)
+        #expect(cache.targetIndex == 3)
+        #expect(provider.mediaFetchCount == 2,
+                "each HTTP request must declare its target once, including file retry and blocking fallback")
+    }
+
     @Test("progressiveVODServe=false makes the provider vend no handle (exact legacy behaviour)")
     func killSwitchDisablesHandle() throws {
         let cache = SegmentCache(forwardWindow: 5, backwardWindow: 5)

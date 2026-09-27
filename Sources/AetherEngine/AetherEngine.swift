@@ -5346,7 +5346,7 @@ public final class AetherEngine: ObservableObject {
         // authoritative slot (it was computed for the seek being superseded). Released before the
         // host seek below so the new target's segment-driven restart cannot be dropped against a
         // locked slot. Live never reaches here (returned above); LiveReopen's anchors are safe.
-        nativeVideoSession?.releaseSupersededAuthoritativeRestart()
+        let earlySeekEpoch = nativeVideoSession?.releaseSupersededAuthoritativeRestart()
         // Convert the (display-axis) target to AVPlayer's HLS clock. The origin re-adds a disc title's clip-0
         // STC base so `target` (0-based, matching duration) lands on the source-PTS shift the producer subtracts,
         // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
@@ -5398,9 +5398,12 @@ public final class AetherEngine: ObservableObject {
         // post-seek playhead never reads (measured: a +30 s scrub held 8.2 s while the march
         // filled five segments AVPlayer never requested; the deadline path fires this same
         // re-anchor 8 s late). Fire it now, off-main; AVPlayer's request rides the restart.
-        if let session = nativeVideoSession {
+        if let session = nativeVideoSession, let earlySeekEpoch {
             let playlistTarget = clockTarget
-            Task.detached { session.reanchorForwardSeekTargetIfLagging(playlistSeconds: playlistTarget) }
+            Task.detached {
+                session.reanchorForwardSeekTargetIfLagging(
+                    playlistSeconds: playlistTarget, seekEpoch: earlySeekEpoch)
+            }
         }
         let gen = loadGeneration
         // Publish the native-path seek target up front so the scrub clock snaps immediately (#37); the host

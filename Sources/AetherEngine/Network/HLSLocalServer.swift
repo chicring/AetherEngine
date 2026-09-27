@@ -28,6 +28,12 @@ protocol HLSSegmentProvider: AnyObject {
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
 
+    /// Read-only retry after mediaSegmentURL(at:) declared this request's target. A later
+    /// request may have advanced the target while this one waited for a staging-file adoption.
+    func cachedMediaSegmentURL(at index: Int) -> URL?
+    /// Blocking fallback for the same request, without declaring its target again.
+    func mediaSegmentAfterTargetDeclaration(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
+
     /// progressive VOD serve: the staging file currently being produced for `index`, or nil when
     /// the feature is off, the session is live, or nothing is in production there. Called only
     /// after mediaSegmentURL(at:) missed the cache, so it must not repeat that call's side effects
@@ -151,6 +157,10 @@ extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
     func initSegment(onSlow: (@Sendable () -> Void)?) -> Data? { initSegment() }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+    func cachedMediaSegmentURL(at index: Int) -> URL? { mediaSegmentURL(at: index) }
+    func mediaSegmentAfterTargetDeclaration(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? {
+        mediaSegment(at: index, onSlow: onSlow)
+    }
     func progressiveSegment(at index: Int) -> ProgressiveSegmentBoard.Handle? { nil }
     func didServeMediaSegment(index: Int, delivered: Bool) {}
     var staticMasterPlaylistBody: String? { nil }
@@ -1089,8 +1099,8 @@ final class HLSLocalServer: @unchecked Sendable {
                         return responseWritten
                     }
                     // File-backed fast path: stream page cache -> socket without Data materialization.
-                    func fileBackedServe() -> Bool? {
-                        guard let url = provider?.mediaSegmentURL(at: index) else { return nil }
+                    func fileBackedServe(_ url: URL?) -> Bool? {
+                        guard let url else { return nil }
                         let outcome = send200File(fd: fd, path: normalizedPath,
                                                   fileURL: url,
                                                   contentType: "video/mp4",
@@ -1103,7 +1113,11 @@ final class HLSLocalServer: @unchecked Sendable {
                         case .retry: return outcome.writeSucceeded
                         }
                     }
-                    if let response = fileBackedServe() { return response }
+                    // This is the sole target declaration for this HTTP request. All later retries
+                    // only read the cache; another request may have sought elsewhere meanwhile.
+                    if let response = fileBackedServe(provider?.mediaSegmentURL(at: index)) {
+                        return response
+                    }
                     // progressive VOD serve: a cache miss whose segment is still being produced is
                     // streamed from the staging file per flushed fragment instead of blocking on the
                     // whole segment (the /tmp/llhls AVPlayer A/B measured 1.9-3.9 s off startup,
@@ -1122,7 +1136,9 @@ final class HLSLocalServer: @unchecked Sendable {
                         // Whether the board never vended a handle (a segment completed during the
                         // provider's entry wait) or the staging file vanished mid-serve, the adopt
                         // that just landed is the likeliest cause; try the cache path once.
-                        if let response = fileBackedServe() { return response }
+                        if let response = fileBackedServe(provider?.cachedMediaSegmentURL(at: index)) {
+                            return response
+                        }
                     }
                     // #93 round 3: a serve outliving the provider's slow threshold (wedge-window
                     // restart, 25-50 s worst case) emits response headers NOW as a chunked
@@ -1130,7 +1146,7 @@ final class HLSLocalServer: @unchecked Sendable {
                     // ~3.5 s time-to-first-byte watchdog logs -12889 per silent request and three
                     // strikes fail the item (failedToPlayToEndTime, terminal from the couch).
                     let early = EarlyHeaderState()
-                    let data = provider?.mediaSegment(at: index, onSlow: { [weak self] in
+                    let data = provider?.mediaSegmentAfterTargetDeclaration(at: index, onSlow: { [weak self] in
                         guard let self, early.markSentOnce() else { return }
                         EngineLog.emit(
                             "[HLSLocalServer] seg\(index): slow serve, sending early chunked header",

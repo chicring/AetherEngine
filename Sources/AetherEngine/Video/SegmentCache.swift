@@ -61,7 +61,7 @@ final class SegmentCache: @unchecked Sendable {
     private var initVersions: [(versionID: Int, fromSegment: Int, data: Data)] = []
 
     private var closed = false
-    /// Declared by provider at top of each mediaSegment(at:); non-monotonic (backward scrub is valid).
+    /// Declared once per segment request by the provider; non-monotonic (backward scrub is valid).
     private var currentTargetIndex: Int = -1
 
     /// Lowest index of the consumer's current uninterrupted fetch sequence, and the highest index it has

@@ -1233,6 +1233,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     func mediaSegmentURL(at index: Int) -> URL? {
         guard index >= 0, index < currentSegmentCount else { return nil }
         handleTargetChange(to: index)
+        return cachedMediaSegmentURL(at: index)
+    }
+
+    func cachedMediaSegmentURL(at index: Int) -> URL? {
+        guard index >= 0, index < currentSegmentCount else { return nil }
         return cache.peekURL(index: index)
     }
 
@@ -1344,9 +1349,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return alreadyReanchoredHere ? .wait : .reanchor
     }
 
-    /// Shared by mediaSegment(at:) and mediaSegmentURL(at:). Without sharing, back-scrubs served
-    /// via sendfile (cache hits) skip the proactive restart entirely, leaving seg-11+ to fall into
-    /// a reactive prune-gap restart with AVPlayer's buffer at its thinnest.
+    /// Called once at the start of a request by mediaSegmentURL(at:) (or by a direct
+    /// mediaSegment(at:) caller). Later cache retries and blocking fallback only read data.
+    /// Without the initial declaration, sendfile cache hits would skip proactive restarts.
     private func handleTargetChange(to index: Int) {
         stateLock.lock()
         _mediaFetchCount += 1
@@ -1441,13 +1446,21 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AVPlayer -12889s at ~3.5 s of silence and three strikes kill the item). Live keeps its own
     /// contracts (below-window fast 404, LL-HLS blocking reload) and never signals.
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? {
-        guard let onSlow, !isLive else { return serveSegment(at: index) }
-        let signal = SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: onSlow)
-        defer { signal.complete() }
-        return serveSegment(at: index)
+        serveSegment(at: index, onSlow: onSlow, declaringTarget: true)
     }
 
-    private func serveSegment(at index: Int) -> Data? {
+    func mediaSegmentAfterTargetDeclaration(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? {
+        serveSegment(at: index, onSlow: onSlow, declaringTarget: false)
+    }
+
+    private func serveSegment(at index: Int, onSlow: (@Sendable () -> Void)?, declaringTarget: Bool) -> Data? {
+        guard let onSlow, !isLive else { return serveSegment(at: index, declaringTarget: declaringTarget) }
+        let signal = SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: onSlow)
+        defer { signal.complete() }
+        return serveSegment(at: index, declaringTarget: declaringTarget)
+    }
+
+    private func serveSegment(at index: Int, declaringTarget: Bool) -> Data? {
         guard index >= 0, index < currentSegmentCount else { return nil }
 
         // Segment below the live window is evicted; returning nil = fast 404 so AVPlayer resyncs.
@@ -1467,7 +1480,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
         let totalStart = DispatchTime.now()
 
-        handleTargetChange(to: index)
+        if declaringTarget { handleTargetChange(to: index) }
 
         // Fast path: serve from cache.
         if let hit = cache.peek(index: index) {
