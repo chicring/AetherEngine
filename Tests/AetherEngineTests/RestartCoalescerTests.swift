@@ -100,6 +100,7 @@ struct RestartCoalescerTests {
         #expect(c.begin(10) == true)
         #expect(c.begin(20) == false)
         c.clearSupersededAuthoritativePending()
+        c.clearSupersededEarlySeekPending()
         #expect(c.next(justRan: 10) == 20)
     }
 
@@ -107,8 +108,41 @@ struct RestartCoalescerTests {
     func supersedeIdleNoOp() {
         var c = RestartCoalescer()
         c.clearSupersededAuthoritativePending()
+        c.clearSupersededEarlySeekPending()
         #expect(c.begin(5) == true)
         #expect(c.next(justRan: 5) == nil)
+    }
+
+    @Test("a superseded early seek cannot drain its queued restart after the new seek hits cache")
+    func supersededEarlySeekPendingDoesNotRun() {
+        var c = RestartCoalescer()
+        #expect(c.begin(10) == true)
+        #expect(c.begin(49, earlySeek: true) == false) // old seek queued behind the worker
+        c.clearSupersededAuthoritativePending() // new seek's release, with no further restart
+        c.clearSupersededEarlySeekPending()
+        #expect(c.next(justRan: 10) == nil)
+        #expect(c.begin(50) == true)
+    }
+
+    @Test("a normal pending that replaces an early seek survives its cancellation")
+    func ordinaryPendingAfterEarlySeekSurvives() {
+        var c = RestartCoalescer()
+        #expect(c.begin(10) == true)
+        #expect(c.begin(49, earlySeek: true) == false)
+        #expect(c.begin(20) == false)
+        c.clearSupersededEarlySeekPending()
+        #expect(c.next(justRan: 10) == 20)
+    }
+
+    @Test("authoritative recovery still owns the pending slot after an early seek is cancelled")
+    func authoritativePendingAfterEarlySeekSurvives() {
+        var c = RestartCoalescer()
+        #expect(c.begin(10) == true)
+        #expect(c.begin(49, earlySeek: true) == false)
+        #expect(c.begin(978, authoritative: true) == false)
+        c.clearSupersededEarlySeekPending()
+        #expect(c.begin(20) == false)
+        #expect(c.next(justRan: 10) == 978)
     }
 
     @Test("After an authoritative target is consumed, ordinary scrubs coalesce normally again")

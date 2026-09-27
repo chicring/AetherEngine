@@ -128,4 +128,25 @@ struct SeekReanchorLeadTests {
         engine.requestRestart(at: 3, earlySeekEpoch: currentEpoch)
         #expect(restarts.value == 1)
     }
+
+    @Test("an early seek queued behind a restart is dropped when the next seek hits resident media")
+    func supersededPendingEarlySeekDoesNotDrain() {
+        let cache = SegmentCache(forwardWindow: 20, backwardWindow: 20)
+        defer { cache.close() }
+        let engine = session(sequential: false, cache: cache)
+        let restartStarts = Counter()
+        let oldEpoch = engine.releaseSupersededAuthoritativeRestart()
+        engine.onSeekStateChanged = { seeking, target in
+            guard seeking else { return }
+            restartStarts.increment()
+            if target == 40 {
+                engine.requestRestart(at: 3, earlySeekEpoch: oldEpoch)
+                _ = engine.releaseSupersededAuthoritativeRestart()
+            }
+        }
+
+        engine.requestRestart(at: 10)
+        engine.onSeekStateChanged = nil
+        #expect(restartStarts.value == 1)
+    }
 }

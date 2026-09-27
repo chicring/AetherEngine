@@ -3773,13 +3773,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// #178: called by the engine when a NEW user seek is dispatched. A recovery re-anchor still
     /// holding the coalescer's authoritative slot belongs to the superseded seek; left in place it
     /// would drop the new seek's segment-driven restart and land the producer on the stale
-    /// recovery position. Runs before the host seek so AVPlayer's new segment GETs never race a
-    /// locked slot.
+    /// recovery position. An early re-anchor can also be queued as an ordinary pending target,
+    /// even if the new seek's segment is resident and triggers no replacement restart. Remove only
+    /// those two superseded targets; unrelated pending requests keep their newest-wins flow.
     @discardableResult
     func releaseSupersededAuthoritativeRestart() -> UInt64 {
         restartLock.lock()
         earlySeekEpoch &+= 1
         restartCoalescer.clearSupersededAuthoritativePending()
+        restartCoalescer.clearSupersededEarlySeekPending()
         let epoch = earlySeekEpoch
         restartLock.unlock()
         return epoch
@@ -3806,7 +3808,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             restartLock.unlock()
             return
         }
-        let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)
+        let shouldRun = restartCoalescer.begin(
+            idx, authoritative: authoritative, earlySeek: expectedEpoch != nil)
         let seekTime = segmentStartSecondsLocked(idx) // under lock; segmentPlan guarded by restartLock (#38)
         restartLock.unlock()
         guard shouldRun else {
