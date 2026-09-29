@@ -2194,6 +2194,11 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.endReadDeadline()
     }
 
+    /// True once the armed read deadline has aborted a read in the current `beginReadDeadline`
+    /// window. Still-extraction diagnostics read this: the reader-side extract line carries the
+    /// transport detail, this is what lets the decode call site say the deadline was the cause.
+    var readDeadlineFired: Bool { avioProvider?.readDeadlineFired ?? false }
+
     /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
     /// at once. No resource freeing. Call before close() when cancelling a pump.
     func markClosed() {

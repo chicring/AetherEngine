@@ -1764,7 +1764,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // side directly; production entry stays the C read callback below.
     func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         guard !isClosed else { return -1 }
-        if readDeadlinePassedOrAborted { readDeadlineFired = true; return -1 }
+        if readDeadlinePassedOrAborted { noteReadDeadlineFired("read entry"); return -1 }
         guard let allowed = readByteBudget.allowance(size) else { return -1 }
         // Check usePersistentReader before isStreaming: live feeds without
         // Content-Length must use the reconnect-capable persistent path.
@@ -1788,7 +1788,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // fetches so it cannot park the decode queue (issue #27). Mirrors the
             // checks readPersistent already does at its loop head.
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
-            if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+            if readDeadlinePassedOrAborted { noteReadDeadlineFired("read"); return totalRead > 0 ? Int32(totalRead) : -1 }
 
             bufferLock.lock()
             let bufEnd = currentOffset + Int64(currentBuffer.count)
@@ -1858,7 +1858,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     // An aborted fetch (supersede/close/deadline) must report a read
                     // error, not EOF (which would truncate the stream cleanly). issue #27.
                     if isClosed || readDeadlinePassedOrAborted {
-                        if readDeadlinePassedOrAborted { readDeadlineFired = true }
+                        if readDeadlinePassedOrAborted { noteReadDeadlineFired("read") }
                         return totalRead > 0 ? Int32(totalRead) : -1
                     }
                     // Audit DMX-10: nil is a transport failure short of a known size, which is the
@@ -2042,7 +2042,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         while totalRead < requestSize {
             diag.recordIteration()
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
-            if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+            if readDeadlinePassedOrAborted { noteReadDeadlineFired("read"); return totalRead > 0 ? Int32(totalRead) : -1 }
 
             // #93/#96 residual: time the loop-head lock acquisition. A delegate thread holding winCond
             // across its window copy blocks the read HERE with nothing to show for it, so this turns
@@ -2252,7 +2252,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // before falling through to the rescue reconnect that serves in ~30-190ms.
                         diag.recordDetourFetchAttempt(ms: msSince(detourStart))
                         if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
-                        if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+                        if readDeadlinePassedOrAborted { noteReadDeadlineFired("read"); return totalRead > 0 ? Int32(totalRead) : -1 }
                         // Hard transport failure: degrade to the OLD single-reconnect behavior.
                         timedReconnect(seek: true, at: curPosition)
                         continue
@@ -4382,9 +4382,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 for: request.url ?? url, label: "\(label) size probe",
                 timeout: Self.shortFetchSlotWaitSeconds)
         } catch {
+            emitExtractDiag("size probe \(range) could not take an origin slot: \(Self.extractErrorTag(error))")
             return nil
         }
         defer { OriginRequestBudget.shared.release(ticket) }
+        if let ticket, !ticket.granted {
+            emitExtractDiag(
+                "size probe \(range) origin slot wait timed out after \(Int(ticket.waitedMs))ms; proceeding uncounted")
+        }
 
         let delegate = ProbeDelegate(extraHeaders: headers(for: request.url))
         let task = (probeRequestSession ?? Self.probeSession).dataTask(with: request)
@@ -4401,18 +4406,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // reopen mid-scrub on a stalled source can't park ~25s, and a teardown during
         // open returns at once (issue #27). Playback keeps its 25s ceiling.
         let probeBudget = min(25, chunkRequestTimeout)
-        if Self.awaitSignal(semaphore, budget: probeBudget, pollInterval: 0.1,
-                            shouldAbort: { [weak self] in
-                                self?.isClosed == true
-                            }) != .signaled {
+        let outcome = Self.awaitSignal(semaphore, budget: probeBudget, pollInterval: 0.1,
+                                       shouldAbort: { [weak self] in
+                                           self?.isClosed == true
+                                       })
+        if outcome != .signaled {
             task.cancel()
             finishCancelledProbeRequest(semaphore)
             EngineLog.emit("[AVIOReader] Range probe (\(range)) timed out", category: .demux, level: .verbose)
+            let why = outcome == .timedOut ? "timed out" : "aborted: reader closed"
+            emitExtractDiag("size probe \(range) \(why) after \(Int(probeBudget))s budget")
             return nil
         }
 
         if delegate.totalSize == nil {
             EngineLog.emit("[AVIOReader] Range probe (\(range)) didn't yield a size", category: .demux, level: .verbose)
+            emitExtractDiag(
+                "size probe \(range) yielded no size"
+                + (delegate.statusCode.map { " (HTTP \($0))" } ?? "")
+                + (delegate.failure.map { " (\(Self.extractErrorTag($0)))" } ?? ""))
         }
         return delegate.totalSize
     }
@@ -4435,6 +4447,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     noteOriginRefusal(status: status, respondedBy: (response as? HTTPURLResponse)?.url)
                 }
                 EngineLog.emit("[AVIOReader] HEAD failed (HTTP \(status))", category: .demux, level: .verbose)
+                emitExtractDiag("HEAD size probe refused: HTTP \(status)")
                 return -1
             }
             let length = http.expectedContentLength
@@ -4444,8 +4457,86 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return length
         } catch {
             EngineLog.emit("[AVIOReader] HEAD probe failed: \(error.localizedDescription)", category: .demux, level: .verbose)
+            emitExtractDiag("HEAD size probe failed: \(Self.extractErrorTag(error))")
             return -1
         }
+    }
+
+    // MARK: - Still-extraction diagnostics
+
+    /// The still extractor's reader (`label == "extract"`) used to report its fetch failures only on
+    /// `.verbose`, which `EngineLog.handler` never receives, or not at all (closed/deadline bails) —
+    /// so a scrub that produced no still ended in ffmpeg's bare "Read error" with no attributable
+    /// cause in the host's playback log. Emits at `.info` for that one reader; every other label
+    /// keeps the existing channels. Lines carry offsets, statuses, elapsed times and an NSError
+    /// `domain(code)` tag — never a URL, a header value, or `localizedDescription`, all of which can
+    /// carry a signed-URL credential.
+    private func emitExtractDiag(_ detail: String) {
+        guard label == "extract" else { return }
+        EngineLog.emit("[AVIOReader:extract] \(detail)", category: .demux)
+    }
+
+    /// Compact, leak-free error tag for `emitExtractDiag`: `domain(code)` plus a short name for the
+    /// NSURLError codes the field actually shows. `localizedDescription` stays out on purpose —
+    /// URLSession embeds the failed URL in it, signed query and all.
+    static func extractErrorTag(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain, let name = Self.urlErrorNames[ns.code] {
+            return "\(ns.domain)(\(ns.code)) \(name)"
+        }
+        return "\(Self.sanitizedErrorDomain(ns.domain))(\(ns.code))"
+    }
+
+    /// Domain strings safe to print verbatim: Foundation/CFNetwork system constants and this
+    /// module's own Swift error types (`AetherEngine.<Type>`). Anything else may be a third-party
+    /// or host-defined string carrying sensitive text, so it is reduced to a deterministic
+    /// fingerprint that still lets two occurrences of the same domain be told apart.
+    static func sanitizedErrorDomain(_ domain: String) -> String {
+        if Self.safeErrorDomainPrefixes.contains(where: { domain.hasPrefix($0) }) { return domain }
+        var hash: UInt32 = 5381
+        for u in domain.utf8 { hash = hash &* 33 &+ UInt32(u) }
+        return "domain#\(String(hash, radix: 16))"
+    }
+
+    private static let safeErrorDomainPrefixes = [
+        "NSURLError", "NSCocoaError", "NSPOSIXError", "kCFError", "AetherEngine.",
+    ]
+
+    private static let urlErrorNames: [Int: String] = [
+        NSURLErrorTimedOut: "timeout",
+        NSURLErrorCancelled: "cancelled",
+        NSURLErrorCannotConnectToHost: "cannotConnect",
+        NSURLErrorCannotFindHost: "cannotFindHost",
+        NSURLErrorNetworkConnectionLost: "connLost",
+        NSURLErrorNotConnectedToInternet: "offline",
+        NSURLErrorSecureConnectionFailed: "tls",
+        NSURLErrorServerCertificateUntrusted: "tlsCert",
+    ]
+
+    /// Short request tag for `emitExtractDiag`: method + the Range header only — byte offsets the
+    /// host can map to a fetch, not the URL they were fetched from.
+    private static func requestTag(_ request: URLRequest) -> String {
+        let method = request.httpMethod ?? "GET"
+        if let range = request.value(forHTTPHeaderField: "Range") {
+            return "\(method) \(range)"
+        }
+        return method
+    }
+
+    /// Milliseconds since `start`, the elapsed figure every extract diagnostic carries.
+    private static func elapsedMs(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    /// Latches `readDeadlineFired` and, on the FIRST latch since `beginReadDeadline` armed this
+    /// window, names the deadline on the host-visible channel for the still extractor — the read
+    /// then fails as ffmpeg's opaque "Read error" and nothing else says the reader's own deadline
+    /// was the cause. Once per armed window, so a stalled read cannot repeat the line.
+    private func noteReadDeadlineFired(_ phase: String) {
+        if !readDeadlineFired {
+            emitExtractDiag("read deadline fired during \(phase); aborting the read")
+        }
+        readDeadlineFired = true
     }
 
     private func fetchChunk(from offset: Int64, size: Int) -> Data? {
@@ -4461,6 +4552,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     private func fetchChunkAttempt(from offset: Int64, size: Int, forceSource: Bool) -> Data? {
+        let fetchStarted = Date()
         let usingCachedURL = !forceSource && cachedResolvedURL() != nil
         let target = forceSource ? url : requestURL()
         let rangeEnd = offset + Int64(size) - 1
@@ -4480,6 +4572,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                             invalidateResolvedURL()
                         }
                         EngineLog.emit("[AVIOReader] chunk fetch got HTTP \(status) at offset \(offset)\(usingCachedURL ? " (cached URL, will retry source)" : "")", category: .demux, level: .verbose)
+                        emitExtractDiag(
+                            "chunk GET refused: HTTP \(status) at offset \(offset) "
+                            + "via=\(usingCachedURL ? "cached" : "src") "
+                            + "attempt \(attempt + 1)/\(chunkMaxRetries) "
+                            + "(\(Self.elapsedMs(since: fetchStarted))ms)")
                         return nil
                     }
                     // VOD: 200 at offset > 0 = server ignored Range; silent corruption. Reject.
@@ -4503,15 +4600,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             } catch {
                 // Superseded / closed / past the read deadline: this read is disposable,
                 // bail at once instead of retrying into the abort (issue #27).
-                if isClosed || isPastReadDeadline { return nil }
+                if isClosed || isPastReadDeadline {
+                    emitExtractDiag(
+                        "chunk GET at offset \(offset) aborted: "
+                        + "\(isClosed ? "reader closed" : "read deadline") "
+                        + "attempt \(attempt + 1)/\(chunkMaxRetries)")
+                    return nil
+                }
                 lastError = error
                 if attempt < chunkMaxRetries - 1 {
+                    emitExtractDiag(
+                        "chunk GET at offset \(offset) attempt \(attempt + 1)/\(chunkMaxRetries) "
+                        + "failed: \(Self.extractErrorTag(error)); retrying")
                     Thread.sleep(forTimeInterval: Double(1 << attempt) * 0.5)
                 }
             }
         }
 
         EngineLog.emit("[AVIOReader] Fetch failed after \(chunkMaxRetries) retries at offset \(offset): \(lastError?.localizedDescription ?? "?")", category: .demux, level: .verbose)
+        emitExtractDiag(
+            "chunk GET failed after \(chunkMaxRetries) attempt(s) at offset \(offset): "
+            + (lastError.map { Self.extractErrorTag($0) } ?? "no error")
+            + " (\(Self.elapsedMs(since: fetchStarted))ms)")
         return nil
     }
 
@@ -4666,10 +4776,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #377: every short fetch the reader makes (detour blocks, size probes, HEAD) funnels
         // through here, so this is the one place that has to take an origin slot for all of them.
         // Scoped to the call: unlike the pump's, this request's life IS this function's.
+        let started = Date()
+        let tag = Self.requestTag(request)
         let slotURL = request.url ?? url
-        let ticket = try requestTicket(
-            for: slotURL, label: "\(label) fetch", timeout: Self.shortFetchSlotWaitSeconds)
+        let ticket: OriginRequestBudget.Ticket?
+        do {
+            ticket = try requestTicket(
+                for: slotURL, label: "\(label) fetch", timeout: Self.shortFetchSlotWaitSeconds)
+        } catch {
+            emitExtractDiag("\(tag) could not take an origin slot: \(Self.extractErrorTag(error))")
+            throw error
+        }
         defer { OriginRequestBudget.shared.release(ticket) }
+        // A slot the budget could not grant inside `shortFetchSlotWaitSeconds` still proceeds, so
+        // this is not a failure — but on a metered origin it is the difference between "the read
+        // deadline lost to the network" and "the read deadline lost to the queue".
+        if let ticket, !ticket.granted {
+            emitExtractDiag(
+                "\(tag) origin slot wait timed out after \(Int(ticket.waitedMs))ms; proceeding uncounted")
+        }
 
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
                                           bodyLimit: Self.expectedBodyBytes(for: request))
@@ -4692,6 +4817,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard outcome == .signaled else {
             task.cancel()
             finishCancelledProbeRequest(semaphore)
+            let why: String
+            switch outcome {
+            case .timedOut:
+                why = "hit the \(Int(budget))s request deadline"
+            case .aborted:
+                why = isClosed ? "aborted: reader closed" : "aborted: read deadline"
+            case .signaled:
+                why = "aborted"
+            }
+            emitExtractDiag("\(tag) \(why) after \(Self.elapsedMs(since: started))ms")
             throw AVIOReaderError.requestTimeout
         }
 
@@ -4699,9 +4834,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // produces is not a failed fetch: the prefix the request asked for is in hand (#255).
         if let err = delegate.error, !delegate.truncated {
             noteTransportSecurityFailure(err)
+            emitExtractDiag(
+                "\(tag) transport error \(Self.extractErrorTag(err)) "
+                + "after \(Self.elapsedMs(since: started))ms")
             throw err
         }
-        guard let response = delegate.response else { throw AVIOReaderError.noResponse }
+        guard let response = delegate.response else {
+            emitExtractDiag("\(tag) completed with no response after \(Self.elapsedMs(since: started))ms")
+            throw AVIOReaderError.noResponse
+        }
         if delegate.truncated {
             EngineLog.emit(
                 "[AVIOReader] response body ran past the requested range; kept \(delegate.body.count) bytes and hung up (origin ignored Range?)",
@@ -5274,6 +5415,11 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
 private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let extraHeaders: [String: String]
     var totalSize: Int64?
+    /// What the origin answered / how the transfer ended, for the still-extractor's host-visible
+    /// diagnostic: a probe that yields no size was previously indistinguishable between "origin
+    /// refused" and "origin gave no length".
+    var statusCode: Int?
+    var failure: Error?
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
 
@@ -5310,6 +5456,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         defer { completionHandler(.cancel) }
         guard let http = response as? HTTPURLResponse else { return }
         let status = http.statusCode
+        statusCode = status
         if (200...299).contains(status), let resolved = dataTask.currentRequest?.url {
             onResolved?(resolved)
         }
@@ -5320,6 +5467,9 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // We hang up at didReceive-response on purpose, so a completion error of `cancelled` is our
+        // own doing and carries no diagnostic weight; only a real transport failure is recorded.
+        if let error, (error as? URLError)?.code != .cancelled { failure = error }
         onCompletion?()
     }
 }
