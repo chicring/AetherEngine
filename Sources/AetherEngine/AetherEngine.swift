@@ -603,6 +603,22 @@ public final class AetherEngine: ObservableObject {
     /// different question (a codec has more than one decoder, and the answer changes with hardware).
     @Published public internal(set) var sourceVideoCodecName: String? = nil
 
+    /// AE#658: the source video stream's pixel format, bit depth, colour description and profile as the
+    /// container and the probe's decoder declared them, nil before load and on sources without video.
+    /// Companion to `decodedVideoFormat`, which is what the engine's own decoder actually produced.
+    ///
+    /// On the probe-free native HLS bypass it is read back from AVPlayer's item video track once that
+    /// resolves: colour from the format description's extensions, profile, bit depth and pixel format from
+    /// its avcC / hvcC record where it carries one (nil otherwise, AV1 and VP9 included). That is the
+    /// DELIVERED stream, which under a server-side transcode is not the file the host's library holds.
+    @Published public internal(set) var sourceVideoStreamFormat: VideoStreamFormat? = nil
+
+    /// AE#658: the format the engine's software decoder produced and the display buffer it went into,
+    /// updated when either changes mid-stream. nil whenever the engine does not decode the picture
+    /// itself, which on the native path is always: AVPlayer decodes there, and its frames never pass
+    /// through the engine, so `sourceVideoStreamFormat` is the only description a host has.
+    @Published public internal(set) var decodedVideoFormat: DecodedVideoFormat? = nil
+
     /// Container libavformat opened ("matroska,webm", "mpegts", "mov,mp4,m4a,3gp,3g2,mj2"), nil before load
     /// and on the native HLS bypass (AVFoundation opens that one, there is no libav context to ask). This is
     /// the container that ARRIVED: on a remux or transcode session it differs from the one the host's library
@@ -638,7 +654,36 @@ public final class AetherEngine: ObservableObject {
     /// Exposed for diagnostic overlays; hosts should not branch on it. Branch on `videoRoute` instead,
     /// which also separates the two native pipelines (#321).
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none {
-        didSet { recomputeVideoRoute(); recomputeAudioDelivery() }
+        didSet { recomputeVideoRoute(); recomputeAudioDelivery(); recomputeAirPlayPictureStaysLocal() }
+    }
+
+    /// True while a wireless AirPlay receiver holds the audio route and the session's picture cannot
+    /// follow it, so the receiver plays the sound and the picture stays on this device.
+    ///
+    /// That is the software host (VP9, AV1 without a hardware decoder, deinterlaced MPEG-2 / VC-1 /
+    /// H.264, a host's `preferredDecodePath = .software`): it draws into an `AVSampleBufferDisplayLayer`,
+    /// and only its `AVSampleBufferAudioRenderer` follows the route. Nothing fails, so without this a host
+    /// has no way to tell the viewer why the TV shows no picture. iOS only; false everywhere else, and
+    /// false on the native paths, where AVPlayer hands the receiver the stream.
+    @Published public internal(set) var airPlayPictureStaysLocal = false
+
+    nonisolated static func airPlayPictureStaysLocal(backend: PlaybackBackend,
+                                                     wirelessAirPlayRoute: Bool) -> Bool {
+        wirelessAirPlayRoute && backend == .software
+    }
+
+    /// Idempotent, and logged on each change, so a report shows when the receiver lost the picture.
+    func recomputeAirPlayPictureStaysLocal() {
+        let next = Self.airPlayPictureStaysLocal(backend: playbackBackend,
+                                                 wirelessAirPlayRoute: Self.isWirelessAirPlayRoute())
+        guard airPlayPictureStaysLocal != next else { return }
+        airPlayPictureStaysLocal = next
+        EngineLog.emit(
+            next
+                ? "[AirPlay] wireless receiver holds the audio route, but the software path draws the "
+                  + "picture on this device: the receiver plays sound only"
+                : "[AirPlay] picture and audio route agree again",
+            category: .engine)
     }
 
     /// Pipeline actually serving this session (#321), including the reroutes the host never asked for.
@@ -2128,8 +2173,20 @@ public final class AetherEngine: ObservableObject {
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
+    /// On the probe-free native HLS bypass they are the delivered stream's, read back from AVPlayer's item
+    /// track once it resolves, so a capped transcode reports the resolution it is actually playing.
     @Published public private(set) var sourceVideoWidth: Int32 = 0
     @Published public private(set) var sourceVideoHeight: Int32 = 0
+
+    /// The remote-HLS bypass's stand-in for the probe: what AVPlayer parsed of the delivered video.
+    func publishRemoteHLSVideoDescription(_ video: RemoteHLSStreamDescription.Video) {
+        if video.width > 0, video.height > 0 {
+            sourceVideoWidth = video.width
+            sourceVideoHeight = video.height
+        }
+        if let codec = video.codecName { sourceVideoCodecName = codec }
+        sourceVideoStreamFormat = video.format
+    }
     /// Display-width multiplier for non-square source pixels: `sourceVideoWidth * this` is the width
     /// the picture presents at. 1 before load, on square-pixel sources, and whenever the declared
     /// ratio is one the engine refuses to believe (#290), so it is never a number the picture
@@ -3928,6 +3985,8 @@ public final class AetherEngine: ObservableObject {
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
+        sourceVideoStreamFormat = nil
+        decodedVideoFormat = nil
         sourceVideoCodecName = nil
         sourceContainerFormat = nil
         sourceVideoWidth = 0
@@ -3991,6 +4050,7 @@ public final class AetherEngine: ObservableObject {
         var detectedDVBLCompatIDNum: Int? = nil
         var detectedRate: Double? = nil
         var detectedVideoBitrate: Int64 = 0
+        var detectedVideoStreamFormat: VideoStreamFormat? = nil
         var detectedDVProfile: Bool = false
         // `dolbyVisionHandling = .baseLayerOnly` resolved against this source: the two halves the
         // format clamp, the criteria request and the software-path guard below all read.
@@ -4142,6 +4202,7 @@ public final class AetherEngine: ObservableObject {
                     sourceVideoPixelAspectRatio = Double(sar.num) / Double(sar.den)
                 }
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
+                detectedVideoStreamFormat = VideoStreamFormat(codecpar: stream.pointee.codecpar)
                 lastDetectedVideoCodec = detectedCodecID
             }
             probedAudioTracks = probe.audioTrackInfos()
@@ -4263,6 +4324,7 @@ public final class AetherEngine: ObservableObject {
         sourceDolbyVisionRPUProfile = detectedDVRPUProfile
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
+        sourceVideoStreamFormat = detectedVideoStreamFormat
         sourceVideoCodecName = detectedCodecID == AV_CODEC_ID_NONE
             ? nil
             : avcodec_get_name(detectedCodecID).map { String(cString: $0) }
@@ -4677,6 +4739,27 @@ public final class AetherEngine: ObservableObject {
         // (device trace: a 720p50 timeshift archive played clean on the native path and visibly
         // stuttered on the software one). Declared-interlaced archives still route software via
         // the field-order policy above - the #232 refute probe cannot run without a rewind.
+        if probeOpened, VideoRoutingPolicy.promotesForwardOnlySourceToSequential(
+            isSourceSeekable: probe.isSourceSeekable,
+            isLive: options.isLive,
+            declaredSequential: options.sequentialOrigin,
+            isCustomSource: isCustomSource,
+            routedSoftware: useSoftwarePath,
+            preferred: options.preferredDecodePath,
+            containerDurationSeconds: probe.duration
+        ) {
+            // Written into loadedOptions as well, so every rebuild of this session (AirPlay LAN swap,
+            // audio switch, background return) reopens it as the sequential origin it turned out to be.
+            options.sequentialOrigin = true
+            options.declaredDurationSeconds = probe.duration
+            loadedOptions.sequentialOrigin = true
+            loadedOptions.declaredDurationSeconds = probe.duration
+            EngineLog.emit(
+                "[AetherEngine] forward-only source with a container duration of "
+                + "\(String(format: "%.1f", probe.duration))s: serving it as a sequential origin",
+                category: .engine
+            )
+        }
         if !probe.isSourceSeekable && !options.isLive {
             if options.sequentialOrigin {
                 if !useSoftwarePath {
@@ -5996,6 +6079,8 @@ public final class AetherEngine: ObservableObject {
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
+        sourceVideoStreamFormat = nil
+        decodedVideoFormat = nil
         sourceVideoCodecName = nil
         sourceContainerFormat = nil
         sourceVideoWidth = 0
@@ -6339,10 +6424,36 @@ public final class AetherEngine: ObservableObject {
               AirPlayPlaylistDecision.routeChangeNeedsReload(
                 isRemoteHLSBypass: loadedOptions.nativeRemoteHLS,
                 bypassServesLoopbackOrigin: remoteHLSSubtitleProxy != nil) else { return }
+        if swapsItemForAirPlayEdge() { return }
         EngineLog.emit("[AirPlay] external playback \(wantAirPlay ? "active (wireless) -> LAN reload" : "ended -> loopback reload")"
                        + (loadedOptions.nativeRemoteHLS ? " (remote-HLS bypass on its #316 subtitle origin)" : ""),
                        category: .engine)
         Task { try? await reloadAtCurrentPosition() }
+    }
+
+    /// A sequential origin crosses an AirPlay edge by swapping the item, not by rebuilding the session.
+    /// A rebuild reopens the source, and such a source can only be read again from byte 0: the reload
+    /// resumed at 0 instead of the playhead and then sat seeking while the producer re-read the prefix.
+    /// Nothing about the session has to change for the hop anyway. The server already listens on every
+    /// interface and keeps every segment it cut, so only the address AVPlayer is handed differs (the LAN
+    /// IP and the receiver's playlist, or the loopback again when the receiver lets go).
+    @MainActor
+    private func swapsItemForAirPlayEdge() -> Bool {
+        guard loadedOptions.sequentialOrigin, !loadedOptions.isLive, !loadedOptions.nativeRemoteHLS,
+              let host = nativeHost, let session = nativeVideoSession,
+              let loopback = session.servingMasterPlaylist
+                ? session.masterPlaylistURL : session.mediaPlaylistURL else { return false }
+        let position = currentTime
+        let served = airPlayAdjustedPlayback(url: loopback, session: session)
+        nativeSubtitleRenditionsServed = served.subtitleRenditionsServed
+        EngineLog.emit(
+            "[AirPlay] external playback \(airPlayActive ? "active (wireless)" : "ended") on a sequential "
+            + "origin -> item swap to \(served.url.absoluteString) at \(String(format: "%.2f", position))s "
+            + "(the source cannot be reopened past byte 0)",
+            category: .engine)
+        host.swapItem(url: served.url, startPosition: position)
+        armAirPlayProgressWatchdog(gen: loadGeneration, position: position)
+        return true
     }
 
     /// Re-read external playback after a session-preserving reload and act on it if it really changed (#227).
@@ -6602,7 +6713,20 @@ public final class AetherEngine: ObservableObject {
     /// expects ~0.5-1 s black frame (AVPlayer.replaceCurrentItem tears the surface). Display-criteria handshake
     /// is suppressed (video unchanged). `index` is the container stream index (TrackInfo.id). No-op if
     /// out-of-range, pointing at a non-audio stream, or already active.
+    ///
+    /// Not available on `VideoRoute.remoteBypass`: there `audioTracks` lists what AVPlayer built and is
+    /// informational, the selection belongs to AVFoundation, and a pick is logged and ignored rather than
+    /// turned into a reload the bypass has no audio override for. A host that wants another language on
+    /// that route loads a URL that carries it.
     public func selectAudioTrack(index: Int) {
+        if videoRoute == .remoteBypass {
+            EngineLog.emit(
+                "[AetherEngine] selectAudioTrack(\(index)) ignored: AVPlayer owns the audio selection on "
+                + "the remote-HLS bypass; audioTracks is informational there",
+                category: .engine
+            )
+            return
+        }
         // Forward-only custom sources (incl. live HLS-ingest) can't rewind; rebuilding would re-consume a
         // drained FIFO and stall silently. Logged so a picker that does nothing is explainable.
         if isCustomSource && !customSourceIsSeekable {
@@ -6950,6 +7074,7 @@ public final class AetherEngine: ObservableObject {
         // #353: the picture belongs to the session. Left standing, the next source would be laid out
         // against this one's rectangle for as long as it takes its own first frame to arrive.
         softwareDisplaySize = nil
+        decodedVideoFormat = nil
         // #314: same detach on the software path, where the outgoing renderer's decode thread is what
         // can still hand a frame over while the next host comes up.
         softwareHost?.setVideoFrameTimeObserver(nil)
@@ -7154,6 +7279,16 @@ public final class AetherEngine: ObservableObject {
             }
             lifecycleObservers.append(observer)
         }
+
+        #if os(iOS)
+        let routeObserver = nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.recomputeAirPlayPictureStaysLocal() }
+        }
+        lifecycleObservers.append(routeObserver)
+        #endif
 
         // Foreign-session interruption handling (Sodalite device-verify 2026-07-15): a live-camera
         // PiP re-claims the audio session on every play() and the system pauses AVPlayer ~10ms after

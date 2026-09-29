@@ -155,6 +155,7 @@ final class AudioPlaybackHost {
         self.audioDecoder = aDec
         self.audioStreamIndex = resolvedAudioIdx
         self.audioOutput = AudioOutput()
+        self.audioOutput?.volume = volume
 
         if let start = startPosition, start > 0 {
             // #254: same off-main, deadline-bounded reposition the transport seek uses. Also load()'s
@@ -229,6 +230,7 @@ final class AudioPlaybackHost {
     }
 
     var clockRateForTesting: Float? { audioOutput?.rate }
+    var outputVolumeForTesting: Float? { audioOutput?.volume }
     #endif
 
     func pause() {
@@ -343,9 +345,9 @@ final class AudioPlaybackHost {
         isReady = false
     }
 
-    var volume: Float {
-        get { audioOutput?.volume ?? 1.0 }
-        set { audioOutput?.volume = newValue }
+    /// #660: held here, not only on the output, because the engine sets it before `load()` builds one.
+    var volume: Float = 1.0 {
+        didSet { audioOutput?.volume = volume }
     }
 
     // MARK: - Demux loop

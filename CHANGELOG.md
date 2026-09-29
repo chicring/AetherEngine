@@ -12,6 +12,98 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.22.0] - 2026-09-28
+
+### Changed
+
+- **The remote-HLS bypass publishes what a stats panel reads.** On `nativeRemoteHLS` (route
+  `.remoteBypass`) the engine published no `liveTelemetry`, an empty `audioTracks` and no delivered
+  video format, so a host fell back to its own metadata for the original file: a 1280x720 H.264 Jellyfin
+  transcode showed as "3840x2160, Main 10, 17 Mbps". Everything is now read from AVPlayer's own item, with
+  no second connection to the origin (#664):
+  - `diagnostics.liveTelemetry` runs on the bypass. The two bitrate fields are what the playing variant
+    declares (BANDWIDTH, and AVERAGE-BANDWIDTH or BANDWIDTH where the master omits it), because what
+    AVPlayer transferred is buffer fill at link speed. Network throughput, transferred bytes, dropped
+    frames and forward buffer come from the access log and the loaded ranges. The loopback counters read 0.
+  - `audioTracks` carries one `TrackInfo` per audio track AVPlayer built (codec, channels, sample rate,
+    profile, Atmos, language), ids from 400000. `selectAudioTrack` is informational on this route and
+    logs instead of acting.
+  - `sourceVideoWidth`, `sourceVideoHeight` and `sourceVideoStreamFormat` describe the stream AVPlayer
+    plays. Under a server-side transcode that is the transcode, not the library's file.
+
+## [7.21.1] - 2026-09-27
+
+### Fixed
+
+- **A software session keeps the volume the host app set.** The engine applies its stored volume to a
+  new host before `load()`, and `SoftwarePlaybackHost` and `AudioPlaybackHost` forwarded that only to
+  the `AudioOutput` that `load()` builds later, so the write was dropped and every software session
+  started at full volume, with `volume` reading 1.0 until then. Both hosts now hold the volume and
+  hand it to each output they build (#660).
+
+## [7.21.0] - 2026-09-27
+
+### Added
+
+- **The stream format a stats panel needs, from the engine (#658).** `sourceVideoStreamFormat` (and
+  `SourceProbe.videoStreamFormat`) is a `VideoStreamFormat`: pixel format, bit depth, colour primaries,
+  transfer, matrix, range and profile in libav's names, with viewer labels alongside ("BT.2020",
+  "PQ (SMPTE ST 2084)", "Limited"). A field the stream leaves unspecified stays nil rather than reading
+  as BT.709. `decodedVideoFormat` is what the engine's own decoder produced and the CoreVideo buffer it
+  was displayed from ("P010 (x420)"), republished on change; it is nil on the native routes, where
+  AVPlayer decodes and no frame passes through the engine. `TrackInfo` gains `sampleRate`,
+  `bitsPerSample`, `sampleFormat`, `channelLayout` and `profile`, the last being where DTS:X and
+  TrueHD Atmos show up. `aetherctl probe` and `aetherctl play` print all of it.
+
+## [7.20.1] - 2026-09-27
+
+### Fixed
+
+- **An in-place load on a reused native host no longer publishes a pause at the seam.** The host
+  stopped observing `timeControlStatus` before pausing the outgoing item, so it kept publishing
+  `.playing`; the next load replayed that on subscribe, treated the transport as already rolled, and
+  let its own pre-roll `.paused` through as a real pause (`loading, playing, paused, playing` within a
+  millisecond). A host raising its transport on an external pause showed it over every
+  auto-advanced episode. `aetherctl play --host-calls reloadnext` reproduces the seam (#661).
+
+## [7.20.0] - 2026-09-27
+
+### Added
+
+- **`airPlayPictureStaysLocal`.** iOS publishes true while a wireless AirPlay receiver holds the audio
+  route and the session runs on the software host, whose picture stays on the device while its sound
+  goes to the TV. Nothing fails there, so a host had no way to tell the viewer why the receiver showed
+  no picture.
+
+### Fixed
+
+- **A URL source that can only be read front to back plays on the native path, and AirPlays with a
+  picture.** An origin that ignores `Range` and names no length (a remote MKV on filesamples.com)
+  was forced onto the software host, which cannot seek on it either and never hands a receiver its
+  picture: AirPlay played the sound only. When the container states a duration the engine now serves
+  such a source as a sequential origin, and an AirPlay hop swaps the item onto the LAN address rather
+  than reopening a source that could only restart from byte 0.
+- **A forward-only source no longer loses its opening.** The cursor reset after the segment plan
+  seeked a source that cannot rewind, which drops the packets the probe had buffered and leaves the
+  Matroska demuxer resyncing wherever the stream had got to: the first GOP of a 30 s clip, 30 s into
+  a remote MKV on the software path.
+- **A sequential origin whose GOP is longer than the segment stride lists all of its media.** Audio
+  opened segments by time while the playlist is built from the video keyframe cuts, so the video
+  after an audio-opened boundary landed in a file the playlist never listed (4 to 11 s of an 11 s
+  first GOP), and AVPlayer stalled at the end of seg0. Audio now follows the video cut there, as on
+  live. The finalize reports are also anchored on the pump's first segment, so a skipped index known
+  before seg0 is captured no longer holds back every later one.
+- **A backward jump on a sequential origin is served from the cache.** The residency scan read the
+  holes its cutter leaves as a gap and asked for a restart the origin cannot give, which published
+  "Source cannot be repositioned" over a session that held every segment it needed (an AirPlay hop
+  back to the device, 22 s in).
+
+- **A `FrameExtractor` still carries the colour space playback shows the picture in.** SDR stills
+  were tagged sRGB while their pixels are in the source's own primaries and video transfer. They now
+  carry the space CoreVideo builds from the tags the displayed buffer carries
+  (`kCGColorSpaceCoreMedia709` for BT.709). Against VideoToolbox's own conversion of the same frame,
+  max channel error 9 -> 2 on BT.709, 52 -> 2 on NTSC SMPTE-C, 57 -> 2 on SDR BT.2020.
+
 ## [7.19.0] - 2026-09-26
 
 ### Fixed

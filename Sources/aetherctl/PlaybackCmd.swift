@@ -164,6 +164,8 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
 private func networkTelemetryFragment(_ telemetry: LiveTelemetry?) -> String {
     guard let telemetry else { return "" }
     var out = ""
+    if let inst = telemetry.instantBitrateMbps { out += String(format: " inst=%.2fMbps", inst) }
+    if let avg = telemetry.averageBitrateMbps { out += String(format: " avg=%.2fMbps", avg) }
     if let mbps = telemetry.networkThroughputMbps { out += String(format: " net=%.2fMbps", mbps) }
     if let rx = telemetry.networkTransferredBytes { out += String(format: " rx=%.1fMB", Double(rx) / 1_048_576) }
     out += String(format: " origin=%.1fMB", Double(telemetry.demuxerBytesFetched) / 1_048_576)
@@ -538,6 +540,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         }
         .store(in: &cancellables)
 
+    // AE#658: what the engine's own decoder produced; silent on the native path, where AVPlayer decodes.
+    engine.$decodedVideoFormat
+        .compactMap { $0 }
+        .removeDuplicates()
+        .sink { d in
+            print("  DECODED \(d.frame.pixelFormat ?? "?") depth=\(d.frame.bitDepth.map(String.init) ?? "?") "
+                  + "primaries=\(d.frame.colorPrimaries ?? "-") transfer=\(d.frame.transfer ?? "-") "
+                  + "matrix=\(d.frame.matrix ?? "-") range=\(d.frame.range ?? "-") -> \(d.pixelBufferLabel)")
+        }
+        .store(in: &cancellables)
+
     let options = LoadOptions(
         suppressDisplayCriteria: true,
         httpHeaders: httpHeaders,
@@ -591,6 +604,14 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                      failure.kind.rawValue))
     }
     defer { escalationSub.cancel() }
+    // `reloadnext`: every published state, because what a host reacts to at an episode seam is a
+    // transition that lasts a millisecond and never shows up in the once-a-second status line.
+    let stateTraceStart = Date()
+    let stateTrace = hostCalls.contains("reloadnext") ? engine.$state.sink { state in
+        print(String(format: "  STATE %@ t=%.3f", String(describing: state),
+                     Date().timeIntervalSince(stateTraceStart)))
+    } : nil
+    defer { stateTrace?.cancel() }
     // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
     // which is the documented usage and the part a host would otherwise have to re-do per load.
     let frameProbe = frameTimes ? FrameTimeProbe() : nil
@@ -624,6 +645,13 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             liveOptions.isLive = true
             liveOptions.dvrWindowSeconds = 1800
             try await engine.load(url: url, options: liveOptions)
+        }
+        // The host's episode seam: the next load on the same engine while the first is still playing,
+        // with no stop() in between, so the native host is reused.
+        if hostCalls.contains("reloadnext") {
+            try await Task.sleep(for: .seconds(4))
+            print("  HOSTCALL reload in place")
+            _ = try await engine.load(url: url, startPosition: startPosition, options: options)
         }
     } catch {
         print("LOAD FAILED: \(error)")
@@ -688,7 +716,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             // exists (the foreground retune's hold-paused policy). Resumed at tick 8.
             print("  HOSTCALL pause() right after load")
             engine.pause()
-        case "reloadlive", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
+        case "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
@@ -696,7 +724,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
-            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
+            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
         }
     }
     defer { if let frameExtractor { Task { await frameExtractor.shutdown() } } }
@@ -1331,6 +1359,16 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // one when the question is what a host's picker ends up showing.
     let finalSubtitleTracks = engine.subtitleTracks
     let finalActiveSubtitle = engine.activeSubtitleTrackIndex
+    // The settled stats-panel identity. The SOURCE line at load prints before the remote-HLS bypass has
+    // read anything back from AVPlayer's item, so it reads empty there by construction.
+    let settledSource = "SOURCE codec=\(engine.sourceVideoCodecName ?? "nil") "
+        + "\(engine.sourceVideoWidth)x\(engine.sourceVideoHeight) "
+        + "fmt=\(engine.sourceVideoFormat) stream=\(engine.sourceVideoStreamFormat.map { String(describing: $0) } ?? "nil")"
+    let settledAudio = engine.audioTracks.map {
+        "#\($0.id) \($0.name) codec=\($0.codec) ch=\($0.channels) sr=\($0.sampleRate)"
+            + "\($0.profile.map { " profile=\($0)" } ?? "")\($0.isAtmos ? " atmos" : "")"
+    }.joined(separator: ", ")
+    let settledActiveAudio = engine.activeAudioTrackIndex
     if record != nil {
         await engine.stopRecording()
         print("  RECORD final state: \(engine.recordingState)")
@@ -1373,6 +1411,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         print("subtitle tracks (* = external): \(listed)")
         print("active subtitle: \(finalActiveSubtitle.map(String.init) ?? "none")")
     }
+    print("settled \(settledSource)")
+    print("audio tracks: \(settledAudio.isEmpty ? "none" : settledAudio) active=\(settledActiveAudio.map(String.init) ?? "none")")
     print("final t=\(String(format: "%.2f", finalTime))s state=\(String(describing: endState)) cues=\(cueCount)")
     let closingWindow = await MainActor.run { lastCues }
     print("WINDOW \(closingWindow.count) cues in the last published window")
