@@ -253,6 +253,8 @@ enum SubtitleForwardPrefetcher {
         /// wall time on purpose, see `SideReaderLinkPolicy.anchorGraceSeconds`.
         var anchorGraceUntil = DispatchTime.now()
             + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
+        /// Startup-rule holds are logged once per session, not per poll.
+        var startupHoldLogged = false
         let telemetryGeneration = SubtitlePrefetchTelemetry.sessionStarted(fence: fence)
         // #220: the exit reason reaches the gauge, not just the fact that the loop stopped.
         // `defer` reads `exit` at unwind, so every break path reports the reason it set.
@@ -276,7 +278,16 @@ enum SubtitleForwardPrefetcher {
                         inAnchorGrace: DispatchTime.now() < anchorGraceUntil
                             || reanchor?.hasPending == true,
                         yieldedSeconds: yielded) {
-                    if yielded == 0 { SubtitlePrefetchTelemetry.recordLinkYield(true) }
+                    if yielded == 0 {
+                        SubtitlePrefetchTelemetry.recordLinkYield(true)
+                        if !startupHoldLogged, link.isHoldingForStartup() {
+                            startupHoldLogged = true
+                            EngineLog.emit(
+                                "[AetherEngine] #151 forward prefetch holding the link "
+                                + "for playback startup",
+                                category: .engine)
+                        }
+                    }
                     // The playhead moves while we wait, so the lead shrinks: a reader parked behind
                     // a busy pump returns to fetching on its own once it falls under the floor.
                     guard let fresh = await playhead() else { break readLoop }
