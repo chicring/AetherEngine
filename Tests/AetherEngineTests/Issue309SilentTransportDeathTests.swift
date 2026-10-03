@@ -176,6 +176,42 @@ struct Issue309SilentTransportDeathTests {
         #expect(past == 4 * 1024 * 1024, "only \(past) B delivered after the empty response")
     }
 
+    /// The field case behind the early verdict: the OPEN connection answers its headers and
+    /// never writes a body — the reader-observable shape of a hung TLS handshake (~12 s in the
+    /// report). `awaitFirstPersistentData` alone would park the open for 15 s, and the gap
+    /// watchdog used to wait out the full stall threshold: the witness delay now ends the
+    /// generation, `awaitFirstPersistentData` wakes on `connEnded`, and the read loop's ladder
+    /// owns the replacement.
+    @Test("an open connection that never delivers is ended at the witness delay",
+          .timeLimit(.minutes(2)))
+    func openConnectionEndedAtWitnessDelay() async throws {
+        let stallTimeout: TimeInterval = 0.6
+        AetherEngine.reconnectBackoffScaleForTesting = 0.02
+        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
+        let attempts = AttemptCounter()
+        let serverMaybe = ThrottledOriginServer(
+            totalSize: Self.totalSize,
+            respond: { _, offset, _ in
+                offset == 0 && attempts.next(for: offset) == 1
+                    ? .serveThenGoSilent(afterBytes: 0) : .serve206
+            })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
+                                boundedInitialFetch: Self.firstRange,
+                                connStallTimeout: stallTimeout)
+        defer { reader.markClosed(); reader.close() }
+
+        let t0 = Date()
+        try reader.open()
+        let got = Self.read(reader, bytes: 1024 * 1024, deadline: 15)
+        let elapsed = Date().timeIntervalSince(t0)
+        #expect(got == 1024 * 1024, "read stopped at \(got / 1024) KB")
+        #expect(elapsed < 6, "the silent open connection was waited out for \(elapsed)s")
+        #expect(server.requestedRanges.filter { $0.start == 0 }.count >= 2,
+                "the silent open generation was never replaced: \(server.requestedRanges)")
+    }
+
     // MARK: - Recovery
 
     @Test("the replacement is requested while read-ahead remains, not once it is spent",

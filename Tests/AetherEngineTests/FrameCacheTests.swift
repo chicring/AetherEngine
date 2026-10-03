@@ -68,6 +68,33 @@ struct FrameCacheTests {
         #expect(cache.get(mode: .snapshot, seconds: 2.0) == nil)
     }
 
+    @Test("Nearest thumbnail serves a nearby frame across a bucket boundary")
+    func nearestWithinWindow() {
+        let cache = FrameCache(thumbnailLimit: 4, snapshotLimit: 2, thumbnailBucketSeconds: 1.0)
+        let a = dummyImage()
+        cache.set(a, mode: .thumbnail, seconds: 10.2)   // bucket covers [10, 11)
+        #expect(cache.nearestThumbnail(to: 14.9, within: 5.0) === a)   // 3.9s away
+        #expect(cache.nearestThumbnail(to: 16.1, within: 5.0) == nil)  // 5.1s away
+        #expect(cache.get(mode: .thumbnail, seconds: 10.7) === a)      // exact path intact
+    }
+
+    @Test("Nearest picks the closest stored frame, on either side")
+    func nearestPicksClosest() {
+        let cache = FrameCache(thumbnailLimit: 4, snapshotLimit: 2, thumbnailBucketSeconds: 1.0)
+        let a = dummyImage(), b = dummyImage()
+        cache.set(a, mode: .thumbnail, seconds: 10.0)
+        cache.set(b, mode: .thumbnail, seconds: 13.0)
+        #expect(cache.nearestThumbnail(to: 14.2, within: 5.0) === b)
+        #expect(cache.nearestThumbnail(to: 11.2, within: 5.0) === a)
+    }
+
+    @Test("Nearest never serves a snapshot as a thumbnail")
+    func nearestIgnoresSnapshots() {
+        let cache = FrameCache(thumbnailLimit: 4, snapshotLimit: 2, thumbnailBucketSeconds: 1.0)
+        cache.set(dummyImage(), mode: .snapshot, seconds: 10.0)
+        #expect(cache.nearestThumbnail(to: 10.0, within: 5.0) == nil)
+    }
+
     @Test("Thumbnail eviction does not affect snapshot store")
     func perModeLimitIndependence() {
         let cache = FrameCache(thumbnailLimit: 2, snapshotLimit: 2, thumbnailBucketSeconds: 1.0)

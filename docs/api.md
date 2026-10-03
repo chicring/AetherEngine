@@ -35,6 +35,7 @@ A working shape for the live contracts below, compiled against the engine: [`Exa
 | --- | --- | --- |
 | The source could not be opened, probed, or routed | throws | `.error(message)` is published as well |
 | A newer `load()` or a `stop()` superseded this one | throws `CancellationError` | belongs to the successor, untouched |
+| The Task awaiting it was cancelled while it ran (Sodalite#173) | throws `CancellationError` | `.idle`; the native host is kept for the next load, as a newer `load()` would keep it |
 | AVPlayer refused the media during startup and the engine rebuilt the session on the software path (AE#561) | keeps waiting, then returns (or throws what the rebuild threw) | whatever the rebuilt session reaches; `softwarePathEscalations` fires with `duringStartup` |
 | A custom `IOReader` whose initial probe failed | throws | `.error` |
 | Dolby Vision with no compatible base layer on the software path | throws `AetherEngineError.dolbyVisionUnplayableOnSoftwarePath` | `.error` |
@@ -329,6 +330,7 @@ arrive together.
 | `LoadOptions.prepareNativeSubtitles`, `externalSubtitles` | the native renditions are declared in the init segment |
 | `LoadOptions.panelIsInHDRMode`, `panelPresentsDolbyVision`, `matchContentEnabled` | the display-criteria handshake and the format clamp both run synchronously inside `load` |
 | `pictureInPictureActive` | governs the background teardown decision at the moment it happens |
+| `logTag` | entered into the shared-output book when the load joins it, so a tag set later is missing from those log lines until the next `load()` |
 
 ### Isolation, and what runs off the main actor
 
@@ -400,6 +402,18 @@ $ otool -L PlayerEngineKit.framework/PlayerEngineKit | grep -i libavcodec
 
 And the engine says it itself: the `[FFmpeg] libavcodec …` line at `init` reports the versions that actually answered, not the ones it was built against, so a wrong binding shows up in the log before it shows up as a defect.
 
+### Running several engines at once
+
+Each `AetherEngine` has its own loopback server, caches and lifecycle, so two or more can play side by side (a multiview grid). What they share is the process: the audio session, its channel preference and the panel's display criteria. The engine keeps one book of who is still playing (`SharedOutputCoordinator`, internal) and acts on it:
+
+- The audio session is released only by the last engine to stop, and only if some engine in that round had `deactivatesAudioSessionOnStop`.
+- The preferred output channel count is the widest source among the playing engines, so a muted stereo tile cannot downmix a 5.1 one.
+- A display-criteria reset waits until the last engine stops, the ones a load runs to clear stale criteria included; an engine that loads again as `.primary` in the meantime cancels its own pending reset, one that loads again as `.secondary` keeps it.
+- The disk allowance for seek and timeshift history (a quarter of the free space, at most 2 GiB per session) is taken from what the other running engines have not already claimed, so side-by-side engines cannot claim the same space twice. A claim ends with the session.
+- Stop every engine before you let go of it. An engine counts as playing from `load()` until `stop()`, whatever its state, `.error` and `.ended` included, so an engine kept for reuse must be stopped when its tile ends or fails, or the last real stop will not release the session. An engine released without `stop()` is noticed and dropped the next time another engine asks, but until then it counts as playing.
+
+Load one engine as `.primary` and the others with `LoadOptions(sharedOutputRole: .secondary)`, set `logTag` (set before `load()`) on each, and control what is audible with `volume`. Every engine keeps decoding its audio, so switching the audible one is a volume change and not a reload.
+
 
 ## Constructing and binding
 
@@ -440,6 +454,8 @@ try await player.reloadAtCurrentPosition()
 | `ProbeCancellation` | Thread-safe, one-shot token: `init()`, `isCancelled`, `cancel()`. Available on every URL/custom header, detail and `probeDetectingAtmos` overload. Cancellation is a request, not a completion notification. |
 | `ProbeError` | `invalidLimits`, `inputLimit`, `packetLimit`, `packetSizeLimit`, `timedOut`, `invalidReaderResult`, `unsupportedURL`, `sourceBusy`; `errorDescription` describes the stop. Explicit caller cancellation throws `CancellationError` instead. |
 | `AetherEngine.externalSubtitleTrackIDBase` | `100_000`. Synthetic ids of external subtitle tracks start here. |
+
+Cancelling the Task that awaits `load()` ends the load at once: it throws `CancellationError` instead of running its connect, open, retry and probe budgets to the end (an unreachable live origin used to hold it for about 19 s). A blocked network read, `avformat_open_input` / `find_stream_info`, a size probe, an `HLSLiveIngestReader` retry and a custom reader's blocking `read` are all aborted, typically within tens of milliseconds; the one stretch it cannot cut short is the AE#532 Dolby Vision record audit, a detached read the load waits out before it throws. The load is left the way a newer `load()` leaves it: the generation moves on, a custom reader is closed, `state` becomes `.idle`, and the native host and AVPlayer (#15), an AE#158 handover item and the panel mode are kept for the next load. Until that next `load()` or a `stop()`, the engine reads `.idle` but still holds the native host and its AVPlayer with the item unloaded, Now Playing may stay registered, the audio session stays active, and with an AE#158 handover the previous item can keep playing in PiP; a host that LEAVES on cancel (a dismissed view, say) must call `stop()`. A cancellation only ends the load it belongs to: one that arrives after a newer `load()` or `stop()` took over, or after the load returned, changes nothing. A load that follows an engine rebuild (AE#629) ends that rebuild when cancelled. A `load()` called from a Task that is already cancelled throws before it touches the running session. A real failure that coincides with the cancellation is reported as `CancellationError` too, and `state` ends `.idle`, though a transient `.error` may have been published on the way. The same holds for a `reloadAtCurrentPosition()` of a URL source, which goes through `load()`. A load that returned before the cancellation is not undone; on the `nativeRemoteHLS` bypass `load()` returns at the mount, so a host leaving that startup calls `stop()`. Not cancelling changes nothing.
 
 ### Whole-probe limits and cancellation
 
@@ -560,7 +576,7 @@ Time lives on `player.clock`, a separate `ObservableObject`, so ~10 Hz ticks nev
 | `clock.$sourceTimeFollowsPicture` | whether `sourceTime` is known to follow the displayed frame. Always true except on `nativeRemoteHLS`, where it is true only while the lead is measured since the last time jump (AE#616); see below the table. |
 | `clock.$progress` | `currentTime / duration` |
 | `clock.$bufferedPosition` | source-axis position buffered ahead |
-| `clock.$liveEdgeTime`, `clock.$seekableLiveRange`, `clock.$behindLiveSeconds`, `clock.$isAtLiveEdge` | live-window surfaces. `seekableLiveRange` is the intersection of the DVR window (policy) and what the segment cache actually holds and can play forward from (fact), so it is honest to scale a rewind strip on and `seek(to:)` clamps to the same floor (AE#441). The two diverge for the whole first `dvrWindowSeconds` of a session and again whenever retention evicts faster than the window slides. Software live sessions have no such cache and keep the arithmetic bound. |
+| `clock.$liveEdgeTime`, `clock.$seekableLiveRange`, `clock.$behindLiveSeconds`, `clock.$isAtLiveEdge` | live-window surfaces. `seekableLiveRange` is the intersection of the DVR window (policy) and what the segment cache actually holds and can play forward from (fact), so it is honest to scale a rewind strip on and `seek(to:)` clamps to the same floor (AE#441). The two diverge for the whole first `dvrWindowSeconds` of a session and again whenever retention evicts faster than the window slides. Software live sessions hold a packet ring instead, which evicts by the same byte budget as the native cache (a quarter of the volume's free space, at most 2 GiB, at least 64 MiB), so the range's floor follows the ring once eviction has moved it past the window. |
 | `$residentRanges` | where the loopback segment cache holds picture right now, as disjoint ascending spans on the `currentTime` axis. This is the cache's own truth, not AVPlayer's `loadedTimeRanges`: a measured session held 64 segments over four minutes across several islands while AVPlayer exposed roughly twelve seconds around the playhead and forgot a seeked-ahead island as soon as the playhead left it. Empty is the nil-equivalent, and a live session publishes empty always (its rewind depth is `seekableLiveRange`, which answers a different question). Residency is not a promise that a seek inside a span is instant: the player may still re-anchor and decode at the target, and a segment can start mid-GOP (AE#412). Coalesced to at most four updates a second, cleared on `load()` and teardown. |
 | `player.currentTime`, `sourceTime`, `sourceTimeFollowsPicture`, `progress`, `bufferedPosition`, `liveEdgeTime`, `seekableLiveRange`, `behindLiveSeconds`, `isAtLiveEdge` | non-published mirrors of the same values for one-shot reads |
 | `$duration` | seconds; a `LoadOptions.declaredDurationSeconds` outranks the container's |
@@ -634,7 +650,7 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | --- | --- |
 | `$audioTracks` | `[TrackInfo]`. Republished when `LoadOptions.confirmAtmos` confirms a track. On `.remoteBypass` it lists the audio tracks AVPlayer built for the item (normally just the one playing), read from their format descriptions: `codec` in libavcodec's spelling (`eac3`, `ac3`, `aac`), `channels`, `sampleRate`, `profile` (AAC's object type; "Dolby Digital Plus + Dolby Atmos" with `isAtmos` when the E-AC-3 dec3 record announces JOC) and `language` from the track or the selected audible option. The ids are synthetic (from 400000 up) because there is no stream index on that route; compare them only with `activeAudioTrackIndex`. |
 | `$activeAudioTrackIndex` | The selected track's id. On `.remoteBypass`, the enabled item track's. |
-| `selectAudioTrack(index:)` | Session-preserving reload, roughly 0.5 to 1 s of black. `index` is `TrackInfo.id`. A no-op when out of range, already active, or on a forward-only custom source (live ingest included), which cannot rebuild its pipeline: there a track change is a fresh `load` naming the stream. Every refusal is logged, so a picker that does nothing is explainable. Also a no-op on `.remoteBypass`, where AVPlayer owns the audio selection and the list above is informational; a different language there is a different URL. |
+| `selectAudioTrack(index:)` | Session-preserving reload, roughly 0.5 to 1 s of black. It comes back in the session's transport like `reloadAtCurrentPosition()`: a paused session stays paused. `index` is `TrackInfo.id`. A no-op when out of range, already active, or on a forward-only custom source (live ingest included), which cannot rebuild its pipeline: there a track change is a fresh `load` naming the stream. Every refusal is logged, so a picker that does nothing is explainable. Also a no-op on `.remoteBypass`, where AVPlayer owns the audio selection and the list above is informational; a different language there is a different URL. |
 | `installAudioTap()`, `removeAudioTap()`, `audioTapHasDeliverySource`, `AetherEngine.audioTapFormat` | Opt-in decoded PCM, mono Float32 48 kHz with source-PTS stamps, off the render path. See the contract above. |
 
 ## Subtitles
@@ -689,7 +705,96 @@ measured against, whether it waited or was satisfied immediately.
 `LoadOptions.liveJoinProfile` is the lever. `.fastZap` collapses `TARGETDURATION` to the source keyframe
 cadence and the holdback follows it down, so the win belongs to the source GOP rather than to the flag:
 `TARGETDURATION` can never fall below `ceil(max EXTINF)`, and a long-GOP source therefore keeps most of
-its runway under either profile.
+its runway under either profile. Where the engine cuts the segments itself, each one is a whole GOP and
+the value is sealed from the first few, so it carries headroom for a GOP 1.5 x the longest seen: a
+broadcast whose GOPs run 1.0 to 2.4 s sealed TARGETDURATION 1 on its first three and then broke
+`EXTINF <= TD` on every longer one (AE#670). The headroom is the smallest value under which that longer
+GOP still lists (RFC 8216 rounds EXTINF to the nearest integer) and finishes inside AVPlayer's
+`1.5 x TARGETDURATION` patience with 0.5 s to spare, so 1 s GOPs serve TARGETDURATION 2 and a 6 s
+holdback, and so does a 59.94 fps stream whose scene-cut keyframes merge GOPs into 80 to 89-frame
+segments (up to 1.666 s seal 2).
+
+**An ingested HLS upstream seals over the segment it is delivered in, as far as its join pays for it,
+under either profile (AE#684).** The engine re-cuts an upstream segment (at its GOPs under `.fastZap`,
+at about 4 s under `.standard`), but the window still changes once per UPSTREAM segment, so what the
+seal asks for is the longest segment the upstream has served, whole, where `ceil(segment / 1.5)` used
+to leave the client a patience of exactly one delivery. The upstream's advertised target duration is
+still not read. What it gets is bounded three ways:
+
+- **By the join, which is not deepened for it on an upstream of uniform segment length.** A seal is a
+  holdback of `3 x` itself, and the join there is the three upstream segments it was before (one more
+  would be one more download before the first picture on every zap, which AE#678 measured and
+  declined). Their last GOP stays open until the next delivery, so three 6 s segments are 18 s joined
+  and 16 s cut: the seal is 5, the largest value whose holdback that window holds, not 6. Three 10 s
+  segments cut 28 s and seal 9. The one addition is that the join is equalised over the PHASES of an
+  upstream whose segment lengths alternate: a tune never loads more than the deepest tune of the same
+  channel already did. Alternating 6 s and 4 s segments used to join four (20 s listed, 18 s cut,
+  seal 6) with a 4 s one newest and three (16 s listed, 14 s cut, seal 4, as in 7.25.1) with a 6 s
+  one newest, so the same channel behaved differently from one tune to the next. The depth is now the
+  deepest the coverage rule takes over the tune itself and the tunes one, two, ... segments earlier
+  that its own join still reaches, at most one segment above its own: both phases join four and seal
+  6. That costs the three-segment phase (about four tunes in ten on that shape) one additional short
+  segment at the join, which the other six already load: 3.47 s to 4.23 s to first picture behind an
+  8 Mbit/s link, median of five, against 4.27 s in the other phase on either build. Shapes whose
+  phases already joined alike keep their join and what it pays: 10 s / 8 s stays at three segments
+  and seals 8 (7 before), 6 s / 6 s / 4 s stays at three and seals 4, unchanged, and a shape like
+  6 s / 5 s keeps a seal that follows the phase (5 in one, 4 in the other), because equalising is
+  about how much a tune loads, not about what it seals. The seal line says what was paid
+  (`of which the join pays 5s of 6s (16.000s cut of the 18.000s it listed)`), and "the join has no
+  more to give" is a fact the reader states (its join batch is handed over and its consumer is
+  waiting), not arithmetic on EXTINF, which a playlist that rounds its durations up would fail.
+  With a demuxed audio rendition the fact is the cutter's rather than one reader's: both join
+  batches handed over and the cutter waiting on either of them, because an audio rendition whose
+  segments end a little before the video's runs dry first and the video reader is then never the
+  one being waited on (three runs per arm on three listed segments, audio aligned and audio 0.2 s
+  short: first picture 0.18 to 0.21 s against 0.17 to 0.36 s on 7.25.1, TD 5 on 6 s and 9 on 10 s
+  under both profiles). A join that is SLOWER than the `.fastZap` grace, a single-connection
+  provider or a slow link, takes the bounded start before it is spent and then seals the full
+  value (6 or 10, not 5 or 9) over a window shorter than its holdback, which AVPlayer notes with a
+  `-16832` warning at the start; measured one request at a time behind a 4 to 5 Mbit/s link that
+  start is not worse than 7.25.1's (first picture 5.05 to 6.08 s against 7.05 to 8.26 s, no
+  `-12888` where 7.25.1 drew 1 to 3).
+- **By a ceiling.** Segments longer than 10 s (`LiveEdgePolicy.upstreamSegmentSealCeilingSeconds`) are
+  not asked for whole: a 20 s one seals 14, as it did before, because the live-only window is 60 s.
+- **Never under what it was.** Where the old value already covered the segment nothing moves: 2 s
+  segments keep 2 and a 6 s holdback, and `.standard` keeps its 6 on anything up to 6 s.
+
+So on a provider of uniform 6 s segments under `.fastZap` the seal goes from 4 to 5 (holdback 12 to
+15 s), on a uniform 10 s one under either profile from 7 to 9 (21 to 27 s), and on alternating
+6 s / 4 s segments from 4 to 6 (12 to 18 s) in both phases. A provider of 3 s segments with 1 s GOPs is
+unchanged at 2: three joined segments cut 8 s, which pays for no more, so the patience of one
+delivery this issue is about stays as it is there. On uniform upstreams the join, and with a host that
+fetches in parallel the time to the first picture, is what it was: behind an 8 Mbit/s link, three runs
+per arm, 3.81 to 4.04 s before and 3.80 to 3.85 s after on 6 s segments, 6.15 to 6.36 s and 6.18 to
+6.28 s on 10 s ones. A host that allows fewer parallel requests than the join has segments
+(`maxConcurrentSourceRequests` of 3 or less) sees its first picture later than before, because the
+gate now waits for the join to be handed over where it used to serve at 12 s of cut content: one
+request at a time behind 14 Mbit/s on the mixed shape, three runs per arm, 2.79 to 3.08 s before and
+3.27 to 3.28 s after in the four-segment phase, 2.80 to 2.83 s and 3.44 to 3.49 s in the phase that
+now also loads the extra segment. The other cost is standing latency: 3 s more behind the upstream's
+edge on uniform 6 s segments, 6 s on alternating 6 s / 4 s and on 10 s ones, 3 s on 10 s / 8 s.
+
+Measured on loopback against `Scripts/hls-burst-origin.py` (deliveries 3 to 9.3 s apart on 6 s
+segments), 60 s per run, three runs per arm and row, 7.25.1 against this; first picture is 0.17 to
+0.51 s in both arms wherever a row does not say otherwise:
+
+| upstream, profile, segments listed | 7.25.1 | now |
+|---|---|---|
+| 6 s, `.fastZap`, 3 | TD 4, 1 x `-12888` per run, 2 stalls in 3 runs | TD 5, none |
+| 6 s, `.fastZap`, 4 | TD 4, 2 x `-12888` per run, 2 stalls in 3 runs | TD 5, 1 to 2 x `-12888`, no stall |
+| 6 s, `.fastZap`, 8 | TD 4, 1 to 3 x `-12888`, 3 stalls in 3 runs | TD 5, 0 to 2 x `-12888`, no stall |
+| 10 s, `.fastZap`, 3 / 4 / 8 | TD 7, 1 x `-12888` in 7 of 9 runs, window closed and item rebuilt in 4 of 9 | TD 9, none in 9 of 9 |
+| 10 s, `.standard`, 3 / 8 | TD 7, item rebuilt in 6 of 6 runs | TD 9, none in 6 of 6 |
+| 6 s, `.standard`, 3 / 8 | TD 6, first picture 6.18 to 6.53 s | unchanged: TD 6, 6.28 to 6.46 s |
+
+Two things this does not do, said plainly. On a 6 s provider `-12888` still comes: over one 180 s run
+5 of them and a stall before, 3 and no stall after, because 7.5 s of patience still loses to a 9 s gap
+and what changed is the holdback under it. (A join one segment deeper seals 6 and drew none in three
+such runs; it was measured and not shipped, for the download it costs.) And `.standard` on 6 s segments
+still takes about 6.3 s to its first picture, waiting for the next upstream segment, exactly as it did:
+its seal there is its own `1.5 x cut target` floor, which three joined segments never covered. A real
+outage longer than the holdback's low point stalls under any of these; the capture that started this
+had 10 of its 110 delivery gaps above 9 s.
 
 **An HLS source with a window of its own now fills that cushion at the join rather than in wall clock**
 (6.77.0). The ingest used to enter a live playlist three segments behind the edge, and three joined
@@ -754,6 +859,17 @@ join holds a fraction of a second, and starting there would trade a still pictur
 The depth is the contiguous span ahead of the playhead, so an island past a gap does not count. When the
 floor is not met the engine says so once per load (`leaving the stall-avoidance wait alone (buffer ahead
 ...s, ...)`), which is what separates the two mechanisms in a report after the fact.
+
+**And the item has to be able to play (AE#684).** The depth is measured from the item's own
+`currentTime()`, and before `readyToPlay` that is where the loader began fetching, not where playback
+will begin. Under an `EXT-X-START` placement, which is how a rejoin lands a fresh item at the place the
+session held, AVPlayer fetches from about 6 s below the target first, so the reading is the lookback
+itself: one device capture shows `buffer ahead 4.00s` from a playhead of 48.00 s on an item placed at
+53.908 s, every second of it behind the start, and `playImmediately` 36 ms before the item was ready. It
+was the one item of five in that capture to be forced and the one its viewer reported out of sync, which
+is a correlation and not yet a mechanism. A hold on an item that cannot play yet is now left alone
+(`leaving the stall-avoidance wait alone on an item that cannot play yet ...; asked again at readiness`)
+and decided again when the item becomes ready, from the playhead it really starts on.
 
 ### The rewind depth a live session really has
 
@@ -843,7 +959,11 @@ way with `.ended(.sessionEnded)`; a recording never outlives its session.
 
 `.ended` is published once the file is closed. The queued tail and the trailer are written off the
 main actor, so it can arrive a moment after the call that ended the recording; `stopRecording()`
-returns only after it, and a `startRecording(to:)` issued in that moment waits for it first.
+returns only after it, and a `startRecording(to:)` issued in that moment waits for it first. If a
+`stopRecording()` or a new `load()` overtakes that wait, the start throws `CancellationError` and
+records nothing. A stop that lands while the writer is already tearing itself down after a failure
+(`.writeTooSlow`, `.diskFull`, `.writeFailed`) waits for that teardown and publishes the failure, not
+`.ended`.
 
 **Not implemented: recording from the start of what is already buffered.** A recording begins at the
 call, not at the back of the DVR window. On `.loopback` what is retained is remuxed fMP4 with
@@ -876,7 +996,8 @@ say so on the tracker rather than working around it.
 | `videoNowPlayingSession`, `setVideoNowPlayingInfo(_:)` | The session and its staged identity dictionary. Elapsed / rate / duration are merged from the player; do not stage them. |
 | `audioNowPlayingSession`, `setAudioNowPlayingInfo(_:)` | The same pair for the audio-only path, which owns its session unconditionally (there is no AVKit fork there). Pass an empty dictionary to clear. |
 | `setExternalMetadata(_:)` | AVKit's on-screen info pane on the video path. Safe before `load()`; replayed at host creation. |
-| `deactivatesAudioSessionOnStop` | Off by default. The engine declares the audio-session category at init and never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24), so it never deactivates it either. Set true only when the app owns the session outright; the engine then releases it on a genuine final teardown, meaning `stop()` and never a reload, handoff or live retune. |
+| `deactivatesAudioSessionOnStop` | Off by default. The engine declares the audio-session category at init and never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (#24), so it never deactivates it either. Set true only when the app owns the session outright; the engine then releases it on a genuine final teardown, meaning `stop()` and never a reload, handoff or live retune. With several engines in one process the release belongs to the last one out: a stop while another engine is still active keeps the session and logs `[SharedOutput] ... still active, session kept`. |
+| `logTag` | A short name for this instance (`tile2`), carried by the `[SharedOutput]` lines and a `[AetherEngine:<tag>] state=` line per transition. Set it before `load()` (the tag is captured when the engine joins), on every engine of a host that runs several at once. |
 
 ## Stills and thumbnails
 
@@ -925,13 +1046,14 @@ as well.
 | Symbol | Notes |
 | --- | --- |
 | `AetherEngine.version` | The engine release this source descends from, as the string a published tag carries. SwiftPM resolves a package to a revision rather than to a tag, so an About panel or the header of a diagnostic log has nothing else to name the engine with. Between releases, and under a pin on an unreleased commit, it names the last published version the checkout descends from. |
-| `diagnostics.liveTelemetry` | 1 Hz `LiveTelemetry?` snapshot while playing or paused, nil while idle. On a separate `ObservableObject` so its ticks cannot re-render a host observing the engine. On `.remoteBypass` it is fed from AVPlayer's access log alone: `instantBitrateMbps` and `averageBitrateMbps` are what the playing variant declares (BANDWIDTH, and AVERAGE-BANDWIDTH or BANDWIDTH where the master omits it), because the bytes AVPlayer transferred are buffer fill at link speed rather than the stream's rate, `networkThroughputMbps` is the access log's `observedBitrate`, `networkTransferredBytes` and `droppedFrameCount` its session totals, `forwardBufferSeconds` the loaded range ahead of the playhead. `avSyncGapMs` and `observedFps` are nil, and the loopback counters (`producerRestartCount`, `muxedBytesLifetime`, `serverBytesSentLifetime`, `serverRequestCount`, `demuxerBytesFetched`) read 0 because there is no loopback. |
+| `diagnostics.liveTelemetry` | 1 Hz `LiveTelemetry?` snapshot while playing or paused, nil while idle. On a separate `ObservableObject` so its ticks cannot re-render a host observing the engine. On the loopback and software routes `instantBitrateMbps` and `averageBitrateMbps` are the rate of the MEDIA played, not of the transfer (AE#514): the bytes of the played video and audio packets the playhead crossed, over the media seconds it crossed, about the last 10 s for the first and the whole session for the second. Read-ahead, a re-fetch after a seek and a paused live source draining into its DVR window do not move them, and both stand still through a pause; the transfer is `networkThroughputMbps`. On `.remoteBypass` it is fed from AVPlayer's access log alone: `instantBitrateMbps` and `averageBitrateMbps` are what the playing variant declares (BANDWIDTH, and AVERAGE-BANDWIDTH or BANDWIDTH where the master omits it), because the bytes AVPlayer transferred are buffer fill at link speed rather than the stream's rate, `networkThroughputMbps` is the access log's `observedBitrate`, `networkTransferredBytes` and `droppedFrameCount` its session totals, `forwardBufferSeconds` the loaded range ahead of the playhead. `avSyncGapMs` and `observedFps` are nil, and the loopback counters (`producerRestartCount`, `muxedBytesLifetime`, `serverBytesSentLifetime`, `serverRequestCount`, `demuxerBytesFetched`) read 0 because there is no loopback. |
 | `LiveTelemetry.softwareCacheSeekHits`, `softwareCacheSeekMisses`, `softwareCacheSourceEpoch` | Optional cumulative software-VOD packet-cache counters. A hit repositions the retained consumer cursor without changing the source epoch; a miss repositions the demuxer and advances it. `nil` on other paths. `cachedBytes` includes retained compressed packet records on software VOD, distinct from decoded `displayCushionSeconds` and the underlying byte-reader window. |
 | `EngineLog.handler` | Mirror every info-level line into a host capture path. Fires from whatever thread emitted it, so it must be thread-safe and non-blocking. |
 | `EngineLog.subsystem`, `EngineLog.Category` | `de.superuser404.AetherEngine`, one category per subsystem: `engine`, `ffmpeg`, `session`, `muxer`, `demux`, `hls.server`, `audio.bridge`, `sw.playback`, `scrub`. |
 | `EngineLog.Level` | `.info` reaches os_log and the host handler; `.verbose` is per-segment trace and reaches os_log's debug level **only**, never the handler, which is what keeps a mirrored stream readable. Read the verbose ones with `log stream --level debug`. |
-| `EngineLog.registerSecret(_:)`, `EngineLog.unregisterSecret(_:)` | Name a value that must never be logged, such as an IPTV password the host holds. Every line reaching os_log or the handler has it replaced, raw or percent-encoded, wherever it sits. The engine already strips named parameters, userinfo, encoded payloads and the Xtream Codes path layout on its own; this covers what only the host can know, such as a provider URL carrying the password as a bare path segment. Returns false for a value under four bytes. |
+| `EngineLog.registerSecret(_:)`, `EngineLog.unregisterSecret(_:)`, `EngineLog.redacted(_:)` | Name a value that must never be logged, such as an IPTV password the host holds. Every line reaching os_log or the handler has it replaced, raw or percent-encoded, wherever it sits. The engine already strips named parameters, `Bearer` / `Basic` credentials, userinfo, encoded payloads and the Xtream Codes path layout on its own, also inside a URL carried percent-encoded in another URL's query; this covers what only the host can know, such as a provider URL carrying the password as a bare path segment. Registrations are counted: a value registered twice stays redacted until it is unregistered twice. Returns false for a value under four bytes. `redacted(_:)` returns a line as the handler would receive it, for a line a host or tool prints itself next to the engine's. |
 | `EngineLog.emit(_:category:level:)` | Emit a host line into the same stream, for a host that wants its own events interleaved with the engine's. |
+| `demuxerBytesFetched` | Cumulative bytes the demuxer has pulled from the network, for a host-side fetch-rate display. |
 | `segmentCacheDiskBytes`, `softwareHostFramesEnqueued` | Point reads for a stats overlay. |
 | `activeProducerShiftSeconds`, `frameAhead`, `clockLeadSeconds` | Divergence diagnostics for tracing a clock that disagrees with the picture. Not for production playback logic. |
 | `nativeItemReading()` -> `NativeItemReading?` | AE#509. The native item's own account of itself: `playhead` (`AVPlayerItem.currentTime()`, on the ITEM axis), `loadedRangeCount` (0 = nothing has been PLACED, which no buffer depth can say) and `status` (0 unknown, 1 ready, 2 failed). Async, read off the main actor. nil when no native item is mounted. The engine's published clock is `item + playlistShiftSeconds`, so on a live source hours into an encoder clock the two are thousands of seconds apart in a healthy session: quote both or neither. |
@@ -942,12 +1064,12 @@ All flags default to safe values; the table is the full set. Depth for the media
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `httpHeaders` | empty | Extra headers on every probe, range and segment fetch. On `nativeRemoteHLS` they ride into the `AVURLAsset`, so header-enforcing IPTV origins work. Forwarded to sidecar subtitle fetches unless overridden. |
+| `httpHeaders` | empty | Extra headers on every probe, range and segment fetch. On `nativeRemoteHLS` they ride into the `AVURLAsset`, so header-enforcing IPTV origins work. Forwarded to sidecar subtitle fetches unless overridden. **Scoping differs by route.** On the plain `nativeRemoteHLS` bypass AVFoundation itself sends them to every host the playlists name (cross-host variants, segments and `EXT-X-KEY` URIs) and carries them across 302 redirects, so credential headers there reach every such host and the engine cannot narrow that. The per-origin credential scoping described for `HLSLiveIngestReader` applies only on the routes the engine fetches itself: the ingest, the disc reader, the origin relay, the subtitle proxy, the audio tap and the live subtitle renditions. A credential that must not reach every host a playlist names should not ride in `httpHeaders` on the bypass. |
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
-| `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. |
-| `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP so an IPTV join costs seconds instead of a full holdback. |
+| `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. The window is a ceiling: the disk budget (a quarter of the free space, at most 2 GiB) bounds what is actually kept, so a long window on a high-bitrate channel or a small volume holds less than it asks for. With several engines running, each one's quarter is taken from the free space the others have not already claimed, so a tile added on a tight volume holds less history than the first one (AE#687). |
+| `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP plus headroom for one 1.5 x longer (AE#670) so an IPTV join costs seconds instead of a full holdback. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
-| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep. The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
+| `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep, on an item that has reached `readyToPlay` (AE#684). The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto derives eligibility from observed upstream cadence, which is what keeps a bursty relay off a `-15410` loop. |
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route regardless (AE#154). The clock here is item time, see `clock.$sourceTime` (AE#616). |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |
@@ -959,11 +1081,12 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `externalSubtitles` | empty | Sidecar files registered at load, so they rank in the language preference and can join the native renditions. |
 | `prepareNativeSubtitles` | false | Declare WebVTT renditions so subtitles survive PiP / AirPlay / external display. |
 | `eagerNativeSubtitleReaders` | false | Populate those renditions at load instead of on first selection, for playlists AVKit auto-selects. Only meaningful with `prepareNativeSubtitles`. |
+| `serveIFramePlaylist` | false | Serve an I-frame rendition next to the master, so a stock `AVPlayerViewController` shows scrub thumbnails and scans on I-frames with no host code. One keyframe per segment at full resolution; opens a second reader on the source. Absent (one log line says why) for live, sources without a keyframe index, `sequentialOrigin`, `heldSourceConnection`, single-request origins, discs and media-playlist routing. Hosts with their own transport bar use `scrubThumbnail`. |
 | `nativeSubtitlePreferredLanguages` | empty | Which rendition is marked `DEFAULT=YES`. Resolved by the same BCP-47 matching as the overlay pick, so inline and PiP / AirPlay agree (#590). Read back as `nativeSubtitleDefaultOrdinal`. Does not activate the overlay path, so it cannot double up with the native render. |
 | `preserveASSMarkup` | false | Emit raw ASS event lines instead of extracted text; pair with `TrackInfo.assHeader`. ASS / SSA codecs only, embedded and sidecar alike, so a session mixing an ASS track with a SubRip one needs no reload to cross between them (AE#587). |
 | `teletextPage` | nil | Fix the DVB teletext caption page instead of letting libzvbi auto-detect. |
 | `audioDelaySeconds` | 0 | Start the session with a lip-sync offset already in force; positive presents audio later. Same value `setAudioDelay(_:)` reads and writes, and a `reloadAtCurrentPosition(applying:)` can correct it. |
-| `suppressDisplayCriteria` | false | Skip the display-criteria handshake entirely. For previews and headless runs. |
+| `suppressDisplayCriteria` | false | Skip the display-criteria handshake entirely. For previews and headless runs. A host that clears `preferredDisplayCriteria` itself between loads (leaving full screen for a preview) no longer strands the engine's same-format skip: the next non-suppressed load reads the display manager, finds nothing set and writes again (AE#678). Clearing through `stop()` stays the cleaner path, because it resets the engine's record in the same step. |
 | `matchContentEnabled` | true | Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. False routes HDR through the auto-tonemap path. |
 | `panelIsInHDRMode` | false | **Host assertion** that the panel is presenting HDR right now, and the gate on whether the HDR10-to-DV upgrade is accepted upfront. It is an OR term over the engine's own readout on every platform, not a replacement for it and no longer confined to `suppressDisplayCriteria` hosts (AE#459). The readout it backs up is `currentEDRHeadroom > 1`, which answers only around a dynamic-range transition: an Apple TV whose output format is locked to HDR never makes one and reads as an SDR panel forever, and on tvOS 27 the property has stopped answering at all on at least one box. A wrong assertion costs one in-place media-playlist fallback (`-11848`), not the item. An in-place rebuild (an audio pick, a custom-source reload) runs no handshake, so it routes on the load's readout and display eligibility together with the session's current assertion and the refusal latch, rather than on this option alone (AE#541). |
 | `attemptsHDRMasterOnUnprovenPanel` | true | Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's acceptance or refusal be the readout `UIScreen` will not give (AE#459). VOD only. The proxy this replaces is `currentEDRHeadroom`, which is measurably unreliable: on one Apple TV 4K 3rd gen on tvOS 26.6 it read a flat 1.00 across 46 samples of HDR content while the TV's own info display reported HDR, and later the same day, same box, same output format, same title, it read 1.20. The panel was presenting HDR and the property was wrong about it; what moves it is not established. What media-direct costs there is not the picture but the manifest: the SUBTITLES rendition, the AUDIO rendition that is the only place AVFoundation reads an HLS language from, and SUPPLEMENTAL-CODECS. A panel that proves itself through the headroom short-circuits and attempts nothing. A refusal costs one in-place media fallback, measured at 223 ms end to end (`-11868` after 54 ms, zero `errorLog` events, position kept, no visible black frame), and is latched for the process, so a genuinely SDR display pays it once rather than per title. Set it false on a host that knows its display is SDR. Live never attempts regardless: a live fallback is a rejoin at the edge rather than a restored position, and that cost is unmeasured. The published `videoFormat` is not moved by an ATTEMPT. It is moved by an ACCEPTANCE: a master AVFoundation has not refused after the settle window publishes the presented format, which is a stronger reading than the headroom rather than a substitute for it. |
@@ -974,14 +1097,15 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `dolbyVisionHandling` | `.automatic` | A `DolbyVisionHandling`. `.baseLayerOnly` presents the HDR10 / HLG base layer of a Dolby Vision source and leaves the Dolby Vision out of the container on every display: plain `hvc1` / `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria, `videoFormat` reads the base layer's format while `sourceVideoFormat` and `sourceDVProfile` keep saying what the file carries. The route a host offers as "Dolby Vision: off (HDR10)", for a source whose Dolby Vision is wrong and whose base layer is right: the reported shape is a remux carrying a Profile 7 RPU under a container record claiming Profile 5, where a player that believes the record decodes YCbCr as IPT and the picture comes out green / violet. Applies to HEVC Profile 7 / 8.1 / 8.4, AV1 Profile 10.1 / 10.4, and a Profile 5 (or AV1 10.0) record whose VUI declares a BT.2020 YCbCr PQ or HLG base; a Profile 5 whose VUI is unspecified carries IPT-PQ-c2, has no base layer to present, keeps its route, and the engine says so in the log. Takes precedence over `forceDolbyVisionOnNonDVDisplay`. A tuning field, correctable through `reloadAtCurrentPosition(applying:)`; a Profile 5 record the VUI contradicts also stops refusing the software path under it. See [formats.md](formats.md#dolby-vision-signaling). |
 | `preferredDecodePath` | `.automatic` | A `DecodePath`. `.software` serves this source through `SoftwarePlaybackHost` whatever the routing concluded, scoped to this session and costing the source nothing (seeks, the audio switch and the title switch all keep working). The escape for the formats `VTCapabilityProbe` deliberately cannot classify, and for live H.264 / HEVC, which never reaches that gate at all. One-way: there is no `.native`. See [Overriding the decode path](#overriding-the-decode-path). |
 | `escalatesToSoftwarePath` | `true` | Whether a native session AVPlayer refuses on its merits (`CoreMediaErrorDomain`), or a live join without an entry point the native route can open (`AetherEngine.LiveJoin`, AE#627), may be rebuilt once on the software path (AE#561). `false` surfaces the failure as `.error` instead, for a host with its own fallback ladder (AE#629). Correctable. |
+| `sharedOutputRole` | `.primary` (default) or `.secondary` | A `SharedOutputRole`. A secondary engine never writes display criteria and never owns Now Playing, whatever `suppressDisplayCriteria` and `ownsVideoNowPlayingSession` say, on the audio-only path too. It also skips the play gate's wait for a criteria write and the panel readout (`criteriaPanelReadout` is nil, as for any suppressed load), so its HDR labelling relies on `panelIsInHDRMode`. The role is fixed for a session, but a later `load()` may change it: as an identity field it only blocks corrections (Sodalite#175). A host that opted into `ownsVideoNowPlayingSession` and changes the role without a `stop()` keeps the native host's original Now Playing ownership until the next stop. |
 | `deinterlaceMode` | `.auto` | A `DeinterlaceMode` for the software path: the Metal / VideoToolbox graph with a CPU bwdif fallback, or `.software` to force the CPU path. |
 | `deinterlaceFieldRate` | `.field` | A `DeinterlaceFieldRate`: the hardware deinterlacer emits one frame per field (25i to 50p) or per frame. The software fallback is always frame rate, because doubling a CPU bwdif is the wrong trade and a fallback should not change cost class. |
 | `probesize`, `maxAnalyzeDuration` | nil | Caller-bounded open-time probe budget (defaults 50 MB / 60 s). They fail **open**: an over-tight budget loads with late-resolving tracks silently missing rather than throwing, so validate track presence if you tighten them. Do not pass `0` for `maxAnalyzeDuration`; FFmpeg maps it to a shorter heuristic. |
 | `forwardBufferSegments` | nil (10, about 40 s) | How far the producer may race ahead and how much the cache keeps resident. Clamped to 4...2700; past the historical 150 the real bound is the session's disk budget, so a "buffer without limit" option can pass `Int.max`. Ignored on `nativeRemoteHLS`. Native HLS retention is readable as `$residentRanges` (see Time). Software VOD uses the same forward-window and volume-budget policy for compressed packet read-ahead; its continuous selected A/V frontier is `bufferedPosition`, not native `residentRanges`. |
-| `sequentialOrigin` | false | Declare an origin that fabricates range answers: one long-lived unranged GET, no ranged probes, non-seekable pb. **Seeking is unavailable**; re-request the archive at a shifted start instead. A URL source the reader finds forward-only by itself (`Range` ignored and no length, so it can only stream front to back) is served this way without the declaration when its container states a duration; `loadedOptions` then reads `true` with that duration declared, and without a duration it stays on the software path. An AirPlay hop on such a session swaps the item onto the LAN address instead of reopening the source, since a reopen could only start again from byte 0. |
+| `sequentialOrigin` | false | Declare an origin that fabricates range answers: one long-lived unranged GET, no ranged probes, non-seekable pb. **Seeking is unavailable**; re-request the archive at a shifted start instead. A URL source the reader finds forward-only by itself (`Range` ignored, so it can only stream front to back; the open confirms a 200 answer with a one byte range, because some CDNs answer a cache miss that way) is served this way without the declaration when its container states a duration, which a stated `Content-Length` lets an MPEG-TS source estimate; `loadedOptions` then reads `true` with that duration declared, and without a duration it stays on the software path. An AirPlay hop on such a session swaps the item onto the LAN address instead of reopening the source, since a reopen could only start again from byte 0. |
 | `declaredDurationSeconds` | nil | Trusted duration, overriding the container's. Required alongside `sequentialOrigin` on VOD, where the tail read is gone. |
-| `maxConcurrentSourceRequests` | nil | Most requests the reader may have open against this origin at once, across every path it fetches on (pump ranges, detour blocks, size probes, tail prefetch, subtitle side reader). nil counts without capping and lowers the ceiling on its own after a 429/503/509. Set it when the provider states a limit; `1` also switches off the speculative parallel paths, which exist only to overlap with the pump. Counts **requests**, not TCP connections, because over HTTP/2 a session multiplexes every request onto one connection while the origin still counts each one (AE#377). It is also the only ceiling: several engines playing from one origin are bounded by this value and by what the origin refuses, not by a transport pool underneath it (AE#450). |
-| `heldSourceConnection` | false | Ask the source **once** and pull it, instead of ending the connection at the reader's window high water and asking again every 8 to 16 MB of drain (AE#377). For an origin that punishes repeated requests rather than concurrency: some CDNs refuse new requests for minutes at a stretch while serving an already open connection at full rate, and against one of those the request cadence is the defect, at any range size (measured at the reporting origin: 32 MB ranges raised to 256 MB, eight times fewer requests, the refusals unchanged). Where `maxConcurrentSourceRequests` bounds how many requests are in flight, this removes the second request. The read path is the engine's own HTTP/1.1 over a demand-driven stream task, so: **HTTP/1.1 only** (no ALPN, an HTTP/2-only origin is out of scope), the **system proxy configuration does not apply**, and TLS is the OS's through the same host trust decision as every other engine session but has not been exercised against a self-signed origin. A viewer who pauses ends the connection after five seconds and resuming costs one request at the frontier, because a held flow nobody reads is the process-wide Network.framework starvation of AE#310. Applies to the playback reader; the subtitle and enrichment side readers keep the default transport, since they park for minutes at a time. **Names the session**: the transport is chosen at open, so a reload that changes it is refused. |
+| `maxConcurrentSourceRequests` | nil | Most requests the reader may have open against this origin at once, across every path it fetches on (pump ranges, detour blocks, size probes, tail prefetch, subtitle side reader, and the HLS live ingest's playlist, segment and key fetches, whose prefetch window narrows to it, AE#678). nil counts without capping and lowers the ceiling on its own after a 429/503/509. Set it when the provider states a limit; `1` also switches off the speculative parallel paths, which exist only to overlap with the pump. Counts **requests**, not TCP connections, because over HTTP/2 a session multiplexes every request onto one connection while the origin still counts each one (AE#377). It is also the only ceiling: several engines playing from one origin are bounded by this value and by what the origin refuses, not by a transport pool underneath it (AE#450). |
+| `heldSourceConnection` | false | Ask the source **once** and pull it, instead of ending the connection at the reader's window high water and asking again every 8 to 16 MB of drain (AE#377). For an origin that punishes repeated requests rather than concurrency: some CDNs refuse new requests for minutes at a stretch while serving an already open connection at full rate, and against one of those the request cadence is the defect, at any range size (measured at the reporting origin: 32 MB ranges raised to 256 MB, eight times fewer requests, the refusals unchanged). Where `maxConcurrentSourceRequests` bounds how many requests are in flight, this removes the second request. The read path is the engine's own HTTP/1.1 over a demand-driven stream task, so: **HTTP/1.1 only** (no ALPN, an HTTP/2-only origin is out of scope), the **system proxy configuration does not apply**, and TLS is the OS's through the same host trust decision as every other engine session but has not been exercised against a self-signed origin. A viewer who pauses ends the connection after five seconds and resuming costs one request at the frontier, because a held flow nobody reads is the process-wide Network.framework starvation of AE#310. Applies to the playback reader; the subtitle and enrichment side readers keep the default transport, since they park for minutes at a time. The open-time detection of an origin that ignores `Range` (see `sequentialOrigin`) does not cover it, because its open is open-ended. **Names the session**: the transport is chosen at open, so a reload that changes it is refused. |
 | `autoplay` | true | False mounts paused: the load skips the terminal `play()` and settles at `.paused` for a host that resumes later. It describes THIS MOUNT and nothing after it: the rebuilds a session makes on its own (`reloadAtCurrentPosition`, an option correction, the AirPlay LAN swap, an audio-delay nudge) come back in the transport state the session is in, not in this one. Correcting it through `reloadAtCurrentPosition(applying:)` therefore does nothing (the log names it as not applied rather than as applied, AE#464 round 3, and the call returns it as `sessionOwned` with `rebuilt` false rather than spending a teardown on it, AE#464 round 4); call `play()` or `pause()` instead. |
 
 ## Value types
