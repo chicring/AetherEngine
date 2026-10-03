@@ -79,6 +79,8 @@ New public API therefore belongs in `docs/api.md` in the commit that adds it, an
 
 ## Releases and host pins
 
+For the Themby fork's single-`main` workflow, local patch inventory, and branch migration checks, see [fork maintenance](docs/fork-maintenance.md). Upstream tags and fork integration tags are distinct; a merge is not a verified release until its regression and host checks pass.
+
 Maintainers cut releases as annotated tags plus a GitHub Release with notes. Host apps pin AetherEngine by commit SHA, so after a change merges the host repos bump their pins to the new commit. You do not need to touch the host repos in your PR.
 
 ## License
