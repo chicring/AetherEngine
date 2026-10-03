@@ -32,11 +32,6 @@ final class SegmentCache: @unchecked Sendable {
     private let condition = NSCondition()
     private let onResidentSetChanged: (@Sendable () -> Void)?
 
-    /// progressive VOD serve: publishes the in-production staging files' flushed byte boundaries so
-    /// the server can stream a segment while the muxer is still writing it. Owned here because the
-    /// board's lifecycle is the session's: adopt() completes entries, close() abandons them all.
-    let progressive = ProgressiveSegmentBoard()
-
     private let forwardWindow: Int
     /// 20 covers Continuous-Audio handover refetches (~7-10 segments backward); smaller values
     /// cascaded into restart chains that reset the FLAC bridge PTS and caused audible glitches.
@@ -61,7 +56,7 @@ final class SegmentCache: @unchecked Sendable {
     private var initVersions: [(versionID: Int, fromSegment: Int, data: Data)] = []
 
     private var closed = false
-    /// Declared once per segment request by the provider; non-monotonic (backward scrub is valid).
+    /// Declared by provider at top of each mediaSegment(at:); non-monotonic (backward scrub is valid).
     private var currentTargetIndex: Int = -1
 
     /// Lowest index of the consumer's current uninterrupted fetch sequence, and the highest index it has
@@ -354,13 +349,11 @@ final class SegmentCache: @unchecked Sendable {
         guard !closed else {
             condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
-            progressive.abandon(index: index, path: stagingPath)
             return
         }
         var residentSetChanged = false
         var supersededFile: URL?
         if renameOK {
-            progressive.complete(index: index, path: stagingPath, bytes: byteCount)
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
@@ -377,7 +370,6 @@ final class SegmentCache: @unchecked Sendable {
             // adoption that cannot state one must not leave the old epoch's claim standing.
             videoReaches[index] = videoReach
         }
-        if !renameOK { progressive.abandon(index: index, path: stagingPath) }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
@@ -402,7 +394,6 @@ final class SegmentCache: @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
 
-        progressive.abandonAll()
         releaseLiveMarker()
         try? FileManager.default.removeItem(at: dir)
         // A closed cache holds nothing, and that is a resident-set change like any other. The engine

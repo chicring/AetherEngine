@@ -803,7 +803,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         sparseHoleWaitSlice: TimeInterval = 2.0,
         repositionRideCapSeconds: TimeInterval = 90.0,
         forwardBackpressureWaitSeconds: TimeInterval = 30.0,
-        slowServeThresholdSeconds: TimeInterval = 1.2,
+        slowServeThresholdSeconds: TimeInterval = 2.0,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
         nativeSubtitleLanguages: [String?] = [],
         nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
@@ -1208,17 +1208,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return cache.fetchInit(timeout: 30.0)
     }
 
-    /// The map fetch blocks on `fetchInit` for as long as a remote-source producer needs to
-    /// position and mux its first init — past AVPlayer's -12889 window on a slow source, which
-    /// is how a remote resume died on "No response for map" before a byte of init existed. Arm
-    /// the same one-shot signal the media-segment serve uses so the server can answer early.
-    func initSegment(onSlow: (@Sendable () -> Void)?) -> Data? {
-        guard let onSlow, !isLive else { return initSegment() }
-        let signal = SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: onSlow)
-        defer { signal.complete() }
-        return initSegment()
-    }
-
     func initVersionID(forSegment index: Int) -> Int {
         cache.initVersionID(forSegment: index)
     }
@@ -1233,44 +1222,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     func mediaSegmentURL(at index: Int) -> URL? {
         guard index >= 0, index < currentSegmentCount else { return nil }
         handleTargetChange(to: index)
-        return cachedMediaSegmentURL(at: index)
-    }
-
-    func cachedMediaSegmentURL(at index: Int) -> URL? {
-        guard index >= 0, index < currentSegmentCount else { return nil }
         return cache.peekURL(index: index)
-    }
-
-    /// progressive VOD serve: kill switch, internal so tests can turn the whole feature off and
-    /// exercise the exact pre-feature serve path (muxers get a nil board, the provider vends no
-    /// handle, the server never sees the progressive branch).
-    nonisolated(unsafe) static var progressiveVODServe = true
-
-    /// progressive VOD serve: how long a request may wait for the muxer's staging file to appear
-    /// on the board. iOS AVPlayer asks for init.mp4 and the first media segment in PARALLEL at
-    /// startup and resume, before the producer has allocated its muxer (it allocates on the first
-    /// keep-packet); without a bounded wait the first segment — the one progressive serve exists
-    /// for — falls into the legacy blocking serve and eats AVPlayer's ~3.5 s -12889 watchdog.
-    /// Bounded so an index the producer never reaches still falls back to the legacy serve with
-    /// its restart logic intact.
-    static let progressiveEntryWaitSeconds: TimeInterval = 2.0
-
-    /// progressive VOD serve: the in-production staging file for `index`, or nil when the feature
-    /// is off, the session is live, the index is out of range, or nothing is being produced for it
-    /// right now. Deliberately does NOT drive handleTargetChange: the server calls this only after
-    /// mediaSegmentURL(at:) already did, and declaring the target twice per request would double
-    /// the fetch accounting.
-    ///
-    /// When nothing is registered yet but the ACTIVE producer is marching toward this index (and
-    /// the cache does not already hold it), wait briefly for the muxer to appear: covers the
-    /// parallel init+first-segment fetch window at startup/resume.
-    func progressiveSegment(at index: Int) -> ProgressiveSegmentBoard.Handle? {
-        guard Self.progressiveVODServe, !isLive,
-              index >= 0, index < currentSegmentCount else { return nil }
-        if let h = cache.progressive.handle(for: index) { return h }
-        guard cache.peekURL(index: index) == nil, activeProducerCovers(index) else { return nil }
-        return cache.progressive.awaitHandle(
-            for: index, until: Date().addingTimeInterval(Self.progressiveEntryWaitSeconds))
     }
 
     /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog
@@ -1349,9 +1301,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return alreadyReanchoredHere ? .wait : .reanchor
     }
 
-    /// Called once at the start of a request by mediaSegmentURL(at:) (or by a direct
-    /// mediaSegment(at:) caller). Later cache retries and blocking fallback only read data.
-    /// Without the initial declaration, sendfile cache hits would skip proactive restarts.
+    /// Shared by mediaSegment(at:) and mediaSegmentURL(at:). Without sharing, back-scrubs served
+    /// via sendfile (cache hits) skip the proactive restart entirely, leaving seg-11+ to fall into
+    /// a reactive prune-gap restart with AVPlayer's buffer at its thinnest.
     private func handleTargetChange(to index: Int) {
         stateLock.lock()
         _mediaFetchCount += 1
@@ -1459,21 +1411,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AVPlayer -12889s at ~3.5 s of silence and three strikes kill the item). Live keeps its own
     /// contracts (below-window fast 404, LL-HLS blocking reload) and never signals.
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? {
-        serveSegment(at: index, onSlow: onSlow, declaringTarget: true)
-    }
-
-    func mediaSegmentAfterTargetDeclaration(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? {
-        serveSegment(at: index, onSlow: onSlow, declaringTarget: false)
-    }
-
-    private func serveSegment(at index: Int, onSlow: (@Sendable () -> Void)?, declaringTarget: Bool) -> Data? {
-        guard let onSlow, !isLive else { return serveSegment(at: index, declaringTarget: declaringTarget) }
+        guard let onSlow, !isLive else { return serveSegment(at: index) }
         let signal = SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: onSlow)
         defer { signal.complete() }
-        return serveSegment(at: index, declaringTarget: declaringTarget)
+        return serveSegment(at: index)
     }
 
-    private func serveSegment(at index: Int, declaringTarget: Bool) -> Data? {
+    private func serveSegment(at index: Int) -> Data? {
         guard index >= 0, index < currentSegmentCount else { return nil }
 
         // Segment below the live window is evicted; returning nil = fast 404 so AVPlayer resyncs.
@@ -1493,7 +1437,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
         let totalStart = DispatchTime.now()
 
-        if declaringTarget { handleTargetChange(to: index) }
+        handleTargetChange(to: index)
 
         // Fast path: serve from cache.
         if let hit = cache.peek(index: index) {
@@ -1746,25 +1690,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// is reset per provider-fired restart) or its restart anchor before the first write (AE#141).
     private var activeMarchFront: Int {
         max(cache.highestStoredIndex, lastRestartIndex)
-    }
-
-    /// How far past the march front a non-resident forward-seek target may sit before the
-    /// engine re-anchors at it instead of letting the fetch wait out the march. Inside the
-    /// forward-wait window the march still produces every segment between the front and the
-    /// target, but a post-seek playhead only ever asks for the target onward: the gap is dead
-    /// ground bought with deadline seconds (measured: a +30 s scrub held 8.2 s while the march
-    /// filled five segments AVPlayer never requested). Past the lead, re-anchoring at the
-    /// target costs less than producing the gap at any plausible delivery rate; at or inside
-    /// it the march arrives first and the existing wait is kept.
-    private static let seekReanchorLeadSegments = 2
-
-    /// Whether a forward-seek target segment needs a producer re-anchor rather than the
-    /// forward-wait the fetch path would otherwise give it. Resident segments are served by
-    /// the cache fast path and must not tear down the producer; targets at or behind the
-    /// front+lead boundary are close enough that the march beats a restart.
-    func seekTargetNeedsReanchor(_ index: Int) -> Bool {
-        guard cache.peekURL(index: index) == nil else { return false }
-        return index > activeMarchFront + Self.seekReanchorLeadSegments
     }
 
     /// AE#141: whether the active producer's march can plausibly deliver `index` without a

@@ -11,24 +11,19 @@ struct RestartCoalescer {
     /// clock was reconciled to (the #79 permanent wedge). A later authoritative target still replaces it
     /// (AVPlayer moved). Cleared once the target is consumed by `next`.
     private var pendingAuthoritative = false
-    /// Only the detached early re-anchor is tied to one user seek. Ordinary segment-driven
-    /// pending targets still keep their newest-wins behavior when a later seek starts.
-    private var pendingEarlySeek = false
 
     /// Returns `true` if the caller should become the in-flight worker; `false` if coalesced (in-flight worker will pick it up via `next(justRan:)`).
     ///
     /// `authoritative` marks a recovery re-anchor (#79): it overwrites `pending` and locks the slot, so a
     /// subsequent ordinary scrub `begin` is dropped rather than clobbering it. A non-authoritative scrub never
     /// overwrites an authoritative pending. Whichever runs as the in-flight worker still drains via `next`.
-    mutating func begin(_ idx: Int, authoritative: Bool = false, earlySeek: Bool = false) -> Bool {
+    mutating func begin(_ idx: Int, authoritative: Bool = false) -> Bool {
         if inFlight {
             if authoritative {
                 pending = idx
                 pendingAuthoritative = true
-                pendingEarlySeek = false
             } else if !pendingAuthoritative {
                 pending = idx
-                pendingEarlySeek = earlySeek
             }
             // else: an authoritative pending owns the slot; drop this scrub. Since #178 a NEW user
             // seek releases the slot (clearSupersededAuthoritativePending) before its segment GETs
@@ -55,25 +50,15 @@ struct RestartCoalescer {
         pendingAuthoritative = false
     }
 
-    /// A detached early re-anchor may already be queued when the next seek supersedes it.
-    /// Leave ordinary segment requests and authoritative recovery targets untouched.
-    mutating func clearSupersededEarlySeekPending() {
-        guard pendingEarlySeek else { return }
-        pending = nil
-        pendingEarlySeek = false
-    }
-
     /// Returns next pending target, or `nil` when the burst has settled (clears in-flight flag).
     mutating func next(justRan idx: Int) -> Int? {
         if let p = pending, p != idx {
             pending = nil
             pendingAuthoritative = false
-            pendingEarlySeek = false
             return p
         }
         pending = nil
         pendingAuthoritative = false
-        pendingEarlySeek = false
         inFlight = false
         return nil
     }

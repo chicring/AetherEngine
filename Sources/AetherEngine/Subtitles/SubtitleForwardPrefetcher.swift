@@ -253,8 +253,6 @@ enum SubtitleForwardPrefetcher {
         /// wall time on purpose, see `SideReaderLinkPolicy.anchorGraceSeconds`.
         var anchorGraceUntil = DispatchTime.now()
             + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
-        /// Startup-rule holds are logged once per session, not per poll.
-        var startupHoldLogged = false
         let telemetryGeneration = SubtitlePrefetchTelemetry.sessionStarted(fence: fence)
         // #220: the exit reason reaches the gauge, not just the fact that the loop stopped.
         // `defer` reads `exit` at unwind, so every break path reports the reason it set.
@@ -278,16 +276,7 @@ enum SubtitleForwardPrefetcher {
                         inAnchorGrace: DispatchTime.now() < anchorGraceUntil
                             || reanchor?.hasPending == true,
                         yieldedSeconds: yielded) {
-                    if yielded == 0 {
-                        SubtitlePrefetchTelemetry.recordLinkYield(true)
-                        if !startupHoldLogged, link.isHoldingForStartup() {
-                            startupHoldLogged = true
-                            EngineLog.emit(
-                                "[AetherEngine] #151 forward prefetch holding the link "
-                                + "for playback startup",
-                                category: .engine)
-                        }
-                    }
+                    if yielded == 0 { SubtitlePrefetchTelemetry.recordLinkYield(true) }
                     // The playhead moves while we wait, so the lead shrinks: a reader parked behind
                     // a busy pump returns to fetching on its own once it falls under the floor.
                     guard let fresh = await playhead() else { break readLoop }
@@ -330,12 +319,8 @@ enum SubtitleForwardPrefetcher {
                 // request, so this under-claims by up to one authored gap and never over-claims.
                 store.noteHarvestAnchor(.prefetch, at: target.seconds)
                 lastCoverageNoted = -Double.infinity
-                // 再锚定不续宽限期（默认 0s）：落点附近的 cue 由 producer 的 keep-set tap
-                // 顺带收获，无条件读 8 秒只会在链路余量不足时把落地后的 buffer refill
-                // 带宽对半分。producer 停着时仲裁本来就不让阅读器等待，所以暂停下
-                // seek 的预取并不受影响。要恢复旧行为把 reanchorGraceSeconds 调回 8。
                 anchorGraceUntil = DispatchTime.now()
-                    + (link?.reanchorGraceSeconds ?? SideReaderLinkPolicy.reanchorGraceSeconds)
+                    + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
                 if let fresh = await playhead() { playheadSnapshot = fresh }
             }
 

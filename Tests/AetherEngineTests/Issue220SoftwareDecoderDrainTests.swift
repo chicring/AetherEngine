@@ -67,10 +67,9 @@ struct Issue220SoftwareDecoderDrainTests {
 
         #expect(packets == 40)
         // Frame threading holds a bounded number of frames back until flush; the guard is that
-        // the drain runs at all and keeps up, not the exact pipeline depth. The decoder requests
-        // activeProcessorCount workers, which may exceed 16 on the machine running this test.
+        // the drain runs at all and keeps up, not the exact pipeline depth.
         #expect(counter.value > 0)
-        #expect(counter.value >= packets - max(16, ProcessInfo.processInfo.activeProcessorCount))
+        #expect(counter.value >= packets - 16)
     }
 
     private final class FrameCounter: @unchecked Sendable {

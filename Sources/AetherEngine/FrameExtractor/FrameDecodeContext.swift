@@ -381,17 +381,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         // serial decode queue and freeze the scrub preview (issue #27). No-op for
         // file:// / custom sources. Disarmed on every exit path.
         demuxer.beginReadDeadline(secondsFromNow: Self.stillReadDeadlineSeconds)
-        defer {
-            // Name the deadline once at this level too: the AVIOReader extract lines carry the
-            // transport detail, this ties the verdict to the still the host asked for.
-            if demuxer.readDeadlineFired {
-                EngineLog.emit(
-                    "[FrameExtractor] still decode at t=\(String(format: "%.2f", seconds))s "
-                    + "abandoned: HTTP read deadline (\(Int(Self.stillReadDeadlineSeconds))s) fired",
-                    category: .swPlayback)
-            }
-            demuxer.endReadDeadline()
-        }
+        defer { demuxer.endReadDeadline() }
 
         avcodec_flush_buffers(ctx)
 

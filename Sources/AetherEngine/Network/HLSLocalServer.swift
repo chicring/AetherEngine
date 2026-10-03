@@ -17,28 +17,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// Default forwards to `mediaSegment(at:)` without ever signalling.
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
 
-    /// Same contract for the EXT-X-MAP init segment: a remote-source start or resume keeps the
-    /// producer positioning while AVPlayer's map request already burns through its -12889
-    /// window ("No response for map"), and three of those fail the item before a byte of init
-    /// ever existed. Default forwards to `initSegment()` without ever signalling.
-    func initSegment(onSlow: (@Sendable () -> Void)?) -> Data?
-
     /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
     /// Must name a file that exists: the server stats and opens it afterwards, and a URL whose file
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
-
-    /// Read-only retry after mediaSegmentURL(at:) declared this request's target. A later
-    /// request may have advanced the target while this one waited for a staging-file adoption.
-    func cachedMediaSegmentURL(at index: Int) -> URL?
-    /// Blocking fallback for the same request, without declaring its target again.
-    func mediaSegmentAfterTargetDeclaration(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
-
-    /// progressive VOD serve: the staging file currently being produced for `index`, or nil when
-    /// the feature is off, the session is live, or nothing is in production there. Called only
-    /// after mediaSegmentURL(at:) missed the cache, so it must not repeat that call's side effects
-    /// (target declaration is already done). Default nil = pre-feature behaviour.
-    func progressiveSegment(at index: Int) -> ProgressiveSegmentBoard.Handle?
 
     /// AE#418 round 7: what became of a media-segment request. `delivered` is true once the whole
     /// response went out; false when it was refused or the write failed on a client that hung up.
@@ -155,13 +137,7 @@ protocol HLSSegmentProvider: AnyObject {
 
 extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
-    func initSegment(onSlow: (@Sendable () -> Void)?) -> Data? { initSegment() }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
-    func cachedMediaSegmentURL(at index: Int) -> URL? { mediaSegmentURL(at: index) }
-    func mediaSegmentAfterTargetDeclaration(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? {
-        mediaSegment(at: index, onSlow: onSlow)
-    }
-    func progressiveSegment(at index: Int) -> ProgressiveSegmentBoard.Handle? { nil }
     func didServeMediaSegment(index: Int, delivered: Bool) {}
     var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
@@ -1035,32 +1011,7 @@ final class HLSLocalServer: @unchecked Sendable {
 
         case "/init.mp4":
             stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
-            // The map request burns through the same ~3.5 s -12889 window as a media segment
-            // ("No response for map"), but the init fetch can block for tens of seconds while a
-            // remote-source producer is still positioning. Emit the early chunked header on the
-            // same threshold so a slow init rides out AVPlayer's watchdog instead of dying on it.
-            let early = EarlyHeaderState()
-            let data = provider?.initSegment(onSlow: { [weak self] in
-                guard let self, early.markSentOnce() else { return }
-                EngineLog.emit(
-                    "[HLSLocalServer] init.mp4: slow serve, sending early chunked header",
-                    category: .hlsServer)
-                _ = self.writeAll(fd: fd,
-                                  data: Self.chunkedResponseHeader(contentType: "video/mp4"),
-                                  path: "\(normalizedPath) [early header]")
-            }) ?? Data()
-            if early.wasSent {
-                guard !data.isEmpty else {
-                    // Headers are committed; abort so AVPlayer sees a truncated transfer
-                    // and retries, instead of a cacheable empty 200.
-                    EngineLog.emit(
-                        "[HLSLocalServer] init.mp4: early-header serve missed; "
-                        + "closing connection for AVPlayer retry",
-                        category: .hlsServer)
-                    return false
-                }
-                return sendChunkedBody(fd: fd, path: normalizedPath, data: data)
-            }
+            let data = provider?.initSegment() ?? Data()
             if data.isEmpty {
                 return send404(fd: fd, path: normalizedPath,
                                reason: "init.mp4 empty (provider not ready?)")
@@ -1099,8 +1050,7 @@ final class HLSLocalServer: @unchecked Sendable {
                         return responseWritten
                     }
                     // File-backed fast path: stream page cache -> socket without Data materialization.
-                    func fileBackedServe(_ url: URL?) -> Bool? {
-                        guard let url else { return nil }
+                    if let url = provider?.mediaSegmentURL(at: index) {
                         let outcome = send200File(fd: fd, path: normalizedPath,
                                                   fileURL: url,
                                                   contentType: "video/mp4",
@@ -1113,40 +1063,13 @@ final class HLSLocalServer: @unchecked Sendable {
                         case .retry: return outcome.writeSucceeded
                         }
                     }
-                    // This is the sole target declaration for this HTTP request. All later retries
-                    // only read the cache; another request may have sought elsewhere meanwhile.
-                    if let response = fileBackedServe(provider?.mediaSegmentURL(at: index)) {
-                        return response
-                    }
-                    // progressive VOD serve: a cache miss whose segment is still being produced is
-                    // streamed from the staging file per flushed fragment instead of blocking on the
-                    // whole segment (the /tmp/llhls AVPlayer A/B measured 1.9-3.9 s off startup,
-                    // zero stalls). Range requests keep the legacy path: a byte range into a file
-                    // still growing is not a progressively servable fetch. serveProgressive returns
-                    // nil only when it wrote nothing, in which case the ordinary serve still applies
-                    // — after one more file-path try, since the likeliest reason the staging file
-                    // could not be opened is the adopt that just landed.
-                    let requestLines = text.components(separatedBy: "\r\n")
-                    if Self.requestHeader(named: "range", in: requestLines) == nil {
-                        if let handle = provider?.progressiveSegment(at: index),
-                           let response = serveProgressive(fd: fd, path: normalizedPath,
-                                                           index: index, handle: handle) {
-                            return response
-                        }
-                        // Whether the board never vended a handle (a segment completed during the
-                        // provider's entry wait) or the staging file vanished mid-serve, the adopt
-                        // that just landed is the likeliest cause; try the cache path once.
-                        if let response = fileBackedServe(provider?.cachedMediaSegmentURL(at: index)) {
-                            return response
-                        }
-                    }
                     // #93 round 3: a serve outliving the provider's slow threshold (wedge-window
                     // restart, 25-50 s worst case) emits response headers NOW as a chunked
                     // transfer; the body follows when the segment lands. Without this, AVPlayer's
                     // ~3.5 s time-to-first-byte watchdog logs -12889 per silent request and three
                     // strikes fail the item (failedToPlayToEndTime, terminal from the couch).
                     let early = EarlyHeaderState()
-                    let data = provider?.mediaSegmentAfterTargetDeclaration(at: index, onSlow: { [weak self] in
+                    let data = provider?.mediaSegment(at: index, onSlow: { [weak self] in
                         guard let self, early.markSentOnce() else { return }
                         EngineLog.emit(
                             "[HLSLocalServer] seg\(index): slow serve, sending early chunked header",
@@ -1244,147 +1167,6 @@ final class HLSLocalServer: @unchecked Sendable {
             return false
         }
         return true
-    }
-
-    /// progressive VOD serve: same TTFB budget as the #93 early-header threshold — past it the
-    /// chunked header goes out even with no body byte yet, or AVPlayer's ~3.5 s watchdog logs -12889.
-    private static let progressiveSlowHeaderSeconds: TimeInterval = 1.2
-    /// progressive VOD serve: how long a served stream may go without a newly committed fragment
-    /// before the connection is dropped for an AVPlayer retry (same order as the VOD forward wait).
-    private static let progressiveNoProgressTimeoutSeconds: TimeInterval = 30
-    /// progressive VOD serve: socket chunk cap; keeps each send() bounded like the file streamer.
-    private static let progressiveChunkBytes = 1 << 20
-
-    /// progressive VOD serve: stream the in-production staging file `handle` points at, one
-    /// committed fragment at a time, as a chunked response. Returns nil only when nothing was
-    /// written yet (the file could not be opened, or it was abandoned before the first byte): the
-    /// caller then retries the cache path and falls back to the ordinary blocking serve. Any later
-    /// failure is terminal for THIS request — an aborted chunked transfer AVPlayer retries — and is
-    /// reported to didServeMediaSegment here.
-    ///
-    /// The fd is opened before waiting on purpose: adopt() renames the staging file into the cache,
-    /// and an open file description survives the rename while the path does not.
-    private func serveProgressive(fd: Int32, path: String, index: Int,
-                                  handle: ProgressiveSegmentBoard.Handle) -> Bool? {
-        let fileFD = open(handle.path.path, O_RDONLY)
-        guard fileFD >= 0 else {
-            EngineLog.emit(
-                "[HLSLocalServer] seg\(index): progressive serve fell back "
-                + "(staging file already gone)",
-                category: .hlsServer)
-            return nil
-        }
-        defer { close(fileFD) }
-
-        let startedAt = Date()
-        let headerDeadline = startedAt.addingTimeInterval(Self.progressiveSlowHeaderSeconds)
-        var sent = 0
-        var chunksSent = 0
-        var headerSent = false
-        var startLogged = false
-        var firstByteAt: Date?
-
-        func writeFailed() -> Bool {
-            provider?.didServeMediaSegment(index: index, delivered: false)
-            return false
-        }
-        func noteProgress(_ n: Int) {
-            if !startLogged {
-                startLogged = true
-                EngineLog.emit(
-                    "[HLSLocalServer] seg\(index): progressive serve start (committed=\(n)B)",
-                    category: .hlsServer)
-            }
-        }
-        func sendHeader() -> Bool {
-            if headerSent { return true }
-            guard writeAll(fd: fd,
-                           data: Self.chunkedResponseHeader(contentType: "video/mp4"),
-                           path: "\(path) [progressive header]") else { return false }
-            headerSent = true
-            return true
-        }
-        /// Send [sent, end) of the staging file as ≤1 MiB chunks. The committed boundary is always a
-        /// whole number of boxes, so the wire never carries a partial moof/mdat.
-        func sendCommittedRange(to end: Int) -> Bool {
-            var buf = [UInt8](repeating: 0, count: Self.progressiveChunkBytes)
-            while sent < end {
-                let want = min(buf.count, end - sent)
-                let n = pread(fileFD, &buf, want, off_t(sent))
-                guard n > 0 else { return false }
-                guard writeAll(fd: fd, data: Self.chunkFrameHeader(size: n),
-                               path: "\(path) [chunk size]"),
-                      writeAll(fd: fd, data: Data(buf[0..<n]), path: path),
-                      writeAll(fd: fd, data: Self.chunkFrameTrailer,
-                               path: "\(path) [chunk trailer]") else { return false }
-                sent += n
-                chunksSent += 1
-                if firstByteAt == nil { firstByteAt = Date() }
-            }
-            return true
-        }
-
-        while true {
-            // Before the header the wait is bounded by the slow threshold; once headers are out the
-            // connection can ride out a much longer production stall, same as the #93 early-header
-            // serve outliving its signal.
-            let deadline = headerSent
-                ? Date().addingTimeInterval(Self.progressiveNoProgressTimeoutSeconds)
-                : headerDeadline
-            switch handle.wait(beyond: sent, until: deadline) {
-            case .committed(let n):
-                noteProgress(n)
-                guard sendHeader(), sendCommittedRange(to: n) else { return writeFailed() }
-            case .completed(let n):
-                noteProgress(n)
-                guard sendHeader(), sendCommittedRange(to: n),
-                      writeAll(fd: fd, data: Self.chunkedFinal,
-                               path: "\(path) [chunk final]") else { return writeFailed() }
-                let totalMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-                let firstMs = firstByteAt.map { Int($0.timeIntervalSince(startedAt) * 1000) } ?? -1
-                EngineLog.emit(
-                    "[HLSLocalServer] seg\(index): served \(sent) B progressively in \(chunksSent) "
-                    + "chunks, first byte after \(firstMs)ms, total \(totalMs)ms",
-                    category: .hlsServer)
-                provider?.didServeMediaSegment(index: index, delivered: true)
-                return true
-            case .abandoned:
-                if !headerSent {
-                    // Dead before a byte went out: the ordinary serve path still applies.
-                    EngineLog.emit(
-                        "[HLSLocalServer] seg\(index): progressive serve abandoned before any "
-                        + "data; falling back",
-                        category: .hlsServer)
-                    return nil
-                }
-                // Headers (and maybe chunks) are committed; an unterminated chunked body reads as a
-                // dropped connection, which AVPlayer retries — never a cacheable empty 200.
-                EngineLog.emit(
-                    "[HLSLocalServer] seg\(index): progressive serve abandoned after \(sent)B sent; "
-                    + "closing connection for AVPlayer retry",
-                    category: .hlsServer)
-                provider?.didServeMediaSegment(index: index, delivered: false)
-                return false
-            case nil:
-                if !headerSent {
-                    // The producer is slower than the TTFB budget: commit the header anyway, then
-                    // keep waiting under the no-progress timeout.
-                    EngineLog.emit(
-                        "[HLSLocalServer] seg\(index): progressive serve slow, sending early "
-                        + "chunked header",
-                        category: .hlsServer)
-                    guard sendHeader() else { return writeFailed() }
-                } else {
-                    EngineLog.emit(
-                        "[HLSLocalServer] seg\(index): progressive serve stalled "
-                        + "\(Int(Self.progressiveNoProgressTimeoutSeconds))s without progress; "
-                        + "closing connection for AVPlayer retry",
-                        category: .hlsServer)
-                    provider?.didServeMediaSegment(index: index, delivered: false)
-                    return false
-                }
-            }
-        }
     }
 
     /// Shared response-header builder. Header and body are sent in two separate send() calls: data may be mmap-backed and must NOT be copied via Data.append (would materialize segment into Swift heap, defeating the BSD-socket rewrite).

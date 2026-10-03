@@ -692,11 +692,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// program boundary or a renumbered clock, not a cadence.
     static let maxSynthesizedStrideSeconds: Double = 1.0
 
-    /// progressive VOD serve: VOD muxers flush a fragment ~every second of buffered video instead of
-    /// holding the AE#195 8 s floor, because the fragment granularity is the delivery step size the
-    /// server streams to AVPlayer while the segment is still being produced.
-    static let progressiveFragmentSeconds: Double = 1.0
-
     /// How far a repaired timestamp advances when the source carried neither dts nor pts.
     ///
     /// It used to advance one tick, which satisfies the muxer's monotonic invariant and nothing
@@ -1516,46 +1511,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.desiredFirstVideoTfdtPts = desiredFirstVideoTfdtPts
         self.desiredFirstAudioTfdtPts = desiredFirstAudioTfdtPts
 
-        // A tapped/harvested subtitle track that ENDS before this producer's anchor has no
-        // sample at or after it; the demuxer seek then leaves its cursor wherever it last was
-        // (open-probe position or the previous seek), and read_frame drains that stale backlog
-        // chunk-by-chunk before the first audio/video packet. On a remote source each cue is a
-        // separate range request, so a resume past a half-authored text track starved the map
-        // and segments for tens of seconds. Such a stream can deliver nothing in the window;
-        // keep it discarded so its chunks are never fetched. From-start anchors keep every
-        // track (nothing ends before 0).
-        let anchorSeconds: Double
-        if restartTargetVideoPts != Int64.min, restartTargetVideoPts > 0 {
-            anchorSeconds = Double(restartTargetVideoPts) * Double(video.timeBase.num)
-                / Double(video.timeBase.den)
-        } else {
-            anchorSeconds = 0
-        }
-        func endedBeforeAnchor(_ idx: Int32) -> Bool {
-            guard anchorSeconds > 0,
-                  let st = demuxer.stream(at: idx) else { return false }
-            let dur = st.pointee.duration
-            let tb = st.pointee.time_base
-            guard dur != Int64.min, dur > 0, tb.num > 0, tb.den > 0 else { return false }
-            return Double(dur) * Double(tb.num) / Double(tb.den) < anchorSeconds
-        }
-        let subtitleStreams = subtitleTapStreamIndices.union(subtitlePacketStreamIndices)
-        let liveSubtitles = subtitleStreams.filter { !endedBeforeAnchor($0) }
-        let droppedSubs = subtitleStreams.subtracting(liveSubtitles)
-        if !droppedSubs.isEmpty {
-            EngineLog.emit(
-                "[HLSSegmentProducer] subtitle stream(s) \(droppedSubs.sorted()) end before the "
-                + "anchor at \(String(format: "%.2f", anchorSeconds))s; discarded to skip the "
-                + "stale-cursor backlog drain",
-                category: .muxer
-            )
-        }
         // Discard streams we don't read (matroska queues PGS bitmaps, secondary audio -- heap churn).
         // Dual-demuxer: side audio index can alias a main-demuxer stream, so keep sets are split.
         if let side = sideAudioDemuxer {
             var keep: Set<Int32> = [videoStreamIndex]
             if closedCaptionStreamIndex >= 0 { keep.insert(closedCaptionStreamIndex) }   // #77
-            keep.formUnion(liveSubtitles)   // Sodalite#32 + #112 rework, minus tracks that end before the anchor
+            keep.formUnion(subtitleTapStreamIndices)   // Sodalite#32
+            keep.formUnion(subtitlePacketStreamIndices)   // #112 rework
             demuxer.discardAllStreamsExcept(keep)
             if let audio = audio {
                 side.discardAllStreamsExcept([audio.sourceStreamIndex])
@@ -1566,7 +1528,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 keep.insert(audio.sourceStreamIndex)
             }
             if closedCaptionStreamIndex >= 0 { keep.insert(closedCaptionStreamIndex) }   // #77
-            keep.formUnion(liveSubtitles)   // Sodalite#32 + #112 rework, minus tracks that end before the anchor
+            keep.formUnion(subtitleTapStreamIndices)   // Sodalite#32
+            keep.formUnion(subtitlePacketStreamIndices)   // #112 rework
             demuxer.discardAllStreamsExcept(keep)
         }
         // #77: cache the CC stream's time_base for the observer's PTS conversion.
@@ -2139,20 +2102,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
                 // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
                 // must not shrink the cap below typical TS A/V interleave skew.
-                // progressive VOD serve: on VOD the fragment granularity IS the delivery step size,
-                // so the bound drops to 1 s to hand AVPlayer a publishable fragment ~every second;
-                // live keeps the AE#195 8 s floor.
-                maxBufferedFragmentSeconds: (isLive || !VideoSegmentProvider.progressiveVODServe)
-                    ? max(8.0, 2 * targetSegmentDurationSeconds)
-                    : Self.progressiveFragmentSeconds,
+                maxBufferedFragmentSeconds: max(8.0, 2 * targetSegmentDurationSeconds),
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
-                // progressive VOD serve: VOD muxers publish flushed fragment boundaries; live and
-                // the kill switch keep nil (= no publishing, exact legacy behaviour).
-                progressiveBoard: (isLive || !VideoSegmentProvider.progressiveVODServe)
-                    ? nil : cache.progressive,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
