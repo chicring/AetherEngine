@@ -250,6 +250,65 @@ live-only session took a rebuild that rejoins at the edge.
 
 `--drop-audio` forces every audio pipeline to fail, so the AE#462 video-only drop is observable without a source this build has no decoder for: the loopback cascade skips both the stream-copy probe and the bridge, and `SoftwarePlaybackHost` refuses its decoder open. The run then prints `audio delivery=droppedNoPipeline pipeline=none`, which is the pair a host reads (the typed fact plus the human label), against `delivery=streamCopy` / `bridged` / `decoded` on the same source without the flag. It is loud in the log on purpose, in both the CLI line and the engine's own, because a forced classification read as a real one would be worse than no harness.
 
+`--switch-rate <rate>[@ms]` (repeatable) calls `setRate()` on the playing session at the
+given delay after load (default +10 s). A rate change that moved the playhead is a bug whatever it
+did to the clock: the run prints `cur` before and after each call, and the instant jump is what a
+seek-like setRate (mpv #13513) would show up in. `--paused` mounts with `autoplay = false`, which
+is the mount flag a host that owns transport uses; pair it with `--host-calls play` to drive the
+post-load play from the caller, which is the shape that used to leave a paused rebuild playing off
+a stale `autoplay = true` (#464 round 2).
+
+`--paused` mounts with `autoplay = false` (AE#464 round 2): the transport decision belongs to the
+host, and a paused mount that the engine's own rebuild treated as autoplaying is the case that
+produced `state=playing cur=0.00` on a session the user had paused. The rebuild now reads the
+session's own transport before `.loading` hides it, so a paused session stays paused through an
+audio switch, a title pick or a `reloadAtCurrentPosition`.
+
+`--switch-rate <rate>[@ms]` (repeatable) calls `setRate()` on the playing session at the
+given delay after load (default +10 s). A rate change that moved the playhead is a bug whatever it
+did to the clock: the run prints `cur` before and after each call, and the instant jump is what a
+seek-like setRate (mpv #13513) would show up in. `--paused` mounts with `autoplay = false`, which
+is the mount flag a host that owns transport uses; pair it with `--host-calls play` to drive the
+post-load play from the caller, which is the shape that used to leave a paused rebuild playing off
+a stale `autoplay = true` (#464 round 2).
+
+`--paused` mounts with `autoplay = false` (AE#464 round 2): the transport decision belongs to the
+host, and a paused mount that the engine's own rebuild treated as autoplaying is the case that
+produced `state=playing cur=0.00` on a session the user had paused. The rebuild now reads the
+session's own transport before `.loading` hides it, so a paused session stays paused through an
+audio switch, a title pick or a `reloadAtCurrentPosition`.
+
+`--served-url` prints `SERVED <url>` whenever the session mounts a native item, with the loopback
+path token in clear. Every other line redacts it, which is right for a log and leaves no way to look
+at what was actually served. With the URL, `init.mp4` is one `curl` away, and the fMP4 segments are
+already on disk under `$TMPDIR/aether-segments/<session>/seg-N-M.m4s`: `cat init.mp4 seg-26-27.m4s
+> s.mp4` is a file `ffprobe -show_packets` reads, which is how AE#684 measured the sound against
+the picture in the bytes rather than in the log.
+
+`--max-concurrent-requests N` sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most
+requests the reader may have open against the origin at once, across every path it fetches on.
+`1` also switches off the speculative parallel paths, which is the shape of a connection-metered
+CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with
+and without the flag.
+
+`--assert-dv` sets `LoadOptions.panelPresentsDolbyVision` (AE#493), the host's assertion that its
+display presents Dolby Vision. macOS has no per-mode display capability API, so a Mac run plays a
+Dolby Vision source as its HDR10 base layer (`effective-format=hdr10`) until the host says
+otherwise; the flag moves that label and the tvOS criteria request. It does not change the
+packaging of a Profile 5 / 8.1 / 8.4 source (those carry their `dvcC` and `SUPPLEMENTAL-CODECS` on
+every display since 6.72).
+
+`--iframes` lists an I-frame rendition in the master (the `LoadOptions.serveIFramePlaylist` path a
+full session uses, AE#682): the engine calls `requestIFramePlaylist()` before `start()`. The master
+then carries `#EXT-X-I-FRAME-STREAM-INF` and the server answers `iframe.m3u8`, `iframe_init.mp4`
+and `iframe<N>.mp4`, one keyframe per segment. The log line `[HLSVideoEngine] i-frame rendition:
+served segments=<n>` or `absent reason=<reason>` says which it was. `curl` the playlist and a
+fragment next to the printed playback URL to look at them.
+
+`--no-blocking-reload` sets `LoadOptions.liveBlockingReload = false` (AE#446): the live playlist
+never advertises `CAN-BLOCK-RELOAD`, which separates "AVPlayer stopped fetching because the
+playlist stopped changing" from "AVPlayer stopped fetching because it is in low-latency mode".
+
 `--deinterlace-field-rate field|frame` sets `LoadOptions.deinterlaceFieldRate` (AE#492). `send_field`, the default, emits one output frame per FIELD, so a 29.97i source hands the layer 59.94 frames per second against 23.976 for a progressive one. That factor is the confound in every per-seek counter taken across the two, and this flag is the only way to take it out: the same file, the same seeks, half the output rate, nothing else changed. Measured on a 480i fixture through the hardware chain, four runs an arm: 59.9 fps and 17.47 drops/s at `field` against 30.0 fps and 7.49 at `frame`, which is 0.291 against 0.250 per frame delivered, with the progressive arm at 0.254. Note that nothing binds a render surface in a CLI run, so the absolute level is the harness's own; only the ratio between arms is a measurement.
 
 
