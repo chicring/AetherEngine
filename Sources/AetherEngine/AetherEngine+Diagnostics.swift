@@ -496,14 +496,22 @@ extension AetherEngine {
 
     /// Lifetime bytes the session's playback reader pulled from the source. Feeds the sampler's
     /// instant + average bitrate and `LiveTelemetry.demuxerBytesFetched`. 0 before a reader exists.
+    /// Hosts may also diff it directly for a real origin-fetch rate; the loopback server and the
+    /// segment cache sit behind it, so cache hits never move this counter.
     ///
     /// #306: software first, native second, the same precedence the memprobe has always read the pump
     /// with. A software session owns no `HLSVideoEngine`, so the native-only form returned 0 for the
     /// whole session and every byte-derived figure a host can show (bitrate, throughput, transferred)
     /// read zero on the one path that carries the exotic content.
-    var demuxerBytesFetched: Int64 {
+    public var demuxerBytesFetched: Int64 {
         Self.pumpBytesFetched(software: softwareHost?.demuxerBytesFetched,
                               native: nativeVideoSession?.demuxerBytesFetched)
+    }
+
+    /// AE#514: the played-media ledger of whichever path owns the pump, same precedence as the byte
+    /// counter above. nil before a pipeline exists and on the paths with no pump to feed one.
+    var playedMediaLedger: PlayedMediaLedger? {
+        softwareHost?.playedMediaLedger ?? nativeVideoSession?.playedMediaLedger
     }
 
     /// #306: the precedence itself, as a function, so the ordering is assertable without a live

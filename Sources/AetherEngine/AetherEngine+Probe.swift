@@ -566,17 +566,34 @@ extension AetherEngine {
     ///
     /// `formatKnown` is false when the open-time probe failed: the real range is then unknown and a DV write
     /// may still be inbound, so a suppressed host keeps the full budget.
+    ///
+    /// `noWriterExpected` is a `.secondary` load (Sodalite#175): nobody writes criteria for it, so there is
+    /// no inbound switch to wait for.
     nonisolated static func playGateGrace(
         criteriaUnchanged: Bool,
         engineIsCriteriaWriter: Bool,
         formatKnown: Bool,
-        effectiveFormat: VideoFormat
+        effectiveFormat: VideoFormat,
+        noWriterExpected: Bool = false
     ) -> DisplayCriteriaController.StartGrace {
         // #133: the criteria were already active, nothing was written, nothing can settle.
-        if criteriaUnchanged { return .skip }
+        if criteriaUnchanged || noWriterExpected { return .skip }
         if engineIsCriteriaWriter { return .brief }
         guard formatKnown else { return .full }
         return effectiveFormat == .sdr ? .brief : .full
+    }
+
+    /// Sodalite#175: a secondary never writes criteria, whatever the host passed.
+    nonisolated static func applyingSharedOutputRole(_ options: LoadOptions) -> LoadOptions {
+        guard options.sharedOutputRole == .secondary else { return options }
+        var adjusted = options
+        adjusted.suppressDisplayCriteria = true
+        return adjusted
+    }
+
+    /// Sodalite#175: Now Playing belongs to the primary; a secondary never takes it.
+    nonisolated static func ownsNowPlaying(hostOptIn: Bool, role: SharedOutputRole) -> Bool {
+        hostOptIn && role == .primary
     }
 
     /// Whitelist (not blacklist) of AVPlayer-native audio codecs: AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, FLAC (native since iOS/tvOS 11). Anything else falls back to `AudioPlaybackHost` (FFmpeg).
@@ -919,6 +936,27 @@ extension AetherEngine {
     ) -> Bool {
         if panelPresentsHDR { return true }
         return attemptWhenUnproven && displayEligibleForHDR && !panelRefusedHDRMaster
+    }
+
+    /// AE#667: whether an unproven master has to wait for the running switch before it is served.
+    ///
+    /// The pre-flight releases the load at its 2 s cap while an HDR switch is still in flight, on purpose:
+    /// the overlap is what #348 kept, and a proven or media route has nothing to lose by it. The unproven
+    /// master is the one route that does, because its whole point is to let AVPlayer's acceptance stand in
+    /// for the readout, and AVPlayer answers for the mode the panel is in NOW. Measured on an Apple TV 4K
+    /// (tvOS 27.0, HDR10 panel): master served 140 ms after the cap, `-11868` 80 ms later, the switch
+    /// ending 660 ms after that, and the refusal latched, so every later HDR title went media-direct.
+    ///
+    /// Only a switch seen to START counts. A DV switch that never reports would make this an unbounded wait
+    /// for an end that cannot arrive, and a proven panel is excluded because it already answered. What the
+    /// wait costs is the prep that used to overlap the switch's tail; the play gate held the first frame
+    /// until that end anyway.
+    nonisolated static func unprovenMasterAwaitsSwitchEnd(
+        routesAsHDR: Bool,
+        panelPresentsHDR: Bool,
+        switchRunning: Bool
+    ) -> Bool {
+        routesAsHDR && !panelPresentsHDR && switchRunning
     }
 
     /// AE#541: the HDR route of an in-place rebuild, composed from the same two decisions the load makes.

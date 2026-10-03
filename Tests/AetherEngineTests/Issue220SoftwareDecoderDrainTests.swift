@@ -67,9 +67,10 @@ struct Issue220SoftwareDecoderDrainTests {
 
         #expect(packets == 40)
         // Frame threading holds a bounded number of frames back until flush; the guard is that
-        // the drain runs at all and keeps up, not the exact pipeline depth.
+        // the drain runs at all and keeps up, not the exact pipeline depth. The decoder requests
+        // activeProcessorCount workers, which may exceed 16 on the machine running this test.
         #expect(counter.value > 0)
-        #expect(counter.value >= packets - 16)
+        #expect(counter.value >= packets - max(16, ProcessInfo.processInfo.activeProcessorCount))
     }
 
     private final class FrameCounter: @unchecked Sendable {
@@ -91,7 +92,7 @@ struct Issue220SoftwareDecoderDrainTests {
     ///   ffmpeg -f lavfi -i "color=c=red:s=128x96:r=10:d=4" -c:v libx264 -preset ultrafast \
     ///     -tune zerolatency -bf 0 -pix_fmt yuv420p -x264-params keyint=10 -movflags +faststart swdec.mp4
     ///   base64 -i swdec.mp4
-    private static let fixtureBase64 = """
+    static let fixtureBase64 = """
         AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAPPbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAD6AAAQAA
         AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         AAAAAgAAAvl0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAA

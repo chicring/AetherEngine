@@ -116,6 +116,60 @@ struct DetourBlockCacheTests {
         #expect(Array(dst[0..<4]) == [100, 101, 102, 103])   // newest value served
     }
 
+    /// A clock a test moves by hand.
+    private final class ManualClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var seconds: TimeInterval = 1000
+        var now: TimeInterval { lock.lock(); defer { lock.unlock() }; return seconds }
+        func advance(_ by: TimeInterval) { lock.lock(); seconds += by; lock.unlock() }
+    }
+
+    // audit PERF-108: only close() emptied the cache, so the blocks of a backward scrub stayed
+    // resident (up to 32 MB per reader) for the rest of the session.
+    @Test("a block idle past the threshold is evicted and a recently hit one survives")
+    func idleEviction() {
+        let clock = ManualClock()
+        let cache = DetourBlockCache(blockSize: 16, maxBlocks: 8, now: { clock.now })
+        cache.insert(0, patternBlock(base: 0))
+        cache.insert(1, patternBlock(base: 16))
+        cache.insert(2, patternBlock(base: 32))
+
+        clock.advance(20)
+        _ = cache.block(1)
+        var dst = [UInt8](repeating: 0, count: 16)
+        #expect(dst.withUnsafeMutableBufferPointer { cache.serveCached(into: $0.baseAddress!, maxLen: 4, at: 32) } == 4)
+        clock.advance(20)
+
+        // Block 0 has been idle 40 s; blocks 1 and 2 were hit 20 s ago.
+        #expect(cache.evictIdle(olderThan: 30) == 1)
+        #expect(cache.residentCount == 2)
+        #expect(cache.block(0) == nil)
+        #expect(cache.block(1) != nil)
+        #expect(cache.block(2) != nil)
+
+        clock.advance(31)
+        #expect(cache.evictIdle(olderThan: 30) == 2)
+        #expect(cache.residentCount == 0)
+        #expect(cache.evictIdle(olderThan: 30) == 0)
+    }
+
+    @Test("a block that was evicted for age leaves the LRU order, so a later insert does not trip on it")
+    func evictedBlockLeavesTheOrder() {
+        let clock = ManualClock()
+        let cache = DetourBlockCache(blockSize: 16, maxBlocks: 2, now: { clock.now })
+        cache.insert(0, patternBlock(base: 0))
+        clock.advance(60)
+        cache.insert(1, patternBlock(base: 16))
+        #expect(cache.evictIdle(olderThan: 30) == 1)
+
+        cache.insert(2, patternBlock(base: 32))
+        cache.insert(3, patternBlock(base: 48))
+        #expect(cache.residentCount == 2)
+        #expect(cache.block(1) == nil, "the oldest surviving block is the one the size cap evicts")
+        #expect(cache.block(2) != nil)
+        #expect(cache.block(3) != nil)
+    }
+
     @Test("clear empties the cache")
     func clearEmpties() {
         let cache = DetourBlockCache(blockSize: 16, maxBlocks: 3)
@@ -140,5 +194,32 @@ struct AVIOReaderRateLimitStreakTests {
             #expect(reader.recordRateLimitAndShouldGiveUp() == false, "attempt \(attempt) should keep trying")
         }
         #expect(reader.recordRateLimitAndShouldGiveUp() == true, "7th consecutive 429/503 must give up")
+    }
+}
+
+/// A Range-ignoring origin (a bare `python -m http.server`, a Range-stripping proxy) answers
+/// every nonzero offset with 200, which the reader rejects — while probe seeks keep clearing
+/// unproductiveReconnects via seekReconnect and every from-0 reconnect streams a "productive"
+/// body, so the ordinary give-up ladder never trips and `avformat_open_input` never returns.
+/// The verdict rides its own streak, which survives both resets and must give up bounded.
+struct AVIOReaderRangeIgnoredTests {
+
+    @Test("ignored-Range verdict gives up only after the bounded cap")
+    func boundedGiveUp() {
+        let reader = AVIOReader(url: URL(string: "https://example.com/x.mkv")!)
+        for attempt in 1...AVIOReader.rangeIgnoredMaxStreak {
+            reader.noteRangeIgnored()
+            #expect(!reader.rangeIgnoredExceeded(), "refusal \(attempt) should keep trying")
+        }
+        reader.noteRangeIgnored()
+        #expect(reader.rangeIgnoredExceeded(), "ignored Range past the cap must give up")
+    }
+
+    @Test("a genuine ranged 206 at a nonzero offset revokes the verdict")
+    func honoredRangeResets() {
+        let reader = AVIOReader(url: URL(string: "https://example.com/x.mkv")!)
+        for _ in 0..<AVIOReader.rangeIgnoredMaxStreak { reader.noteRangeIgnored() }
+        reader.noteRangeHonored()
+        #expect(!reader.rangeIgnoredExceeded(), "a real 206 must clear the verdict")
     }
 }
