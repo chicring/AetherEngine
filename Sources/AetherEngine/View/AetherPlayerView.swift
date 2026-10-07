@@ -27,11 +27,12 @@ import SwiftUI
 /// can also change across sessions when consecutive sources dispatch to
 /// different paths.
 @MainActor
-public final class AetherPlayerView: PlatformBaseView {
+public final class AetherPlayerView: PlatformBaseView, HeldStillSurface {
 
     private var hostedLayer: CALayer?
     /// AE#711 follow-up: the picture held over an in-place item swap, above `hostedLayer`.
-    private var stillLayer: AVSampleBufferDisplayLayer?
+    private let presenter = HeldStillPresenter()
+    private var stillLayer: CALayer? { presenter.layer }
 
     /// Engine-internal. The engine this view was last bound to, so a dismantling surface can unbind
     /// from it synchronously and a second engine binding the view can take it over (AE#536).
@@ -87,7 +88,7 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         hostedLayer?.frame = bounds
-        stillLayer?.frame = bounds
+        presenter.layout(bounds)
         CATransaction.commit()
     }
 
@@ -139,71 +140,17 @@ public final class AetherPlayerView: PlatformBaseView {
 
     // MARK: - Held picture
 
-    /// Engine-internal. Lays `frame` over the hosted layer until `clearStill()`: `replaceCurrentItem`
-    /// drops an AVPlayerLayer to black until the next item's first frame, and an in-place rebuild
-    /// should not show that. A sample-buffer layer rather than `contents`, so an HDR frame is
-    /// presented through its colour attachments the way the software path presents every frame.
-    /// False when the frame cannot be wrapped for display; nothing is shown then.
+    /// Engine-internal. Lays `frame` over the hosted layer until `clearStill()`, see `HeldStillPresenter`.
     @discardableResult
     func showStill(_ frame: CVPixelBuffer, gravity: AVLayerVideoGravity, isHDR: Bool) -> Bool {
-        clearStill()
-        guard let sample = Self.stillSample(frame) else { return false }
-        let still = AVSampleBufferDisplayLayer()
-        still.videoGravity = gravity
-        if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
-            still.preferredDynamicRange = isHDR ? .high : .standard
-        } else {
-            #if os(iOS) || os(macOS)
-            still.wantsExtendedDynamicRangeContent = isHDR
-            #endif
-        }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        #if canImport(UIKit)
-        layer.addSublayer(still)
-        #elseif canImport(AppKit)
-        layer?.addSublayer(still)
-        #endif
-        still.frame = bounds
-        still.sampleBufferRenderer.enqueue(sample)
-        stillLayer = still
-        CATransaction.commit()
-        return true
+        let host: CALayer? = layer
+        return presenter.show(frame, gravity: gravity, isHDR: isHDR, on: host, bounds: bounds)
     }
 
     /// Engine-internal. Removes the held picture, if any. Idempotent.
-    func clearStill() {
-        guard let still = stillLayer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        still.removeFromSuperlayer()
-        CATransaction.commit()
-        still.sampleBufferRenderer.flush()
-        stillLayer = nil
-    }
+    func clearStill() { presenter.clear() }
 
-    var isHoldingStill: Bool { stillLayer != nil }
-
-    private static func stillSample(_ frame: CVPixelBuffer) -> CMSampleBuffer? {
-        var description: CMVideoFormatDescription?
-        guard CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescriptionOut: &description
-        ) == noErr, let description else { return nil }
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero,
-                                        decodeTimeStamp: .invalid)
-        var sample: CMSampleBuffer?
-        guard CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescription: description,
-            sampleTiming: &timing, sampleBufferOut: &sample
-        ) == noErr, let sample else { return nil }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
-           CFArrayGetCount(attachments) > 0 {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
-        return sample
-    }
+    var isHoldingStill: Bool { presenter.layer != nil }
 }
 
 // MARK: - Platform base view alias

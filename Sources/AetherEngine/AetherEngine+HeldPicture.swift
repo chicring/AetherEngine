@@ -18,23 +18,35 @@ extension AetherEngine {
     /// picture. Call after the pause and before `stopInternal`.
     func holdPictureAcrossItemSwap() async {
         releaseHeldPicture(reason: nil)
-        guard let host = nativeHost, let view = boundView else { return }
-        if let skip = Self.heldPictureSkipReason(
+        guard let host = nativeHost else { return }
+        // A bound still view first: a host that binds one renders the native path through AVKit, and
+        // its `AetherPlayerView`, if any, is not what is on screen.
+        let surface: (any HeldStillSurface)? = boundStillView ?? boundView
+        if let skip = surface == nil ? "no surface bound" : Self.heldPictureSkipReason(
             videoFormat: videoFormat, pictureInPictureActive: pictureInPictureActive,
             externalPlaybackActive: host.avPlayer.isExternalPlaybackActive) {
+            heldPictureLastSkip = skip
             EngineLog.emit("[AetherEngine] held picture: skipped (\(skip))", category: .engine)
             return
         }
+        guard let view = surface else { return }
+        heldPictureLastSkip = nil
         let generation = loadGeneration
         let heldSession = host.sessionID
         let started = ContinuousClock.now
         guard let frame = await host.captureDisplayedFrame() else {
+            heldPictureLastSkip = "no frame from the outgoing item"
             EngineLog.emit("[AetherEngine] held picture: no frame from the outgoing item", category: .engine)
             return
         }
-        guard loadGeneration == generation, nativeHost === host, boundView === view else { return }
+        guard loadGeneration == generation, nativeHost === host,
+              (boundStillView ?? boundView) === view else { return }
         let isHDR = videoFormat == .hdr10 || videoFormat == .hdr10Plus || videoFormat == .hlg
-        guard view.showStill(frame, gravity: videoGravity, isHDR: isHDR) else { return }
+        guard view.showStill(frame, gravity: videoGravity, isHDR: isHDR) else {
+            heldPictureLastSkip = "frame could not be wrapped for display"
+            EngineLog.emit("[AetherEngine] held picture: frame could not be wrapped for display", category: .engine)
+            return
+        }
         heldPictureView = view
         heldPictureShownAt = .now
         heldPictureToken &+= 1

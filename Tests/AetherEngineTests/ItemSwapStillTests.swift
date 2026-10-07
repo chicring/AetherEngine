@@ -179,6 +179,77 @@ struct ItemSwapStillTests {
         #expect(engine.heldPictureView == nil)
     }
 
+    /// A host shaped like Sodalite: AVKit renders the native path, no `AetherPlayerView` is bound,
+    /// and a still view is the only surface the engine has. Before it existed the hold returned
+    /// without a trace (device log 2026-10-07: no `held picture` line at all).
+    @Test("an AVKit host's still view carries the hold through the rebuild")
+    func stillViewCarriesTheHold() async throws {
+        let file = try await Self.fixtureURL()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let still = AetherStillView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        engine.bindStillView(still)
+        _ = try await engine.load(url: file)
+        let host = try #require(engine.nativeHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        let audioIndex = try #require(engine.activeAudioTrackIndex)
+
+        var held = false
+        let watcher = Task { @MainActor in
+            while !Task.isCancelled {
+                if still.isHoldingStill { held = true }
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        let failure = await engine.reloadWithAudioOverride(
+            url: file, audioStreamIndex: Int32(audioIndex), expectedGeneration: engine.loadGeneration)
+        #expect(failure == nil)
+        try await waitFor { !still.isHoldingStill }
+        watcher.cancel()
+
+        #expect(held)
+        #expect(engine.heldPictureLastSkip == nil)
+        #expect(engine.heldPictureLastRelease == "first frame of the next item")
+    }
+
+    @Test("with no surface bound the hold says so instead of returning silently")
+    func noSurfaceIsLogged() async throws {
+        let file = try await Self.fixtureURL()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(url: file)
+        let host = try #require(engine.nativeHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        engine.pause()
+        await engine.holdPictureAcrossItemSwap()
+        #expect(engine.heldPictureLastSkip == "no surface bound")
+        #expect(engine.heldPictureView == nil)
+    }
+
+    @Test("a bound still view wins over the player view, and unbinding it takes the picture down")
+    func stillViewWinsAndUnbindReleases() async throws {
+        let file = try await Self.fixtureURL()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        let still = AetherStillView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        engine.bind(view: view)
+        engine.bindStillView(still)
+        _ = try await engine.load(url: file)
+        let host = try #require(engine.nativeHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        engine.pause()
+        await engine.holdPictureAcrossItemSwap()
+        #expect(still.isHoldingStill)
+        #expect(!view.isHoldingStill)
+        engine.unbindStillView(still)
+        #expect(!still.isHoldingStill)
+        #expect(engine.heldPictureLastRelease == "still view unbound")
+    }
+
     @Test("Dolby Vision, PiP and external playback hold nothing")
     func skipReasons() {
         #expect(AetherEngine.heldPictureSkipReason(

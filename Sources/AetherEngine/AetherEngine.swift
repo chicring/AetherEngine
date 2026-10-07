@@ -1697,6 +1697,23 @@ public final class AetherEngine: ObservableObject {
         presentCurrentLayer()
     }
 
+    /// Bind the surface the engine holds the picture on across the item swap of an audio-track switch,
+    /// for a host that renders the native path through AVKit instead of `AetherPlayerView`. Without
+    /// one the engine holds it on the bound `AetherPlayerView`, and with neither nothing is held.
+    public func bindStillView(_ view: AetherStillView) {
+        if let previous = boundStillView, previous !== view, heldPictureView === previous {
+            releaseHeldPicture(reason: "still view replaced")
+        }
+        boundStillView = view
+    }
+
+    /// Unbind a still view. Idempotent; takes down a picture held on it.
+    public func unbindStillView(_ view: AetherStillView) {
+        guard boundStillView === view else { return }
+        if heldPictureView === view { releaseHeldPicture(reason: "still view unbound") }
+        boundStillView = nil
+    }
+
     /// Unbind a view. Idempotent. Unbinding the surface the layer is on detaches it and presents the
     /// layer on the most recently bound surface that is still alive, if any.
     public func unbind(view: AetherPlayerView) {
@@ -3462,7 +3479,10 @@ public final class AetherEngine: ObservableObject {
     private(set) var audioSelectionTask: Task<Void, Never>?
     /// AE#711 follow-up: the picture held over an in-place item swap. See `holdPictureAcrossItemSwap`.
     var heldPictureRelease: AnyCancellable?
-    weak var heldPictureView: AetherPlayerView?
+    weak var heldPictureView: (any HeldStillSurface)?
+    weak var boundStillView: AetherStillView?
+    /// Why the last hold showed nothing, for the log and the tests that pin it.
+    var heldPictureLastSkip: String?
     var heldPictureToken = 0
     var heldPictureShownAt: ContinuousClock.Instant?
     /// What took the last held picture down, for the log line and the tests that pin it.
