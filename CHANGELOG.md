@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Opt-in `LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` let hosts tune fast live admission for long-GOP sources without changing segment cuts or advertised holdback. Defaults preserve the existing minimum media and grace policies.
 
 ## [7.28.3] - 2026-10-07
 

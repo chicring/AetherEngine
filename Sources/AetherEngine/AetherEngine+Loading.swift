@@ -841,6 +841,8 @@ extension AetherEngine {
             // AE#195/#208: the session resolves the cut target and enables the bounded first-manifest
             // path only for the host's explicit fastZap profile.
             liveJoinProfile: loadedOptions.liveJoinProfile,
+            liveStartupGraceSeconds: loadedOptions.liveStartupGraceSeconds,
+            liveStartupSingleSegmentMinimumSeconds: loadedOptions.liveStartupSingleSegmentMinimumSeconds,
             blockingReloadOverride: loadedOptions.liveBlockingReload,
             liveCadenceObservation: liveCadenceObservation,
             liveClosedCadenceObservation: liveClosedCadenceObservation,
