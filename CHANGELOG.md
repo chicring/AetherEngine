@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Disposable source-backed snapshots accept a caller-supplied budget across opening, stream analysis, seek and decode, with cancellation and measured presentation timestamps.
 
 ## [7.28.3] - 2026-10-07
 

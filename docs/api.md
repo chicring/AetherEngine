@@ -1144,3 +1144,15 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
+
+
+### Bounded source-backed snapshots
+
+`FrameExtractor.boundedSnapshot(at:maxSize:limits:cancellation:)` uses caller-supplied
+`ProbeLimits` and `ProbeCancellation` across open, stream analysis, seek and decode.
+Use a fresh extractor: an already-open context is rejected, and the disposable
+context closes on completion. Cancellation interrupts a stalled HTTP header as
+well as packet reads and decoding. The `BoundedStillFrame` result contains an image
+and an optional measured `actualSeconds`; nil means no source PTS was available,
+not that the requested time was decoded. URL selection and budget policy remain
+the caller's responsibility. Ordinary snapshot/thumbnail extraction is unchanged.

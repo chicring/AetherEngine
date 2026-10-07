@@ -1,6 +1,17 @@
 import Foundation
 import CoreGraphics
 
+/// A bounded one-shot still. nil PTS means the source supplied no timestamp;
+/// callers must label the requested time rather than claim a measured one.
+// CGImage is immutable; all other stored properties are immutable Sendable values.
+public struct BoundedStillFrame: @unchecked Sendable {
+    public let image: CGImage
+    public let actualSeconds: Double?
+    public init(image: CGImage, actualSeconds: Double?) {
+        self.image = image; self.actualSeconds = actualSeconds
+    }
+}
+
 /// Produces still images from a media URL via an isolated FFmpeg decode context,
 /// separate from playback. Two modes share one decode core: `snapshot` (frame-accurate,
 /// full-res) and `thumbnail` (keyframe-snapped, low-res, fast). Lazy: context opens on
@@ -27,6 +38,7 @@ public actor FrameExtractor {
         func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
     }
     private var currentToken: CancelToken?
+    private var boundedCancellation: ProbeCancellation?
 
     /// Set by `shutdown()`. Once true, the extractor refuses further
     /// work instead of lazily reopening a closed context.
@@ -94,6 +106,44 @@ public actor FrameExtractor {
         await produce(at: seconds, mode: .snapshot, targetWidth: 0, maxSize: maxSize)
     }
 
+    /// Disposable source-backed preview with one budget spanning open, stream
+    /// analysis, seek and decode. The controlled reader counts every input byte,
+    /// the monotonic deadline interrupts I/O, and a late result is discarded.
+    /// Unlike snapshot(), this never uses a previously opened or cached context.
+    public func boundedSnapshot(at seconds: Double, maxSize: CGSize,
+                                limits: ProbeLimits, cancellation: ProbeCancellation) async -> BoundedStillFrame? {
+        guard !isShutDown, seconds.isFinite, !Task.isCancelled, !cancellation.isCancelled,
+              let control = try? ProbeControl(limits: limits, cancellation: cancellation) else { return nil }
+        currentToken?.cancel()
+        boundedCancellation?.cancel()
+        boundedCancellation = cancellation
+        let token = CancelToken(); currentToken = token
+        let context = self.context
+        let result = await withTaskCancellationHandler {
+            await runOnQueue { () -> BoundedStillFrame? in
+                // A previously opened demuxer was outside this budget. Reject
+                // it instead of letting its teardown extend this one-shot work.
+                guard !context.isOpen else { control.finish(); return nil }
+                defer { context.close(); control.finish() }
+                guard !token.isCancelled, !cancellation.isCancelled else { return nil }
+                do { try context.ensureOpen(control: control) } catch { return nil }
+                var actual: Double?
+                guard let image = context.decodeFrame(at: seconds, mode: .snapshot,
+                    targetWidth: 0, maxSize: maxSize,
+                    isCancelled: { token.isCancelled || cancellation.isCancelled || control.isStopped },
+                    reportDecodedTime: { actual = $0 }),
+                    !token.isCancelled, !cancellation.isCancelled else { return nil }
+                do { try control.complete() } catch { return nil }
+                return BoundedStillFrame(image: image, actualSeconds: actual)
+            }
+        } onCancel: {
+            token.cancel()
+            cancellation.cancel()
+        }
+        if boundedCancellation === cancellation { boundedCancellation = nil }
+        return !Task.isCancelled && !cancellation.isCancelled && !token.isCancelled ? result : nil
+    }
+
     /// Open the decode context ahead of the first request to hide cold-start latency
     /// (e.g. at the start of a scrub gesture).
     public func prewarm() async {
@@ -111,6 +161,8 @@ public actor FrameExtractor {
         idleTask?.cancel()
         isShutDown = true
         currentToken?.cancel()
+        boundedCancellation?.cancel()
+        boundedCancellation = nil
         cache.clear()
         let context = self.context
         await runOnQueue { context.close() }
@@ -133,6 +185,7 @@ public actor FrameExtractor {
             return nil
         }
         currentToken?.cancel()
+        boundedCancellation?.cancel()
         let token = CancelToken()
         currentToken = token
 
