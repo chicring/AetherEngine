@@ -15,6 +15,10 @@ the public-API contract.
 - Timestamped, cancellable resident previews return measured frame positions without opening a second source or seeking playback.
 - Disposable source-backed snapshots accept a caller-supplied budget across opening, stream analysis, seek and decode, with cancellation and measured presentation timestamps.
 
+### Fixed
+
+- The single-demuxer stream-copy live path recognizes exact source replay using timestamps and payload signatures, discarding duplicates only after both audio and video confirm the overlap. Uncertain candidates return to ordinary discontinuity handling.
+
 ## [7.29.0] - 2026-10-07
 
 ### Added
