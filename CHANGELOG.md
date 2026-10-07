@@ -19,6 +19,7 @@ the public-API contract.
 
 - Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
 - Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
+- **A remote disc image reports the bytes it pulls from the origin.** `LiveTelemetry.demuxerBytesFetched` read 0 for every custom-reader source, so a disc image played over HTTP showed no `origin` bytes and, on the software path, no `networkThroughputMbps`, while `HTTPDiscIOReader` pulled the title. The engine's own disc reader now counts the response bodies it receives and the extent map passes the count through; a host's own `IOReader` still reports 0. Measured on a 49.5 GB Blu-ray ISO served over HTTP: 0.0 MB across a 15 s `aetherctl play` before, 107.5 MB rising to 367.5 MB over 25 s after.
 
 ## [7.28.3] - 2026-10-07
 
