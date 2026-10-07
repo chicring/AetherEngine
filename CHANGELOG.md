@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- The single-demuxer stream-copy live path recognizes exact source replay using timestamps and payload signatures, discarding duplicates only after both audio and video confirm the overlap. Uncertain candidates return to ordinary discontinuity handling.
 
 ## [7.28.3] - 2026-10-07
 

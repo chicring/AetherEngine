@@ -526,3 +526,17 @@ The `aetherctl` CLI target (`Sources/aetherctl/`) is documented separately in [d
 | VideoToolbox | System | Native path video decode (HW where available, Apple's bundled SW dav1d on iOS / macOS) |
 | AVFoundation | System | AVPlayer + AVDisplayManager (native path); AVSampleBufferDisplayLayer + AVSampleBufferRenderSynchronizer (SW path) |
 | CoreMedia | System | Sample descriptions, format-description tagging, CMTimebase |
+
+
+### Exact overlap after a live source reconnect
+
+On the single-demuxer stream-copy path, rollback alone is never treated as proof
+of replay. A candidate packet must match an accepted packet's source DTS, PTS and
+compressed-payload SHA-256 signature. Candidate packets are buffered until both
+tracks have passed their previous frontier. A mismatch, read error, EOF or bounded
+history/payload limit forwards the pending packets to ordinary discontinuity
+handling. Bridged audio and separate side-audio sources are excluded.
+
+The cutter watchdog distinguishes an intentional overlap scan from a stuck cut
+while continuing to detect source starvation. No host API or resource policy is
+added; the guard and its packet history belong to the producer thread.
