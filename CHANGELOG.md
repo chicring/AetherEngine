@@ -13,6 +13,7 @@ the public-API contract.
 ### Added
 
 - Opt-in `LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` let hosts tune fast live admission for long-GOP sources without changing segment cuts or advertised holdback. Defaults preserve the existing minimum media and grace policies.
+- Native live display/seek time remains continuous through source timestamp resets. A stale item-range mirror may use already-played resident history, so early starts do not hide available rewind; return to live accepts a caller-selected offset. Queued resume clamps yield to newer seeks.
 
 ## [7.28.3] - 2026-10-07
 

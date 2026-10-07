@@ -1163,3 +1163,21 @@ The upstream first-serve latch remains unchanged. The optional real-media script
 `Scripts/test-long-gop-startup.sh` creates paced H.264/AAC MPEG-TS fixtures with
 long GOPs and exercises macOS AVPlayer startup, rewind and continued playback.
 Set `FFMPEG_BIN` to an FFmpeg executable when it is not on PATH.
+
+
+### Continuous live display time and return offsets
+
+Native loopback `clock.currentTime`, seek ranges, item placement and seek targets
+retain the session's initial timeline shift when an origin resets its timestamps.
+`clock.sourceTime` remains the presented frame's source PTS for subtitle cues;
+these clocks can intentionally differ after a reset. Live subtitle backfill uses
+elapsed session time while source-cue pruning follows the source clock.
+
+`seekToLiveEdge(offsetSeconds:)` accepts a caller-selected distance behind the usable
+edge and clamps to retained media. Its default is zero; negative/nonfinite offsets
+are treated as zero. `liveTargetDurationSeconds` exposes the measured served HLS
+target duration, and `currentItemLiveEdgeTime` exposes the native item's usable
+edge on the display axis. Both are optional when unavailable. Choosing a safety
+margin remains the host's responsibility. An old item-range mirror may admit only
+already-played contiguous resident history, never a prefetched future frontier.
+A delayed resume clamp cannot override a newer seek or load.

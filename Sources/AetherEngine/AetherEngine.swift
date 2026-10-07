@@ -194,9 +194,14 @@ public final class AetherEngine: ObservableObject {
     /// preventing a superseded seek from clobbering a newer one.
     private var seekGeneration: UInt64 = 0
 
-    /// #250: read-only view of the seek fence for the subtitle-resolution statement. Read-only on
-    /// purpose: only `seek(to:)` may move the counter, and a diagnostic must not be able to.
+    /// Read-only seek fence for diagnostics and queued resume work.
     var currentSeekGeneration: UInt64 { seekGeneration }
+
+    /// Every actual reposition, including a live-only edge seek, invalidates prior work.
+    func advanceSeekGeneration() -> UInt64 {
+        seekGeneration &+= 1
+        return seekGeneration
+    }
 
     /// Three independent seek-in-flight flags that isSeeking OR-s over. Programmatic and native scrub
     /// seeks are NOT mutually exclusive: a far programmatic seek triggers the same producer-restart as a
@@ -403,14 +408,20 @@ public final class AetherEngine: ObservableObject {
               let watchTarget = nativeScrubSeekTarget,
               let host = nativeHost else {
             // AE#270: the event's `target` is on the display axis, so its landing has to be too.
-            finishNativeScrubSeek(.landed(renderedTime: PresentationAxis.display(
-                sourcePTS: clock.sourceTime, origin: sourcePresentationOrigin)))
+            let renderedTime = isLive && videoRoute == .loopback
+                ? (nativeHost?.renderedTime ?? nativeClockSeconds) + liveSessionShiftSeconds
+                    + liveItemAxisOffsetSeconds
+                : PresentationAxis.display(sourcePTS: clock.sourceTime,
+                                           origin: sourcePresentationOrigin)
+            finishNativeScrubSeek(.landed(renderedTime: renderedTime))
             return
         }
         pendingScrubLanding = PendingScrubLanding(
             displayTarget: watchTarget,
-            playlistTarget: PresentationAxis.source(displayTime: watchTarget,
-                                                    origin: sourcePresentationOrigin) - playlistShiftSeconds,
+            playlistTarget: isLive && videoRoute == .loopback
+                ? watchTarget - liveSessionShiftSeconds - liveItemAxisOffsetSeconds
+                : PresentationAxis.source(displayTime: watchTarget,
+                                          origin: sourcePresentationOrigin) - playlistShiftSeconds,
             frozenRendered: host.renderedTime
         )
         // The watch runs on `$renderedTime`, which goes silent while AVPlayer waits to play, so the
@@ -447,10 +458,11 @@ public final class AetherEngine: ObservableObject {
         guard Self.nativeScrubLanded(rendered: rendered,
                                      target: watch.playlistTarget,
                                      frozen: watch.frozenRendered) else { return }
-        finishNativeScrubSeek(
-            .landed(renderedTime: PresentationAxis.display(sourcePTS: rendered + playlistShiftSeconds,
-                                                           origin: sourcePresentationOrigin))
-        )
+        let renderedTime = isLive && videoRoute == .loopback
+            ? rendered + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
+            : PresentationAxis.display(sourcePTS: rendered + playlistShiftSeconds,
+                                       origin: sourcePresentationOrigin)
+        finishNativeScrubSeek(.landed(renderedTime: renderedTime))
     }
 
     /// Armed when a coalesced scrub restart drains; retired when the picture reaches the target or the
@@ -1762,9 +1774,12 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// A playlist-axis second on the published display axis. Seam-aware like the clock fold: bytes
-    /// below a seam were muxed by the previous producer and keep folding with its shift.
+    /// A playlist-axis second on the published display axis. Live loopback uses the shift latched
+    /// at join; VOD follows its producer seams.
     func displaySeconds(forPlaylistSeconds seconds: Double) -> Double {
+        if isLive && videoRoute == .loopback {
+            return seconds + liveSessionShiftSeconds
+        }
         let shift = presentationAxis.shiftSeconds(atItemSeconds: seconds) ?? playlistShiftSeconds
         return PresentationAxis.display(sourcePTS: seconds + shift,
                                         origin: displayOrigin(forShift: shift))
@@ -1832,6 +1847,11 @@ public final class AetherEngine: ObservableObject {
 
     /// Native AVPlayer + AVPlayerLayer host. Non-nil between load and stop.
     var nativeHost: NativeAVPlayerHost?
+
+    /// Controlled host I/O boundary for integration witnesses. Production reads only the
+    /// existing KVO mirror, never AVPlayerItem's synchronous seekableTimeRanges getter.
+    var nativeSeekableEndReading: (() -> Double)?
+    var nativeItemSeekableEnd: Double { nativeSeekableEndReading?() ?? nativeHost?.seekableEnd ?? 0 }
 
     /// Combine subscriptions mirroring nativeHost's @Published into the engine. Cancelled in stopInternal.
     var nativeCancellables: Set<AnyCancellable> = []
@@ -1916,11 +1936,27 @@ public final class AetherEngine: ObservableObject {
     private(set) var customSourceIsSeekable = false
 
     /// Seconds the producer subtracted from source PTS so AVPlayer's raw clock sits at
-    /// `source_pts - playlistShiftSeconds`. The engine folds this back before publishing, so
-    /// currentTime/sourceTime always carry source PTS. Updated by HLSVideoEngine.onPlaylistShiftChanged
+    /// `source_pts - playlistShiftSeconds`. Source time folds this back for cue alignment; live
+    /// loopback currentTime uses `liveDisplayShiftSeconds` so PTS rollbacks cannot move its DVR axis.
+    /// Updated by HLSVideoEngine.onPlaylistShiftChanged
     /// on every producer init/restart (Matroska seek imprecision means the shift can differ per restart).
     /// 0 on SW/audio paths (no shift). See `nativeClockSeconds` for the pre-fold raw value.
     @Published public internal(set) var playlistShiftSeconds: Double = 0
+
+    /// Live loopback segments keep increasing their item timestamps across a source PTS rollback.
+    /// Keep the first shift as the session's display axis; later shifts still describe the source
+    /// PTS of rendered frames, but must never move the DVR rail or its seek targets.
+    var liveDisplayShiftSeconds: Double?
+
+    var liveSessionShiftSeconds: Double {
+        isLive && videoRoute == .loopback ? (liveDisplayShiftSeconds ?? playlistShiftSeconds)
+            : playlistShiftSeconds
+    }
+
+    var liveSessionSeekAxis: PresentationAxisMap {
+        isLive && videoRoute == .loopback
+            ? .anchored(shiftSeconds: liveSessionShiftSeconds) : presentationAxis
+    }
 
     /// Raw AVPlayer clock (source_pts - playlistShiftSeconds) before shift fold. Held so
     /// onPlaylistShiftChanged can re-derive currentTime immediately on shift change. Unused on SW/audio (shift 0).
@@ -1972,11 +2008,14 @@ public final class AetherEngine: ObservableObject {
         activeProducerShiftSeconds - playlistShiftSeconds
     }
 
-    /// `currentTime - sourceTime`. Positive while a native seek is in flight: currentTime holds the seek target
-    /// while sourceTime tracks AVPlayer's rendered position. This is the AetherEngine#49 divergence measured
-    /// by rrgomes on-device. Distinct from `frameAhead` (producer-shift fold). Diagnostics only.
+    /// Seek target ahead of the rendered position, on the same display axis. Source PTS can roll
+    /// backward on live loopback while the item axis continues, so compare item time on that route.
     public var clockLeadSeconds: Double {
-        clock.currentTime - clock.sourceTime
+        if isLive && videoRoute == .loopback {
+            return clock.currentTime - (renderedPositionMirror.get() + liveSessionShiftSeconds
+                                        + liveItemAxisOffsetSeconds)
+        }
+        return clock.currentTime - clock.sourceTime
     }
 
     /// Monotonic load/stop generation. Bumped by every stopInternal; captured after teardown; re-checked at
@@ -3077,8 +3116,8 @@ public final class AetherEngine: ObservableObject {
         // the tag, and it is the same seek it always was.
         var didArmPlacement = false
         if isLive, let rejoinPosition, let session = nativeVideoSession {
-            let outputSeconds = presentationAxis.itemSeconds(forSourceSeconds: rejoinPosition)
-                ?? (rejoinPosition - playlistShiftSeconds)
+            let outputSeconds = liveSessionSeekAxis.itemSeconds(forSourceSeconds: rejoinPosition)
+                ?? (rejoinPosition - liveSessionShiftSeconds)
             if let armed = session.armLiveRejoinStart(atOutputSeconds: outputSeconds) {
                 didArmPlacement = true
                 EngineLog.emit(
@@ -5468,13 +5507,16 @@ public final class AetherEngine: ObservableObject {
         let liveLanding: (sessionTarget: Double, clockTarget: Double)? = isLive
             ? liveWindow.map {
                 Self.liveSeekLanding(requested: seconds, window: $0,
-                                     itemEnd: nativeHost?.seekableEnd ?? 0,
-                                     shift: playlistShiftSeconds,
-                                     axis: presentationAxis,
+                                     itemEnd: nativeItemSeekableEnd,
+                                     shift: liveSessionShiftSeconds,
+                                     axis: liveSessionSeekAxis,
                                      origin: origin,
-                                     residentRange: origin == .liveRejoin
+                                     residentRange: origin == .liveRejoin || videoRoute == .loopback
                                         ? residentLiveRangeSessionSeconds() : nil,
-                                     itemAxisOffset: liveItemAxisOffsetSeconds)
+                                     itemAxisOffset: liveItemAxisOffsetSeconds,
+                                     nativePlayedTime: videoRoute == .loopback
+                                        && loadedOptions.dvrWindowSeconds != nil
+                                            ? currentTime : nil)
               }
             : nil
         var target: Double = isLive
@@ -5500,7 +5542,7 @@ public final class AetherEngine: ObservableObject {
             let resident = residentLiveRangeSessionSeconds()
             let held = abs(target - seconds) < 0.5
             let itemRange = nativeHost.map {
-                "\(String(format: "%.2f", $0.seekableStart + playlistShiftSeconds))..\(String(format: "%.2f", $0.seekableEnd + playlistShiftSeconds))s"
+                "\(String(format: "%.2f", $0.seekableStart + liveSessionShiftSeconds + liveItemAxisOffsetSeconds))..\(String(format: "%.2f", $0.seekableEnd + liveSessionShiftSeconds + liveItemAxisOffsetSeconds))s"
             } ?? "no range"
             EngineLog.emit(
                 "[AetherEngine] #446 rejoin to \(String(format: "%.2f", seconds))s"
@@ -5519,8 +5561,7 @@ public final class AetherEngine: ObservableObject {
         state = .seeking
         // Span isSeeking across the real landing, not just the optimistic .playing flip (#38).
         // Generation guard at each finalize point prevents a superseded seek from clearing it.
-        seekGeneration &+= 1
-        let seekGen = seekGeneration
+        let seekGen = advanceSeekGeneration()
         // A stash resolving into this seek hands its window over without a gap in `isSeeking`: the
         // deferred flag clears in the same recompute that sets the programmatic one.
         closeSeekTicket(&deferredSeekTicket, with: .superseded)
@@ -5566,13 +5607,12 @@ public final class AetherEngine: ObservableObject {
                 closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: target))
                 return
             }
-            // AE#446 round 3: the conversion is the seam-aware one, decided in `liveSeekLanding`
-            // from the same sample the clamp above used. The edge-delta form it replaces read the
-            // published edge and the item's clock as if they were one state, which they stop being
-            // at exactly the moments a rejoin runs in.
-            let clockTarget = liveLanding?.clockTarget ?? max(0, target - playlistShiftSeconds)
+            // Convert the sampled session target to the item clock. Live loopback uses its stable
+            // session axis so a source PTS rollback cannot name a future, nonexistent item time.
+            let clockTarget = liveLanding?.clockTarget ?? max(0, target - liveSessionShiftSeconds)
             EngineLog.emit("[AetherEngine] live seek target=\(target) clockTarget=\(clockTarget) "
-                           + "seekableEnd=\(nativeHost?.seekableEnd ?? 0) shift=\(playlistShiftSeconds) "
+                           + "seekableEnd=\(nativeItemSeekableEnd) sessionShift=\(liveSessionShiftSeconds) "
+                           + "sourceShift=\(playlistShiftSeconds) "
                            + "publishedEdge=\(liveWindow?.edgeTime ?? 0)", category: .engine)
             // Publish target up front to hold the scrub clock while the host suppresses stale pre-seek reads.
             // Only currentTime takes the optimistic target; sourceTime stays on the rendered frame (#49).
@@ -5582,7 +5622,6 @@ public final class AetherEngine: ObservableObject {
             guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
             nativeClockSeconds = clockTarget
             clock.currentTime = target
-            clock.sourceTime = target
             // publishLiveWindow on the next tick recomputes behindLiveSeconds.
             if let nativeHost {
                 reconcileNativeSeekTransport(host: nativeHost, isStarved: false)
@@ -7297,6 +7336,7 @@ public final class AetherEngine: ObservableObject {
         activeAudioDecoder = nil
         lastDetectedVideoCodec = AV_CODEC_ID_NONE
         playlistShiftSeconds = 0
+        liveDisplayShiftSeconds = nil
         // AE#105 / AE#270: the display origin belongs to the session that published it. Clearing it here
         // rather than only in stop() keeps a load that reuses the engine (the common path: load() runs
         // stopInternal itself) from folding the previous source's PTS origin into the new one's clock.

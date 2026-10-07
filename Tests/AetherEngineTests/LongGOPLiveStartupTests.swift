@@ -63,24 +63,23 @@ struct LongGOPLiveStartupTests {
         print("LONG_GOP=\(gopSeconds) JOIN_SECONDS=\(joined)")
         for line in log.matching("first live manifest") { print(line) }
         #expect(joined < .seconds(7), "a second full GOP must not be required after a playable first GOP")
-        // Admission controls first picture only. AVPlayer's DVR range may be published later;
-        // exercise rewind after playback has advanced and the native range becomes available.
+        let seekable = try await waitFor(upTo: .seconds(2)) {
+            guard let range = engine.seekableLiveRange else { return false }
+            return range.upperBound - range.lowerBound >= 1
+        }
+        #expect(seekable, "an advancing played frontier must not wait for a second long GOP")
+        print("LONG_GOP_SEEKABLE_SECONDS=\(start.duration(to: .now))")
         let initial = engine.currentTime
         try await waitFor { engine.currentTime - initial > 10 || engine.errorInfo != nil }
         print("LONG_GOP_ADVANCE=\(engine.currentTime - initial) state=\(engine.state)")
         #expect(engine.videoRoute == .loopback)
         #expect(engine.currentTime - initial > 10)
         #expect(engine.currentAVPlayer?.currentItem?.error == nil)
-        try await waitFor {
-            guard let range = engine.seekableLiveRange else { return false }
-            return range.upperBound - range.lowerBound >= 1
-        }
         let beforeRewind = engine.currentTime
         let range = try #require(engine.seekableLiveRange)
         await engine.seek(to: max(range.lowerBound, beforeRewind - 3))
         #expect(engine.currentTime < beforeRewind - 1)
-        let liveRange = try #require(engine.seekableLiveRange)
-        await engine.seek(to: max(liveRange.lowerBound, liveRange.upperBound - 5))
+        await engine.seekToLiveEdge(offsetSeconds: 5)
         let afterReturn = engine.currentTime
         try await waitFor { engine.currentTime > afterReturn + 1 || engine.errorInfo != nil }
         #expect(engine.currentTime > afterReturn + 1)

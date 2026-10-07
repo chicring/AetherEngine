@@ -36,13 +36,15 @@ extension AetherEngine {
         if pendingRecoverySeekClockTarget == nil {
             // AE#105: fold the disc's clip-0 STC base back out so the published playhead sits on the same
             // 0-based axis as the MPLS duration (origin 0 for normal/live -> no-op).
-            clock.currentTime = PresentationAxis.display(
-                sourcePTS: value + playlistShiftSeconds + liveItemAxisOffsetSeconds,
-                origin: displayOrigin(forShift: playlistShiftSeconds))
+            clock.currentTime = isLive && videoRoute == .loopback
+                ? value + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
+                : PresentationAxis.display(
+                    sourcePTS: value + playlistShiftSeconds + liveItemAxisOffsetSeconds,
+                    origin: displayOrigin(forShift: playlistShiftSeconds))
         }
-        // Live edge must fold with the same playlistShiftSeconds as the playhead; opposite sign would make behindLiveSeconds meaningless.
+        // The live edge and playhead use the same stable session shift across source PTS rebases.
         if isLive {
-            publishLiveWindow(edgeSessionTime: (nativeHost?.seekableEnd ?? 0) + playlistShiftSeconds
+            publishLiveWindow(edgeSessionTime: nativeItemSeekableEnd + liveSessionShiftSeconds
                               + liveItemAxisOffsetSeconds)
         }
     }
@@ -906,6 +908,9 @@ extension AetherEngine {
                 // buffer, and has to keep folding with the previous shift. Collapsing the history here (as this
                 // did before) hands every consumer the new shift for old-epoch bytes.
                 if self.isLive {
+                    if self.liveDisplayShiftSeconds == nil {
+                        self.liveDisplayShiftSeconds = seconds
+                    }
                     self.setPresentationAxis(.anchored(shiftSeconds: seconds))
                 } else {
                     var map = self.presentationAxis
@@ -923,9 +928,12 @@ extension AetherEngine {
                 // AE#422: read off-main before building the line (see `avPlayerBufferAheadSeconds`).
                 let avBufAhead = await self.avPlayerBufferAheadSeconds()
                 // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
-                self.clock.currentTime = PresentationAxis.display(
-                    sourcePTS: self.nativeClockSeconds + activeShift,
-                    origin: self.displayOrigin(forShift: activeShift))
+                self.clock.currentTime = self.isLive && self.videoRoute == .loopback
+                    ? self.nativeClockSeconds + self.liveSessionShiftSeconds
+                        + self.liveItemAxisOffsetSeconds
+                    : PresentationAxis.display(
+                        sourcePTS: self.nativeClockSeconds + activeShift,
+                        origin: self.displayOrigin(forShift: activeShift))
                 // sourceTime re-folds on next $renderedTime tick; keeping it there tracks the rendered picture, not the optimistic clock (#49).
                 EngineLog.emit(
                     "[AetherEngine] VOD shift published: \(String(format: "%.3f", seconds))s "
@@ -953,9 +961,7 @@ extension AetherEngine {
                 guard let self = self else { return }
                 // Fold playlist-axis segment time onto the published display axis (#38); the origin keeps a disc
                 // scrub target 0-based like currentTime (0 off disc). nil clears without disturbing the last value.
-                let target = playlistTime.map {
-                    PresentationAxis.display(sourcePTS: $0 + self.playlistShiftSeconds, origin: self.sourcePresentationOrigin)
-                }
+                let target = playlistTime.map { self.displaySeconds(forPlaylistSeconds: $0) }
                 self.setNativeScrubSeek(inFlight: inFlight, target: target)
                 // #112: a producer restart settles here (out-of-range fetch on a fast-forward, or a wedge reconcile)
                 // without going through seek()'s landing, so the embedded PGS side reader is never re-armed. Give it
@@ -1017,7 +1023,8 @@ extension AetherEngine {
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
-                // Program boundary: producer rebased but AVPlayer is still rendering old program (buffer + holdback). Record the seam so $currentTime resolves the active shift from history, keeping currentTime/sourceTime behind what is on screen. Backward DVR seeks re-apply the pre-seam shift. Seams append in output-timeline order (continuation dts is monotonic).
+                // Program boundary: keep the source-PTS seam for rendered cues while the item clock
+                // continues forward. The live display/seek axis stays on its initial shift.
                 var map = self.presentationAxis
                 // Cap inside appendSeam; losing the oldest only reduces fidelity for DVR positions past 60+ program boundaries.
                 map.appendSeam(shiftSeconds: seconds, activatingAtItemSeconds: seamOutputSeconds)
@@ -1423,8 +1430,10 @@ extension AetherEngine {
                 // rendered frame. Drawn against the 0-based duration, so map onto the display axis to keep
                 // the buffer bar aligned with currentTime (0 off disc). AE#105, #207 follow-up.
                 // See docs issue #33 follow-up.
-                let renderedDisplay = PresentationAxis.display(
-                    sourcePTS: value + shift, origin: self.displayOrigin(forShift: shift))
+                let renderedDisplay = self.isLive && self.videoRoute == .loopback
+                    ? value + self.liveSessionShiftSeconds + self.liveItemAxisOffsetSeconds
+                    : PresentationAxis.display(
+                        sourcePTS: value + shift, origin: self.displayOrigin(forShift: shift))
                 let readAhead = self.nativeVideoSession?
                     .contiguousForwardReadAheadSeconds(playlistSeconds: value) ?? 0
                 self.clock.bufferedPosition = renderedDisplay + max(0, readAhead)
