@@ -10,17 +10,23 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.29.0] - 2026-10-07
+
 ### Added
 
-- `setSoftwareSubtitleDelay(_:)` applies a persistent, caller-selected subtitle offset to both channels in software PiP without changing the playback clock. Native renditions remain unchanged.
-- `needsForegroundVideoRestore` exposes actual background video teardown so a host can rebuild through the existing reload API before resuming.
+- **An audio-track switch holds the picture instead of flashing black.** Every switch rebuilds the session, and every rebuild showed black until the new pipeline's first frame. The outgoing frame is now read and laid over the video until then. Native path: #711 keeps the old item mounted while the source reopens, but `replaceCurrentItem` still blanks the player layer until the new item decodes, so the frame is read from the paused item through an `AVPlayerItemVideoOutput` (about 20 ms paused). Software path: the rebuild replaces host and layer, and the old host's `stop()` flushed its layer for the whole startup of the new one; the frame is read back from the renderer (`displayedPixelBuffer`, or the newest frame enqueued). Dolby Vision with a displayable base layer (8.x, 10.1+) holds that base layer as HDR. Profile 5 and AV1 Profile 10 have none, so their frame is decoded from the resident segment through the RPU reshaping the scrub stills already use, frame-accurately and 960 wide (measured on an M1 Pro, Profile 5 UHD: 1.53 s at 1920 wide, 0.40 s at 960, the reshaping runs per pixel on the CPU); the switch waits up to 3 s for it with the outgoing picture paused. Nothing is held in PiP or on external playback. Verified on an Apple TV 4K for native H.264; the software path and Dolby Vision are covered by tests, Profile 5 and 8.1 against Dolby's own clips.
+- **`AetherStillView`, `bindStillView(_:)`, `unbindStillView(_:)`** for a host that renders the native path through AVKit rather than `AetherPlayerView` and so gave the engine no surface to hold the picture on. Transparent and input-free; place it above the video and below the host's chrome (for instance at the top of `AVPlayerViewController.contentOverlayView`) and set its `videoGravity` to the host player's fill.
+- **`setSoftwareSubtitleDelay(_:)` and `softwareSubtitleDelaySeconds` (#709).** A media-time offset for both subtitle channels composited into software PiP frames, persistent across loads, taking effect on the next frame without a seek or a clock change. Native renditions, native PiP and AirPlay are not shifted. Contributed by yucelokan.
+- **`needsForegroundVideoRestore` (#710).** True once background policy has actually released the video item, so a host restores through `reloadAtCurrentPosition(applying:)` before playing instead of inferring a teardown from `state` and `playbackBackend`. Contributed by yucelokan.
 
 ### Fixed
 
-- Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
-- Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
-- An audio-track switch on the native path holds the last picture across the item swap instead of dropping to black: `replaceCurrentItem` blanks the player layer until the new item's first frame, so the outgoing frame is read from the paused item and laid over the layer until then, on the bound `AetherPlayerView` or, for a host that renders the native path through AVKit, on a new transparent `AetherStillView` it binds with `bindStillView(_:)`. The software path holds its renderer's last picture the same way (`AVSampleBufferVideoRenderer.displayedPixelBuffer`, or the newest frame enqueued). Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10) cannot come from the output, which vends the base layer; it is decoded frame-accurately from the resident segment through the RPU reshaping the scrub stills already use, at 960 wide (1.5 s at 1920 against 0.4 s at 960 on an M1 Pro, the reshaping runs per pixel on the CPU), and the switch waits up to 3 s for it with the outgoing picture paused. Other Dolby Vision profiles hold their HDR10, HLG or SDR base layer. Nothing is held in PiP or on external playback.
-- A `play()` or `pause()` that arrives while any session-preserving rebuild runs (an audio or disc-title switch, `reloadAtCurrentPosition()`, an engine-raised rebuild) now decides the transport it comes back in; before, only an audio pick honoured it and the others came back in the state they started from.
+- **Rapid audio-track picks coalesce into one rebuild at a time (#711).** A second pick during a rebuild used to race the first one's generation check. A pick back to the active track now costs nothing, and `stop()` or a new `load` drops what is queued. Contributed by yucelokan.
+- **A play or pause pressed during any session rebuild decides how it comes back.** An audio or disc-title switch, `reloadAtCurrentPosition()` or an engine-raised rebuild came back in the transport state it started from, so a pause pressed while it ran was lost. `play()` and `pause()` now write the transport the rebuild settles from, `transportIntentUnderReconstruction` (#464 round 3), while one runs. #711 had added this for audio picks in a field of its own; the two are one now.
+- **Video routing asks for the AV1 hardware decoder only for AV1 sources (#708).** It registered the supplemental decoder on every first load, H.264 and HEVC included. Contributed by yucelokan.
+- **The #243 fetch-tally test tolerates a parallel session start.** A session start zeroes the process-wide tally, so an engine test loading in parallel failed it on CI. Test-only.
 
 ## [7.28.3] - 2026-10-07
 
