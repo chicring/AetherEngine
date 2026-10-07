@@ -1677,7 +1677,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// The surface the layer is presented on: the most recently bound one that is still alive.
-    private var boundView: AetherPlayerView? {
+    var boundView: AetherPlayerView? {
         boundSurfaces.last { $0.view != nil }?.view
     }
 
@@ -1695,6 +1695,23 @@ public final class AetherEngine: ObservableObject {
         boundSurfaces.removeAll { $0.view == nil || $0.view === view }
         boundSurfaces.append(BoundSurface(view: view))
         presentCurrentLayer()
+    }
+
+    /// Bind the surface the engine holds the picture on across the item swap of an audio-track switch,
+    /// for a host that renders the native path through AVKit instead of `AetherPlayerView`. Without
+    /// one the engine holds it on the bound `AetherPlayerView`, and with neither nothing is held.
+    public func bindStillView(_ view: AetherStillView) {
+        if let previous = boundStillView, previous !== view, heldPictureView === previous {
+            releaseHeldPicture(reason: "still view replaced")
+        }
+        boundStillView = view
+    }
+
+    /// Unbind a still view. Idempotent; takes down a picture held on it.
+    public func unbindStillView(_ view: AetherStillView) {
+        guard boundStillView === view else { return }
+        if heldPictureView === view { releaseHeldPicture(reason: "still view unbound") }
+        boundStillView = nil
     }
 
     /// Unbind a view. Idempotent. Unbinding the surface the layer is on detaches it and presents the
@@ -3460,6 +3477,20 @@ public final class AetherEngine: ObservableObject {
     /// `sessionRebuildResumesPlaying`. See `rebuildResumesPlaying`.
     var transportIntentUnderReconstruction: Bool?
     private(set) var audioSelectionTask: Task<Void, Never>?
+    /// AE#711 follow-up: the picture held over an in-place item swap. See `holdPictureAcrossItemSwap`.
+    var heldPictureRelease: AnyCancellable?
+    weak var heldPictureView: (any HeldStillSurface)?
+    weak var boundStillView: AetherStillView?
+    /// Why the last hold showed nothing, for the log and the tests that pin it.
+    var heldPictureLastSkip: String?
+    var heldPictureToken = 0
+    var heldPictureShownAt: ContinuousClock.Instant?
+    /// What took the last held picture down, for the log line and the tests that pin it.
+    var heldPictureLastRelease: String?
+    /// A hold over a software rebuild waits for `loadSoftware` to install the host it comes down on.
+    var heldPictureAwaitsSoftwareHost = false
+    /// Which route the last held picture came from, for the log line and the tests that pin it.
+    var heldPictureLastRoute: String?
     private var pendingAudioSelection: Int?
     private var audioSelectionEpoch = UUID()
 
@@ -3973,6 +4004,7 @@ public final class AetherEngine: ObservableObject {
         // has already unloaded the item, so there is nothing left to hand over in place.
         let handOverInPlace = consumeInPlaceItemHandoverRequest(priorBackendWasNative: priorBackendWasNative)
         cancelPendingAudioSelection()
+        releaseHeldPicture(reason: "new load")
         pendingInPlaceItemHandover = handOverInPlace
         // #128 follow-up: preserve the previous session's display criteria across the load seam. Nil-ing it
         // here bounces the panel through SDR before apply() re-negotiates the same mode on video->video
@@ -6219,6 +6251,7 @@ public final class AetherEngine: ObservableObject {
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         cancelPendingAudioSelection()
+        releaseHeldPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false
         stopInternal(resetDisplayCriteria: resetDisplayCriteria,
                      finalTeardown: finalTeardown ?? resetDisplayCriteria)

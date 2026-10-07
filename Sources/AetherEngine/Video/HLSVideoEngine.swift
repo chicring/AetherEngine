@@ -2513,6 +2513,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let segmentIndex: Int
         let initData: Data
         let segmentURL: URL
+        /// Where the segment starts on the playlist axis `scrubThumbnailSource` was asked on.
+        var startSeconds: Double = 0
 
         func makeReader() -> DataIOReader? {
             guard let segment = try? Data(contentsOf: segmentURL, options: .alwaysMapped) else { return nil }
@@ -2527,7 +2529,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard let prov else { return nil }
         guard let seg = prov.thumbnailSegment(atSeconds: seconds),
               let initData = prov.peekInitSegment() else { return nil }
-        return ScrubThumbnailSource(segmentIndex: seg.index, initData: initData, segmentURL: seg.fileURL)
+        return ScrubThumbnailSource(segmentIndex: seg.index, initData: initData, segmentURL: seg.fileURL,
+                                    startSeconds: seg.startSeconds)
     }
 
     public func stop() {

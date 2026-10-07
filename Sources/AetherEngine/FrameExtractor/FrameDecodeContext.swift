@@ -382,6 +382,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         mode: FrameMode,
         targetWidth: Int,
         maxSize: CGSize?,
+        afterFirstFrame offsetSeconds: Double? = nil,
         isCancelled: () -> Bool
     ) -> CGImage? {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
@@ -415,7 +416,15 @@ final class FrameDecodeContext: @unchecked Sendable {
         demuxer.seek(to: seekSeconds)
 
         // A target the stream's own time base cannot hold is no position in it (audit BIT-105).
-        guard let targetPTS = Demuxer.ticks(forSeconds: seekSeconds, timeBase: timeBase) else { return nil }
+        guard var targetPTS = Demuxer.ticks(forSeconds: seekSeconds, timeBase: timeBase) else { return nil }
+        // AE#711 follow-up: a target measured from the first frame decoded rather than on the stream's
+        // axis, for a cache segment whose fMP4 tfdt may be absolute or zero-based (after a producer
+        // restart). Fixed on the first frame that carries a PTS.
+        var offsetTicks: Int64?
+        if let offsetSeconds {
+            guard let ticks = Demuxer.ticks(forSeconds: max(0, offsetSeconds), timeBase: timeBase) else { return nil }
+            offsetTicks = ticks
+        }
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard frame != nil else { return nil }
@@ -533,6 +542,10 @@ final class FrameDecodeContext: @unchecked Sendable {
                 // Skip frames before targetPTS for frame-accuracy. No-PTS frames
                 // (AV_NOPTS_VALUE == Int64.min) are accepted, so PTS-less streams
                 // degrade to the first frame after the seek.
+                if let ticks = offsetTicks, f.pointee.pts != Int64.min {
+                    targetPTS = f.pointee.pts + ticks
+                    offsetTicks = nil
+                }
                 if mode == .snapshot,
                    f.pointee.pts != Int64.min,
                    f.pointee.pts < targetPTS {
@@ -551,6 +564,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                         mode: mode,
                         targetWidth: targetWidth,
                         maxSize: maxSize,
+                        afterFirstFrame: offsetSeconds,
                         isCancelled: isCancelled)
                 }
                 return image

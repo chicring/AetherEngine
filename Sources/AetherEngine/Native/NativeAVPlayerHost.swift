@@ -289,7 +289,7 @@ final class NativeAVPlayerHost {
 
     /// Monotonic counter tags every load() invocation so multi-attempt sessions produce distinguishable log lines.
     private static var nextSessionID: Int = 0
-    private var sessionID: Int = 0
+    private(set) var sessionID: Int = 0
 
     /// AE#446 round 4: which item this host currently holds. Bumped by every `load`/`swapItem`, so a
     /// caller that latches something about the item can tell when the item under it changed.
@@ -1788,6 +1788,32 @@ final class NativeAVPlayerHost {
     func pause() {
         playIntent = false
         avPlayer.pause()
+    }
+
+    /// AE#711 follow-up: the picture on screen now, for the engine to hold over the gap an in-place
+    /// swap opens: `replaceCurrentItem` blanks this layer until the next item's first frame, however
+    /// long the old item was kept. An output belongs to one item and is only attached for the read.
+    /// nil when no frame arrives inside `timeout`, which the caller treats as "nothing to hold".
+    func captureDisplayedFrame(timeout: Duration = .milliseconds(500)) async -> CVPixelBuffer? {
+        guard let item = playerItem else { return nil }
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
+        ])
+        item.add(output)
+        defer { item.remove(output) }
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        repeat {
+            // A playing item vends at the host clock, a paused one only at the time it holds.
+            let itemTime = avPlayer.rate == 0 ? item.currentTime()
+                : output.itemTime(forHostTime: CACurrentMediaTime())
+            if itemTime.isNumeric,
+               let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {
+                return buffer
+            }
+            try? await Task.sleep(for: .milliseconds(8))
+        } while clock.now < deadline && playerItem === item
+        return nil
     }
 
     /// Synthesize organic end-of-media when the engine determines a tail park is video-exhaustion

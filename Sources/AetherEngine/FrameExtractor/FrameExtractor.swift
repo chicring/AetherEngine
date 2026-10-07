@@ -94,6 +94,25 @@ public actor FrameExtractor {
         await produce(at: seconds, mode: .snapshot, targetWidth: 0, maxSize: maxSize)
     }
 
+    /// AE#711 follow-up: the frame `offset` seconds after the first one this source decodes, for a
+    /// one-segment cache source whose timestamps may sit on either axis. Frame-accurate like
+    /// `snapshot`, uncached (the cache keys on stream time), and with the same Dolby Vision and HDR
+    /// conversion as every still.
+    func snapshot(afterFirstFrameBy offset: Double, maxSize: CGSize? = nil) async -> CGImage? {
+        guard !isShutDown, offset.isFinite else { return nil }
+        let context = self.context
+        let image = await runOnQueue { () -> CGImage? in
+            do { try context.ensureOpen() } catch {
+                EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback)
+                return nil
+            }
+            return context.decodeFrame(at: 0, mode: .snapshot, targetWidth: 0, maxSize: maxSize,
+                                       afterFirstFrame: offset, isCancelled: { false })
+        }
+        scheduleIdleClose()
+        return image
+    }
+
     /// Open the decode context ahead of the first request to hide cold-start latency
     /// (e.g. at the start of a scrub gesture).
     public func prewarm() async {

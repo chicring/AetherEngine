@@ -111,6 +111,13 @@ final class SoftwarePlaybackHost {
     /// point it uses for `AVPlayerLayer`.
     var displayLayer: AVSampleBufferDisplayLayer { renderer.displayLayer }
 
+    /// AE#711 follow-up: the picture on screen now, read back from the renderer before a rebuild's
+    /// `stop()` flushes it, so the engine can hold it over the new host's startup. Falls back to the
+    /// newest frame enqueued, which a layer that is not on screen is all there is of.
+    func displayedFrame() -> CVPixelBuffer? {
+        renderer.displayLayer.sampleBufferRenderer.displayedPixelBuffer() ?? renderer.lastEnqueuedFrame
+    }
+
     /// SW-PiP Phase C: engine-fed cue mirror + PiP gate for the renderer's frame compositor.
     func updateSubtitleCompositor(cues: [SubtitleCue], enabled: Bool, delaySeconds: Double) {
         renderer.subtitleCompositor.update(cues: cues, enabled: enabled, delaySeconds: delaySeconds)
