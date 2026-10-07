@@ -744,6 +744,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// what actually replaces the segments and the item holding them.
     public var audioDelaySeconds: Double = 0
 
+    /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
+    /// session builds. Set before `start()`.
+    var servesSegmentsProgressively = false
+
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
     private let restartGate = NSLock()
@@ -1954,6 +1958,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             sourceBitrate: sourceBitrate,
             audioLanguage: servedAudioLanguage,
             isLive: isLiveSession,
+            servesSegmentsProgressively: servesSegmentsProgressively,
             // Sequential archives: playlist grows with the producer's REAL cut durations. The
             // static plan's uniform EXTINF lies whenever the archive's GOP cadence does not
             // divide the cut target (1.92 s GOPs vs a 4.0 s plan put every segment's media up
@@ -2800,6 +2805,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // AE#464: read here rather than pushed, so every producer this session builds (seek
             // restart, live reopen, #99 revive) cuts with the offset currently in force.
             audioDelaySeconds: audioDelaySeconds,
+            servesSegmentsProgressively: servesSegmentsProgressively,
             epoch: producerEpoch
         )
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers

@@ -17,6 +17,11 @@ protocol HLSSegmentProvider: AnyObject {
     /// Default forwards to `mediaSegment(at:)` without ever signalling.
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
 
+    /// As above, but a VOD segment that is still being written may come back as a reader over it,
+    /// which the server sends chunk by chunk (`LoadOptions.progressiveSegmentDelivery`). Default
+    /// wraps `mediaSegment(at:onSlow:)`.
+    func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
+
     /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
     /// Must name a file that exists: the server stats and opens it afterwards, and a URL whose file
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
@@ -27,6 +32,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// The axis is a statement about bytes in AVPlayer's timeline, so a placement composed from a
     /// request needs to know whether that request was answered. Default ignores it.
     func didServeMediaSegment(index: Int, delivered: Bool)
+
+    /// One more chunk of a progressively delivered segment left the server: the request-counting
+    /// wedge watchdog's evidence that AVPlayer is still reading. Default ignores it.
+    func didDeliverProgressiveChunk(index: Int)
 
     var segmentCount: Int { get }
     func segmentDuration(at index: Int) -> Double
@@ -143,8 +152,12 @@ protocol HLSSegmentProvider: AnyObject {
 
 extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
+    func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? {
+        mediaSegment(at: index, onSlow: onSlow).map { .data($0) }
+    }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
     func didServeMediaSegment(index: Int, delivered: Bool) {}
+    func didDeliverProgressiveChunk(index: Int) {}
     var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
@@ -1209,7 +1222,7 @@ final class HLSLocalServer: @unchecked Sendable {
                     // ~3.5 s time-to-first-byte watchdog logs -12889 per silent request and three
                     // strikes fail the item (failedToPlayToEndTime, terminal from the couch).
                     let early = EarlyHeaderState()
-                    let data = provider?.mediaSegment(at: index, onSlow: { [weak self] in
+                    let source = provider?.mediaSegmentSource(at: index, onSlow: { [weak self] in
                         guard let self, early.markSentOnce() else { return }
                         EngineLog.emit(
                             "[HLSLocalServer] seg\(index): slow serve, sending early chunked header",
@@ -1218,6 +1231,23 @@ final class HLSLocalServer: @unchecked Sendable {
                                           data: Self.chunkedResponseHeader(contentType: "video/mp4"),
                                           path: "\(normalizedPath) [early header]")
                     })
+                    // A segment being written: commit the chunked header (unless the slow-serve
+                    // signal already did) and send each fragment as it lands. An abandoned segment
+                    // ends the connection without the final chunk, so AVPlayer retries it rather
+                    // than taking the partial bytes for a whole segment.
+                    if case .progressive(let reader) = source {
+                        if early.markSentOnce() {
+                            guard writeAll(fd: fd, data: Self.chunkedResponseHeader(contentType: "video/mp4"),
+                                           path: "\(normalizedPath) [progressive header]") else {
+                                return refused(false)
+                            }
+                        }
+                        return delivered(sendProgressiveBody(fd: fd, path: normalizedPath, reader: reader))
+                    }
+                    let data: Data? = {
+                        if case .data(let d) = source { return d }
+                        return nil
+                    }()
                     if early.wasSent {
                         guard let data, !data.isEmpty else {
                             // Headers are committed; abort so AVPlayer sees a truncated transfer
@@ -1296,6 +1326,37 @@ final class HLSLocalServer: @unchecked Sendable {
 
     /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
     /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
+    /// Body for a progressively delivered segment: one chunk per read (usually the fragment the muxer
+    /// just flushed), the final chunk once the sealed segment is read to its end. Returns false
+    /// without the final chunk when the producer abandons the segment.
+    private func sendProgressiveBody(fd: Int32, path: String, reader: ProgressiveSegmentReader) -> Bool {
+        let provider = self.provider
+        var sent = 0
+        while true {
+            switch reader.next() {
+            case .bytes(let data):
+                guard writeAll(fd: fd, data: Self.chunkFrameHeader(size: data.count), path: "\(path) [chunk size]"),
+                      writeAll(fd: fd, data: data, path: path),
+                      writeAll(fd: fd, data: Self.chunkFrameTrailer, path: "\(path) [chunk trailer]") else {
+                    return false
+                }
+                sent += data.count
+                provider?.didDeliverProgressiveChunk(index: reader.index)
+            case .finished:
+                EngineLog.emit(
+                    "[HLSLocalServer] -> 200 \(path) bytes=\(sent) type=video/mp4 [progressive]",
+                    category: .hlsServer, level: .verbose)
+                return writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]")
+            case .abandoned:
+                EngineLog.emit(
+                    "[HLSLocalServer] \(path): the producer abandoned this segment after \(sent) B sent; "
+                    + "closing so AVPlayer asks for it again",
+                    category: .hlsServer)
+                return false
+            }
+        }
+    }
+
     private func sendChunkedBody(fd: Int32, path: String, data: Data) -> Bool {
         EngineLog.emit(
             "[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=video/mp4 [chunked, early header]",

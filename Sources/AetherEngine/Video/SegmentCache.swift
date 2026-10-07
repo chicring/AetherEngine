@@ -49,6 +49,16 @@ final class SegmentCache: @unchecked Sendable {
     /// overwritten (stat returned new size, old bytes stayed counted forever).
     private var entryBytes: [Int: Int] = [:]
 
+    /// Progressive delivery: the segments a producer is writing right now, index to staging file.
+    /// Registered when the producer opens the segment (`beginInProgress`), removed when it is
+    /// adopted or abandoned. A serve that finds its index here reads the staging file as it grows
+    /// (`ProgressiveSegmentReader`) instead of waiting for the cut.
+    private var inProgress: [Int: URL] = [:]
+    /// The staging file each recently adopted segment was renamed from, and its final size, so a
+    /// progressive reader can tell that the file IT holds was sealed, rather than the same index
+    /// produced again by a later epoch. Bounded to the most recent adoptions.
+    private var sealedFromStaging: [Int: (staging: URL, bytes: Int)] = [:]
+
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
 
@@ -308,7 +318,18 @@ final class SegmentCache: @unchecked Sendable {
         }
 
         condition.lock()
+        // Sealed or not, this staging file is no longer being written.
+        if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
+        if renameOK {
+            sealedFromStaging[index] = (stagingPath, byteCount)
+            if sealedFromStaging.count > Self.sealedStagingMemory {
+                for key in sealedFromStaging.keys.sorted().prefix(sealedFromStaging.count - Self.sealedStagingMemory) {
+                    sealedFromStaging.removeValue(forKey: key)
+                }
+            }
+        }
         guard !closed else {
+            condition.broadcast()
             condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
             return
@@ -351,6 +372,8 @@ final class SegmentCache: @unchecked Sendable {
         videoReaches.removeAll(keepingCapacity: false)
         initSegment = nil
         initVersions.removeAll(keepingCapacity: false)
+        inProgress.removeAll(keepingCapacity: false)
+        sealedFromStaging.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
         condition.broadcast()
@@ -461,6 +484,79 @@ final class SegmentCache: @unchecked Sendable {
         condition.unlock()
         guard let url = fileURL else { return nil }
         return readOrDrop(index: index, url: url)
+    }
+
+    // MARK: - Progressive delivery
+
+    /// How many adoptions `sealedFromStaging` remembers: enough for every reader still draining.
+    static let sealedStagingMemory = 64
+
+    /// The producer opened segment `index` in `stagingPath`, which from here on is only appended to
+    /// until it is adopted under its final name.
+    func beginInProgress(index: Int, stagingPath: URL) {
+        condition.lock()
+        if !closed {
+            inProgress[index] = stagingPath
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    /// The producer gave up the segment it was writing (restart, failed cut, teardown), so its
+    /// partial bytes are never adopted. A reader draining it learns that on its next poll.
+    func abandonInProgress(index: Int) {
+        condition.lock()
+        if inProgress.removeValue(forKey: index) != nil { condition.broadcast() }
+        condition.unlock()
+    }
+
+    enum InProgressState: Equatable {
+        case writing
+        case sealed(bytes: Int)
+        case abandoned
+    }
+
+    /// What became of the staging file a progressive reader holds.
+    func inProgressState(index: Int, stagingPath: URL) -> InProgressState {
+        condition.lock()
+        defer { condition.unlock() }
+        if inProgress[index] == stagingPath { return .writing }
+        if let sealed = sealedFromStaging[index], sealed.staging == stagingPath {
+            return .sealed(bytes: sealed.bytes)
+        }
+        return .abandoned
+    }
+
+    /// `fetch` for the loopback server. With `progressive`, a segment that is being written is
+    /// answered at once with a reader over its staging file, so AVPlayer receives each fragment as
+    /// the muxer flushes it instead of the whole segment after its cut.
+    func fetchSource(index: Int, timeout: TimeInterval, progressive: Bool) -> SegmentSource? {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        while true {
+            if let url = entries[index] {
+                condition.unlock()
+                return readOrDrop(index: index, url: url).map { .data($0) }
+            }
+            if closed {
+                condition.unlock()
+                return nil
+            }
+            if progressive, let staging = inProgress[index] {
+                condition.unlock()
+                if let reader = ProgressiveSegmentReader(cache: self, index: index, stagingPath: staging) {
+                    return .progressive(reader)
+                }
+                // The staging file was renamed or removed between the lookup and the open: look again.
+                condition.lock()
+                if inProgress[index] == staging { inProgress.removeValue(forKey: index) }
+                continue
+            }
+            if !condition.wait(until: deadline) {
+                condition.unlock()
+                return nil
+            }
+        }
     }
 
     /// AE#451: a read that comes back empty for a file the bookkeeping still lists is the same lie
@@ -843,5 +939,91 @@ final class SegmentCache: @unchecked Sendable {
     private func byteSize(of url: URL) -> Int {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         return values?.fileSize ?? 0
+    }
+}
+
+/// A segment as the loopback server gets it: complete bytes, or a reader over one being written.
+enum SegmentSource {
+    case data(Data)
+    case progressive(ProgressiveSegmentReader)
+}
+
+/// Reads a segment while its producer is still writing it.
+///
+/// The muxer appends each flushed fragment (moof+mdat) to the staging file and never rewrites what
+/// it wrote, and adoption renames the file as it stands. So a descriptor opened on the staging file
+/// reads a growing prefix of the final segment, the rename does not disturb it, and the read is
+/// complete at the byte count the cache records for the adoption. A segment the producer abandons
+/// reads as `.abandoned`, and the server closes the connection so AVPlayer asks for it again.
+final class ProgressiveSegmentReader: @unchecked Sendable {
+    let index: Int
+    let stagingPath: URL
+    private let fd: Int32
+    private weak var cache: SegmentCache?
+    private(set) var offset: Int64 = 0
+
+    enum Next: Equatable {
+        case bytes(Data)
+        case finished
+        case abandoned
+    }
+
+    init?(cache: SegmentCache, index: Int, stagingPath: URL) {
+        let fd = open(stagingPath.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        self.fd = fd
+        self.cache = cache
+        self.index = index
+        self.stagingPath = stagingPath
+    }
+
+    deinit { close(fd) }
+
+    /// The next bytes past `offset`, waiting for the producer to write them. `.finished` once the
+    /// sealed segment is read to its end; `.abandoned` when the producer gave it up, or wrote nothing
+    /// for `idleTimeout` (a wedged producer must not hold a connection forever).
+    func next(maxBytes: Int = 256 * 1024, pollInterval: TimeInterval = 0.02,
+              idleTimeout: TimeInterval = 60) -> Next {
+        let deadline = Date().addingTimeInterval(idleTimeout)
+        while true {
+            var st = stat()
+            let statOK = fstat(fd, &st) == 0
+            if statOK, st.st_size > offset {
+                let count = Int(min(Int64(maxBytes), st.st_size - offset))
+                var data = Data(count: count)
+                let read = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
+                if read > 0 {
+                    if read < count { data.removeSubrange(read ..< count) }
+                    offset += Int64(read)
+                    return .bytes(data)
+                }
+            }
+            switch cache?.inProgressState(index: index, stagingPath: stagingPath) ?? .abandoned {
+            case .writing:
+                break
+            case .sealed(let bytes):
+                if offset >= Int64(bytes) { return .finished }
+                // The last fragment landed with the seal: read on. A file shorter than its recorded
+                // size is not a state to spin in.
+                if statOK, st.st_size > offset { continue }
+                return .abandoned
+            case .abandoned:
+                return .abandoned
+            }
+            if Date() >= deadline { return .abandoned }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+    }
+
+    /// Reads to the seal, for a caller that needs the whole segment. nil when it was abandoned.
+    func readToEnd() -> Data? {
+        var all = Data()
+        while true {
+            switch next() {
+            case .bytes(let d): all.append(d)
+            case .finished: return all
+            case .abandoned: return nil
+            }
+        }
     }
 }
