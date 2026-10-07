@@ -1919,6 +1919,7 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        armHeldPictureRelease(onSoftwareHost: host)
         // #311: a load builds a new host and a new renderer, so an observer installed once by the
         // host app has to be carried across the seam, exactly as the native session does at load.
         host.setVideoFrameTimeObserver(softwareVideoFrameTimeObserver)
@@ -2350,8 +2351,11 @@ extension AetherEngine {
         // invalidated by a media-services reset (audit LIF-104).
         let keepAudioSwitchItem = audioStreamIndex != nil && discTitleIDOverride == nil
             && !targetSoftwarePath && !mediaServicesWereReset && nativeHost?.avPlayer.currentItem != nil
-        if keepAudioSwitchItem {
-            nativeHost?.pause()
+        // The software path rebuilds its host and layer, and `stop()` flushes the old one to black.
+        let holdsSoftwarePicture = audioStreamIndex != nil && discTitleIDOverride == nil
+            && targetSoftwarePath && softwareHost != nil
+        if keepAudioSwitchItem || holdsSoftwarePicture {
+            if keepAudioSwitchItem { nativeHost?.pause() }
             let heldGeneration = loadGeneration
             await holdPictureAcrossItemSwap()
             // A stop() or load() that landed while the frame was read owns the engine now.

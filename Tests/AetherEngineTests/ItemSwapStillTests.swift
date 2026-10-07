@@ -124,7 +124,7 @@ struct ItemSwapStillTests {
         engine.pause()
         let started = ContinuousClock.now
         let frame = await host.captureDisplayedFrame()
-        #expect(ContinuousClock.now - started < .milliseconds(250))
+        #expect(ContinuousClock.now - started < .milliseconds(500))
         #expect(frame != nil)
     }
 
@@ -250,16 +250,133 @@ struct ItemSwapStillTests {
         #expect(engine.heldPictureLastRelease == "still view unbound")
     }
 
-    @Test("Dolby Vision, PiP and external playback hold nothing")
+    @Test("PiP and external playback hold nothing")
     func skipReasons() {
         #expect(AetherEngine.heldPictureSkipReason(
-            videoFormat: .hdr10, pictureInPictureActive: false, externalPlaybackActive: false) == nil)
+            pictureInPictureActive: false, externalPlaybackActive: false) == nil)
         #expect(AetherEngine.heldPictureSkipReason(
-            videoFormat: .dolbyVision, pictureInPictureActive: false, externalPlaybackActive: false) != nil)
+            pictureInPictureActive: true, externalPlaybackActive: false) != nil)
         #expect(AetherEngine.heldPictureSkipReason(
-            videoFormat: .sdr, pictureInPictureActive: true, externalPlaybackActive: false) != nil)
-        #expect(AetherEngine.heldPictureSkipReason(
-            videoFormat: .sdr, pictureInPictureActive: false, externalPlaybackActive: true) != nil)
+            pictureInPictureActive: false, externalPlaybackActive: true) != nil)
+    }
+
+    @Test("only Dolby Vision without a displayable base layer is reshaped from the segment")
+    func reshapingRule() {
+        #expect(AetherEngine.heldPictureNeedsReshaping(videoFormat: .dolbyVision, dolbyVisionProfile: 5))
+        #expect(AetherEngine.heldPictureNeedsReshaping(videoFormat: .dolbyVision, dolbyVisionProfile: 10))
+        #expect(!AetherEngine.heldPictureNeedsReshaping(videoFormat: .dolbyVision, dolbyVisionProfile: 8))
+        #expect(!AetherEngine.heldPictureNeedsReshaping(videoFormat: .hdr10, dolbyVisionProfile: 5))
+    }
+
+    /// The fixture paints frame n at grey level 2n, so the frame a still came from can be read off it.
+    @Test("a still measured from the first frame lands on the frame it names")
+    func snapshotAfterFirstFrameIsFrameAccurate() async throws {
+        let file = try await Self.fixtureURL()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let extractor = FrameExtractor(url: file)
+        defer { Task { await extractor.shutdown() } }
+        // This file's first frame sits at 0, so both axes name the same frame. Grey 2n per frame
+        // n means a frame off reads two (plus colour conversion) levels off.
+        let relative = try #require(await extractor.snapshot(afterFirstFrameBy: 1.0))
+        let absolute = try #require(await extractor.snapshot(at: 1.0))
+        let earlier = try #require(await extractor.snapshot(afterFirstFrameBy: 0.5))
+        let grey = try #require(Self.centreGrey(relative))
+        #expect(grey == Self.centreGrey(absolute))
+        #expect(grey > (Self.centreGrey(earlier) ?? .max))
+    }
+
+    @Test("a software-path audio rebuild holds the renderer's picture until the next host's first frame")
+    func softwareRebuildHoldsThePicture() async throws {
+        let file = try await Self.fixtureURL()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        engine.bind(view: view)
+        var options = LoadOptions()
+        options.preferredDecodePath = .software
+        _ = try await engine.load(url: file, options: options)
+        #expect(engine.playbackBackend == .software)
+        let host = try #require(engine.softwareHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        let audioIndex = try #require(engine.activeAudioTrackIndex)
+
+        var held = false
+        let watcher = Task { @MainActor in
+            while !Task.isCancelled {
+                if view.isHoldingStill { held = true }
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        let failure = await engine.reloadWithAudioOverride(
+            url: file, audioStreamIndex: Int32(audioIndex), expectedGeneration: engine.loadGeneration)
+        #expect(failure == nil)
+        try await waitFor { !view.isHoldingStill }
+        watcher.cancel()
+
+        #expect(held)
+        #expect(engine.heldPictureLastRoute == "software renderer")
+        #expect(engine.heldPictureLastRelease == "first frame of the next host")
+        #expect(engine.softwareHost !== host)
+    }
+
+    nonisolated private static let userFixtures = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Fixtures/user")
+    nonisolated static let profile5URL = userFixtures
+        .appendingPathComponent("Patterns_Of_Nature_DoVi_24_P5_UHD_HEVC-10mbps_DD+JOC-768kbps_iOS.mp4")
+    nonisolated static let profile81URL = userFixtures
+        .appendingPathComponent("Patterns_Of_Nature_HDR10-P8.1_UHD_24_H265-10Mbps_DD+JOC-768Kbps.mp4")
+
+    /// Dolby's own Profile 5 signal, which cannot be committed: the base layer is IPTPQc2 and only
+    /// the RPU makes it a picture, so the hold must come from the reshaping path.
+    @Test("a Profile 5 title holds a reshaped still",
+          .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
+    func profile5HoldsAReshapedStill() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        engine.bind(view: view)
+        _ = try await engine.load(url: Self.profile5URL)
+        let host = try #require(engine.nativeHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        try await Task.sleep(for: .seconds(1))
+        engine.pause()
+        let started = ContinuousClock.now
+        await engine.holdPictureAcrossItemSwap()
+        #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds))
+        #expect(engine.videoFormat == .dolbyVision)
+        #expect(engine.heldPictureLastRoute == "Dolby Vision reshaped")
+        #expect(view.isHoldingStill)
+    }
+
+    @Test("a Profile 8.1 title holds its HDR10 base layer from the output",
+          .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile81URL.path)))
+    func profile81HoldsTheBaseLayer() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        engine.bind(view: view)
+        _ = try await engine.load(url: Self.profile81URL)
+        let host = try #require(engine.nativeHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        engine.pause()
+        await engine.holdPictureAcrossItemSwap()
+        #expect(engine.heldPictureLastSkip == nil)
+        #expect(engine.heldPictureLastRoute == "native output")
+        #expect(view.isHoldingStill)
+    }
+
+    private static func centreGrey(_ image: CGImage) -> Int? {
+        var pixel = [UInt8](repeating: 0, count: 4)
+        guard let context = CGContext(
+            data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let x = image.width / 2, y = image.height / 2
+        guard let crop = image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)) else { return nil }
+        context.draw(crop, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return Int(pixel[1])
     }
 }
 

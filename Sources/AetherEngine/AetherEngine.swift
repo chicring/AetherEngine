@@ -3487,6 +3487,10 @@ public final class AetherEngine: ObservableObject {
     var heldPictureShownAt: ContinuousClock.Instant?
     /// What took the last held picture down, for the log line and the tests that pin it.
     var heldPictureLastRelease: String?
+    /// A hold over a software rebuild waits for `loadSoftware` to install the host it comes down on.
+    var heldPictureAwaitsSoftwareHost = false
+    /// Which route the last held picture came from, for the log line and the tests that pin it.
+    var heldPictureLastRoute: String?
     private var pendingAudioSelection: Int?
     private var audioSelectionEpoch = UUID()
 
