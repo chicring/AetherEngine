@@ -2511,6 +2511,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// place, so a mapping stays valid for as long as the reader holds it.
     struct ScrubThumbnailSource: Sendable {
         let segmentIndex: Int
+        let startSeconds: Double
+        let durationSeconds: Double
+        let carriedOffset: Double?
+        let identity: String
         let initData: Data
         let segmentURL: URL
 
@@ -2527,7 +2531,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard let prov else { return nil }
         guard let seg = prov.thumbnailSegment(atSeconds: seconds),
               let initData = prov.peekInitSegment() else { return nil }
-        return ScrubThumbnailSource(segmentIndex: seg.index, initData: initData, segmentURL: seg.fileURL)
+        anchorShiftLock.lock()
+        let carried = isLiveSession ? 0 : epochAxisByIndex.carried(at: seg.index)
+        anchorShiftLock.unlock()
+        // The cache replaces/unlinks immutable files. An index alone cannot
+        // identify bytes after a same-session re-cut/restart rewrites that index.
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: seg.fileURL.path),
+              let volume = attributes[.systemNumber] as? NSNumber,
+              let inode = attributes[.systemFileNumber] as? NSNumber,
+              let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date else { return nil }
+        let identity = "\(volume.uint64Value):\(inode.uint64Value):\(size.uint64Value):\(modified.timeIntervalSince1970):" + initData.base64EncodedString()
+        return ScrubThumbnailSource(segmentIndex: seg.index, startSeconds: seg.startSeconds, durationSeconds: seg.durationSeconds,
+                                    carriedOffset: carried, identity: identity,
+                                    initData: initData, segmentURL: seg.fileURL)
     }
 
     public func stop() {

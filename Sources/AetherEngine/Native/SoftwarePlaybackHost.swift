@@ -1495,6 +1495,44 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    /// Resident preview only; selection and decode run on the existing still queue.
+    /// The frozen source/session delta maps actual PTS back through the same axis as seek.
+    func scrubPreviewFrame(atSessionSeconds seconds: Double, refined: Bool, maxWidth: Int,
+                           isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
+        guard let extractor = resolveStillExtractor() else { return nil }
+        let source = sourceSeconds(forSession: seconds)
+        let ring = isLive ? dvrRing : nil
+        let cache = isLive ? nil : vodPacketReadAhead
+        let requests = stillRequests
+        let ticket = requests.next()
+        return await withCheckedContinuation { continuation in
+            stillQueue.async {
+                let cancelled = { isCancelled() || ticket != requests.latest }
+                guard !cancelled() else { continuation.resume(returning: nil); return }
+                var actual: Double?
+                var didRefine = false
+                var sourceRange: Range<Double>?
+                let reportRange = { (range: Range<Double>) in sourceRange = range }
+                let report = { (pts: Double, precise: Bool) in actual = pts; didRefine = precise }
+                let image: CGImage?
+                if let ring {
+                    image = extractor.still(from: ring, targetPts: source, maxWidth: maxWidth,
+                        precise: refined, isCancelled: cancelled, reportTime: report, reportRange: reportRange)
+                } else if let cache, let run = cache.stillRun(atSeconds: source,
+                    maxPackets: 900, maxSpanSeconds: 12, reorderTail: 16, isCancelled: cancelled) {
+                    image = extractor.still(from: run, targetPts: source, maxWidth: maxWidth,
+                        precise: refined, isCancelled: cancelled, reportTime: report, reportRange: reportRange)
+                } else { image = nil }
+                guard let image, let actual, actual.isFinite, !cancelled() else {
+                    continuation.resume(returning: nil); return
+                }
+                continuation.resume(returning: ScrubFrame(image: image,
+                    actualSeconds: seconds + actual - source, refined: didRefine,
+                    validRange: sourceRange.map { (seconds + $0.lowerBound - source)..<(seconds + $0.upperBound - source) }))
+            }
+        }
+    }
+
     /// #544: a scrub still for the live DVR window, decoded out of the packet ring.
     ///
     /// Takes the session axis, exactly as `seek` does, and converts it with the same `sessionStartPts`

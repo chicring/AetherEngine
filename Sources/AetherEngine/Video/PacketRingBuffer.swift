@@ -358,7 +358,9 @@ final class PacketRingBuffer: @unchecked Sendable {
     func stillRun(target: Double,
                   maxPackets: Int,
                   maxSpanSeconds: Double,
-                  reorderTail: Int) -> [Packet]? {
+                  reorderTail: Int, isCancelled: (() -> Bool)? = nil) -> [Packet]? {
+        guard target.isFinite, isCancelled?() != true else { return nil }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         lock.lock()
         guard let startIdx = lastKeyframeIndexLocked(atOrBefore: target) else {
             lock.unlock()
@@ -377,8 +379,10 @@ final class PacketRingBuffer: @unchecked Sendable {
                                            reorderTail: reorderTail,
                                            indexReachesEnd: reachesEnd) else { return nil }
 
-        let run = span.compactMap { seq -> Packet? in
-            window[seq - base].isVideo ? packet(atSeq: seq) : nil
+        var run: [Packet] = []
+        for seq in span {
+            if isCancelled?() == true || (isCancelled != nil && ContinuousClock.now >= deadline) { return nil }
+            if window[seq - base].isVideo, let packet = packet(atSeq: seq) { run.append(packet) }
         }
         // Eviction between the snapshot and the off-lock reads would cost the run its keyframe, and
         // a run that does not open on one decodes as garbage.

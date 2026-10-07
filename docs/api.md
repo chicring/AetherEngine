@@ -1144,3 +1144,16 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
+
+
+### Timestamped resident previews
+
+`scrubPreviewFrame(atSeconds:refined:maxWidth:isCancelled:)` reads resident native
+segments or software packets without seeking playback or opening a second source.
+Its `ScrubFrame` contains an immutable image, measured `actualSeconds` on the
+session/display axis, `refined` status and an optional resident `validRange`.
+Refinement means target-directed decoding succeeded, not exact timestamp equality.
+Missing, cancelled, replaced or stale work returns nil. `scrubPreviewSourceGeneration`
+changes when teardown invalidates the source; hosts may use it to fence UI work.
+`clearResidentPreviewFrames()` schedules cancellation/cache clearing for native
+resident extractors without discarding playback media.

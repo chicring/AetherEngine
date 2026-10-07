@@ -34,18 +34,60 @@ public actor FrameExtractor {
 
     private let idleInterval: Duration = .seconds(10)
     private var idleTask: Task<Void, Never>?
+    private var residentApproximation: (width: Int, frame: ScrubFrame)?
+    nonisolated let residentIdentity: String?
+    func clearResidentPreviewCache() {
+        currentToken?.cancel()
+        residentApproximation = nil
+    }
 
-    private init(context: FrameDecodeContext, yieldWhile: (@Sendable () -> Bool)?) {
+    /// Only used with a one-segment DataIOReader. No URL or provider fallback.
+    /// Refined results bypass the old 0.1 s snapshot bucket entirely.
+    func residentPreview(rawTarget: Double, refined: Bool, maxWidth: Int,
+                                isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
+        guard !isShutDown, rawTarget.isFinite,
+              !Task.isCancelled, !isCancelled() else { return nil }
+        guard maxWidth > 0 else { return nil }
+        let width = maxWidth
+        if !refined, let cached = residentApproximation, cached.width == width {
+            scheduleIdleClose()
+            return cached.frame
+        }
+        currentToken?.cancel()
+        let token = CancelToken(); currentToken = token
+        let context = self.context
+        let result: ScrubFrame? = await withTaskCancellationHandler {
+            await runOnQueue {
+                guard !token.isCancelled, !isCancelled() else { return nil }
+                do { try context.ensureOpen() } catch { return nil }
+                var actual: Double?
+                var didRefine = false
+                let image = context.decodeFrame(at: 0, mode: refined ? .snapshot : .thumbnail,
+                    targetWidth: width, maxSize: CGSize(width: CGFloat(width), height: CGFloat(width)),
+                    isCancelled: { token.isCancelled || isCancelled() }, residentTarget: rawTarget,
+                    reportResidentTime: { actual = $0; didRefine = $1 })
+                guard let image, let actual, !token.isCancelled, !isCancelled() else { return nil }
+                return ScrubFrame(image: image, actualSeconds: actual, refined: didRefine)
+            }
+        } onCancel: { token.cancel() }
+        guard !Task.isCancelled, !isCancelled(), !token.isCancelled else { return nil }
+        if !refined, let result, result.image.bytesPerRow * result.image.height <= 512 * 1_024 {
+            residentApproximation = (width, result)
+        }
+        scheduleIdleClose()
+        return result
+    }
+
+    private init(context: FrameDecodeContext, yieldWhile: (@Sendable () -> Bool)?, residentIdentity: String? = nil) {
         self.context = context
+        self.residentIdentity = residentIdentity
         self.yieldWhile = yieldWhile
         self.cache = FrameCache(
             thumbnailLimit: 24,
             snapshotLimit: 2,
             thumbnailBucketSeconds: 1.0
         )
-        // .utility (not .userInitiated): the disposable thumbnail decode must yield to
-        // the real-time software playback decode under CPU contention so it cannot
-        // starve playback on a weak box (issue #27).
+        // Still extraction is elective work and must yield to playback under CPU contention.
         self.decodeQueue = DispatchQueue(label: "com.aetherengine.frameextractor", qos: .utility)
     }
 
@@ -65,6 +107,11 @@ public actor FrameExtractor {
                 yieldWhile: (@Sendable () -> Bool)? = nil) {
         self.init(context: FrameDecodeContext(reader: reader, formatHint: formatHint),
                   yieldWhile: yieldWhile)
+    }
+
+    init(residentReader: IOReader, formatHint: String, identity: String) {
+        self.init(context: FrameDecodeContext(reader: residentReader, formatHint: formatHint),
+                  yieldWhile: nil, residentIdentity: identity)
     }
 
     /// Yield decision for elective (thumbnail) extraction. The disposable decode's demuxer pulls
@@ -112,6 +159,7 @@ public actor FrameExtractor {
         isShutDown = true
         currentToken?.cancel()
         cache.clear()
+        residentApproximation = nil
         let context = self.context
         await runOnQueue { context.close() }
     }
@@ -200,6 +248,7 @@ public actor FrameExtractor {
     /// shutdown() this does NOT set `isShutDown`, so the next request lazily reopens.
     private func idleClose() {
         cache.clear()
+        residentApproximation = nil
         let context = self.context
         // Fire-and-forget: best-effort, no caller awaits it; runOnQueue would block the actor for nothing.
         decodeQueue.async { context.close() }
