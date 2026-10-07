@@ -13,6 +13,7 @@ the public-API contract.
 ### Added
 
 - Timestamped, cancellable resident previews return measured frame positions without opening a second source or seeking playback.
+- Disposable source-backed snapshots accept a caller-supplied budget across opening, stream analysis, seek and decode, with cancellation and measured presentation timestamps.
 
 ## [7.29.0] - 2026-10-07
 

@@ -26,6 +26,9 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// (main) title. Threaded into `Demuxer.open` so a still follows the currently-selected disc title
     /// instead of always decoding the default one (AE#105).
     private let selectTitleID: Int?
+    /// Owned only during a controlled one-shot extraction. The ordinary URL and
+    /// custom-reader paths retain their existing ownership rules.
+    private var boundedReader: IOReader?
 
     private var demuxer: Demuxer?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -151,10 +154,10 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     /// Open demuxer + decoder if not already open. Throws on failure, leaving the
     /// context fully closed (no partial state to leak).
-    func ensureOpen() throws {
+    func ensureOpen(control: ProbeControl? = nil) throws {
         guard !isOpen else { return }
         do {
-            try openInternal()
+            try openInternal(control: control)
             isOpen = true
         } catch {
             close()
@@ -177,6 +180,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         demuxer?.close()
         demuxer = nil
+        boundedReader?.close()
+        boundedReader = nil
         videoStreamIndex = -1
         isHDR = false
         isDolbyVisionNoBaseLayer = false
@@ -184,9 +189,38 @@ final class FrameDecodeContext: @unchecked Sendable {
         isOpen = false
     }
 
-    private func openInternal() throws {
+    private func openInternal(control: ProbeControl?) throws {
         let demuxer = Demuxer()
-        if let reader = reader {
+        demuxer.probeControl = control
+        if let control {
+            let source: IOReader
+            if let reader {
+                source = reader
+            } else if url.isFileURL {
+                guard let file = FileIOReader(url: url) else { throw DemuxerError.openFailed(code: -1) }
+                source = file
+                boundedReader = file
+            } else if ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                let http = ProbeHTTPReader(url: url, headers: httpHeaders, control: control,
+                                           boundedWindowBytes: 64 * 1024)
+                source = http
+                boundedReader = http
+            } else {
+                throw ProbeError.unsupportedURL
+            }
+            // Count from before demux open through seek and decode. The 64 KiB
+            // HTTP window bounds bytes fetched ahead of the input-byte limit.
+            // Register the cancellation handler BEFORE the HTTP open; a stalled
+            // response header must be interruptible by the same deadline.
+            let counted = ProbeIOReader(reader: source, control: control)
+            try control.check()
+            if let http = source as? ProbeHTTPReader { try http.open() }
+            try control.check()
+            try demuxer.open(reader: counted,
+                             formatHint: formatHint, profile: .stillExtraction,
+                             selectTitleID: selectTitleID)
+            try control.check()
+        } else if let reader = reader {
             try demuxer.open(reader: reader, formatHint: formatHint, profile: .stillExtraction)
         } else {
             try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction, selectTitleID: selectTitleID)
@@ -389,7 +423,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         isCancelled: () -> Bool,
         residentTarget: Double? = nil,
         reportResidentTime: ((Double, Bool) -> Void)? = nil,
-        residentDeadline: ContinuousClock.Instant? = nil
+        residentDeadline: ContinuousClock.Instant? = nil,
+        reportDecodedTime: ((Double?) -> Void)? = nil
     ) -> CGImage? {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
 
@@ -585,7 +620,8 @@ final class FrameDecodeContext: @unchecked Sendable {
                         isCancelled: isCancelled,
                         residentTarget: residentTarget,
                         reportResidentTime: reportResidentTime,
-                        residentDeadline: deadline)
+                        residentDeadline: deadline,
+                        reportDecodedTime: reportDecodedTime)
                 }
                 if let residentTarget {
                     guard f.pointee.pts != Int64.min else { return nil }
@@ -594,6 +630,9 @@ final class FrameDecodeContext: @unchecked Sendable {
                     reportResidentTime?(raw, mode == .snapshot && raw >= residentTarget &&
                         presentationStartSeconds.map { residentTarget >= $0 } == true)
                 }
+                let decodedPTS = f.pointee.pts == Int64.min ? nil
+                    : Optional(Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den))
+                reportDecodedTime?(decodedPTS.flatMap { $0.isFinite ? $0 : nil })
                 return image
             }
         }
