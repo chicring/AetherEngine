@@ -44,7 +44,7 @@ extension AetherEngine {
             : (nativeSource == nil && softwareSource == nil) ? "no video host"
             : Self.heldPictureSkipReason(
                 pictureInPictureActive: pictureInPictureActive,
-                externalPlaybackActive: nativeSource?.avPlayer.isExternalPlaybackActive ?? false) {
+                externalPlaybackActive: Self.externalPlaybackActive(nativeSource)) {
             heldPictureLastSkip = skip
             EngineLog.emit("[AetherEngine] held picture: skipped (\(skip))", category: .engine)
             return
@@ -110,6 +110,15 @@ extension AetherEngine {
             + "(\(held.route), \(CVPixelBufferGetWidth(held.frame))x\(CVPixelBufferGetHeight(held.frame)), "
             + "hdr=\(held.isHDR))",
             category: .engine)
+    }
+
+    /// visionOS has no external playback, and no `isExternalPlaybackActive` to ask.
+    private static func externalPlaybackActive(_ host: NativeAVPlayerHost?) -> Bool {
+        #if os(visionOS)
+        return false
+        #else
+        return host?.avPlayer.isExternalPlaybackActive ?? false
+        #endif
     }
 
     /// Called where `loadSoftware` installs its host: a picture held over a software rebuild comes

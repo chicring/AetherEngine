@@ -1803,7 +1803,17 @@ final class NativeAVPlayerHost {
         defer { item.remove(output) }
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
+        // A paused item that vends nothing to a freshly attached output (measured on the macOS CI
+        // runner; a Mac and an Apple TV answer in ~20 ms) is asked to render its own frame again: a
+        // zero-tolerance seek to where it stands. The item is about to be swapped out anyway.
+        let reRenderAt = clock.now + .milliseconds(100)
+        var askedForReRender = false
         repeat {
+            if !askedForReRender, avPlayer.rate == 0, clock.now >= reRenderAt {
+                askedForReRender = true
+                item.seek(to: item.currentTime(), toleranceBefore: .zero, toleranceAfter: .zero,
+                          completionHandler: nil)
+            }
             // A playing item vends at the host clock, a paused one only at the time it holds.
             let itemTime = avPlayer.rate == 0 ? item.currentTime()
                 : output.itemTime(forHostTime: CACurrentMediaTime())

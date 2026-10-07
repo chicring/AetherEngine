@@ -115,7 +115,11 @@ final class SoftwarePlaybackHost {
     /// `stop()` flushes it, so the engine can hold it over the new host's startup. Falls back to the
     /// newest frame enqueued, which a layer that is not on screen is all there is of.
     func displayedFrame() -> CVPixelBuffer? {
-        renderer.displayLayer.sampleBufferRenderer.displayedPixelBuffer() ?? renderer.lastEnqueuedFrame
+        if #available(visionOS 1.1, *),
+           let shown = renderer.displayLayer.sampleBufferRenderer.displayedPixelBuffer() {
+            return shown
+        }
+        return renderer.lastEnqueuedFrame
     }
 
     /// SW-PiP Phase C: engine-fed cue mirror + PiP gate for the renderer's frame compositor.
