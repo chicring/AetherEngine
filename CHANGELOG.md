@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Opt-in live DVR retention leases let callers renew time and disk allowances without reopening playback. Native and software paths retain finite playback cushions; software eviction recovery reanchors decoders and clocks before feeding retained packets.
 
 ## [7.28.3] - 2026-10-07
 

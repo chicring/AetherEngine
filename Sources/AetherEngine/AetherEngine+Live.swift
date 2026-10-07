@@ -486,13 +486,51 @@ extension AetherEngine {
         nativeVideoSession?.sealedLiveTargetDurationSeconds().map(Double.init)
     }
 
-    /// Publish `liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`, `behindLiveSeconds`. Path-agnostic; no-op when no live window is active.
-    @MainActor
+    /// Update native HLS retention without load/reload, source requests, or a second player.
+    /// Supply a fresh temporary-volume capacity and its monotonic expiry deadline.
+    /// False for software/remote/unready sessions. Their conservative load options are untouched.
+    @discardableResult
+    public func setNativeLiveDVRLimits(_ limits: LiveDVRLimits, availableCapacityBytes: Int64?) -> Bool {
+        guard isLive, isSessionReady, videoRoute == .loopback, let session = nativeVideoSession,
+              session.setNativeLiveDVRLimits(limits, availableCapacityBytes: availableCapacityBytes) else { return false }
+        // Capacity lease renewal alone must not add clock publications to the existing tick rate.
+        if liveWindow?.windowSeconds != session.nativeLiveDVRWindow?.windowSeconds {
+            publishLiveWindow(edgeSessionTime: liveWindow?.edgeTime ?? currentTime)
+        }
+        return true
+    }
+
+    /// Bound the software packet spool without stopping its source, decoders or clock.
+    /// Requires LoadOptions.softwareDVRRetention. Expiry withdraws optional history
+    /// and falls back to the caller-selected playback cushion.
+    @discardableResult
+    public func setSoftwareLiveDVRLimits(_ limits: LiveDVRLimits, availableCapacityBytes: Int64?) -> Bool {
+        guard isLive, isSessionReady, videoRoute == .software, let host = softwareHost else { return false }
+        return host.setLiveDVRLimits(limits, availableBytes: availableCapacityBytes)
+    }
+    public var softwareLiveDVRBytes: Int64? { softwareHost?.liveDVRBytes.map(Int64.init) }
+
+    /// Finite pinned playback payload that may exceed the optional retention allowance.
+    /// Does not include muxer staging, init/subtitle data, AVPlayer buffers, or recording output.
+    public var nativeLiveDVRMandatoryBytes: Int64? {
+        guard isLive, videoRoute == .loopback, let session = nativeVideoSession else { return nil }
+        return Int64(session.nativeLiveDVRMandatoryBytes)
+    }
+
+    /// Publish the live timeline after reconciling actual resident history.
     func publishLiveWindow(edgeSessionTime: Double) {
         guard var w = liveWindow else { return }
+        if videoRoute == .loopback, let limits = nativeVideoSession?.nativeLiveDVRWindow {
+            w.setWindowSeconds(limits.windowSeconds)
+        } else if videoRoute == .software {
+            // The software spool owns both actual retained history and capacity expiry.
+            // A route transition never transfers expanded native retention into it.
+            w.setWindowSeconds(softwareHost?.liveDVRWindowSeconds)
+        }
         w.noteEdge(edgeSessionTime)
         w.notePlayhead(currentTime)
-        w.noteResidentFloor(residentLiveFloorSessionSeconds() ?? softwareHost?.dvrResidentFloorSessionSeconds)
+        // Resident media bounds the allowance on both playback routes.
+        w.noteResidentFloor(videoRoute == .software ? softwareHost?.liveDVRResidentFloor : residentLiveFloorSessionSeconds())
         // Sodalite#104 round 4: the cadence the playlist declares, which outranks how the source
         // happened to deliver. nil on the paths that serve no playlist of ours.
         w.noteTargetDuration(liveTargetDurationSeconds)

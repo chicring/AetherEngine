@@ -102,6 +102,49 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
     private var server: HLSLocalServer?
     var provider: VideoSegmentProvider?
+    let nativeLiveDVRPolicy = LiveDVRRetentionPolicy() // shared native retention contract; internal for integration witnesses
+    private let liveRetentionQueue = DispatchQueue(label: "com.aetherengine.live-retention", qos: .utility)
+    private var liveRetentionScheduled = false // restartLock; at most one pending I/O job
+    private var liveRetentionRevision: UInt64 = 0 // restartLock; do not lose an update during I/O
+
+    var nativeLiveDVRWindow: LiveDVRRetentionPolicy.Snapshot? { nativeLiveDVRPolicy.snapshot }
+    var nativeLiveDVRMandatoryBytes: Int { subsystemSnapshot().cache?.nativeLiveMandatoryBytes ?? 0 }
+
+    func setNativeLiveDVRLimits(_ limits: LiveDVRLimits, availableCapacityBytes: Int64?) -> Bool {
+        restartLock.lock()
+        let currentCache = cache
+        let currentProvider = provider
+        restartLock.unlock()
+        guard isLiveSession, let currentCache, currentProvider != nil else { return false }
+        nativeLiveDVRPolicy.update(limits, availableBytes: availableCapacityBytes, residentBytes: currentCache.totalBytes)
+        currentCache.startNativeLiveDVRExpiryChecks()
+        restartLock.lock()
+        liveRetentionRevision &+= 1
+        let schedule = !liveRetentionScheduled
+        liveRetentionScheduled = true
+        restartLock.unlock()
+        if schedule {
+            liveRetentionQueue.async { [weak self] in
+                self?.drainNativeLiveRetentionUpdates()
+            }
+        }
+        return true
+    }
+
+    private func drainNativeLiveRetentionUpdates() {
+        while true {
+            restartLock.lock()
+            let revision = liveRetentionRevision
+            let currentProvider = provider
+            restartLock.unlock()
+            currentProvider?.applyNativeLiveDVRRetention()
+            restartLock.lock()
+            let settled = liveRetentionRevision == revision
+            if settled { liveRetentionScheduled = false }
+            restartLock.unlock()
+            if settled { return }
+        }
+    }
 
     /// The 2026-09-02 field session retained 64 segments spanning more than four minutes. Cache
     /// mutations can arrive much faster than a host timeline needs to redraw, so fold them into at
@@ -1505,6 +1548,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
+            nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
         claim.track { [weak segmentCache] in segmentCache?.totalBytes ?? 0 }
@@ -1967,6 +2011,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // resident cap it can never pass.
                 retentionBudgetBytes: retentionBudgetBytes
             ),
+            nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
             allowsBoundedDegradedStart: liveJoinProfile == .fastZap,
             boundedStartFloorsAtHoldback: LiveEdgePolicy.boundedStartFloorArmed,
             firstServeLatchCoversEngineCut: LiveEdgePolicy.firstServeLatchAllArmed,

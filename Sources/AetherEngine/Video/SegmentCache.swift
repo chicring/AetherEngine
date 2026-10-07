@@ -43,6 +43,10 @@ final class SegmentCache: @unchecked Sendable {
     /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
     /// (live sessions, where the sliding playlist already dropped everything behind the window).
     private let retentionBudgetBytes: Int
+    private let nativeLiveDVRPolicy: LiveDVRRetentionPolicy?
+    private var nativeLiveRetentionFloor = 0
+    private lazy var nativeLiveExpiryQueue = DispatchQueue(label: "com.aetherengine.live-expiry", qos: .utility)
+    private var nativeLiveExpiryTimer: DispatchSourceTimer? // condition; opt-in, cancelled by close
 
     private var entries: [Int: URL] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
@@ -105,10 +109,11 @@ final class SegmentCache: @unchecked Sendable {
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
-         baseDirectory: URL? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
+         baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
+        self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
@@ -134,6 +139,7 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     deinit {
+        nativeLiveExpiryTimer?.cancel()
         releaseLiveMarker()
     }
 
@@ -344,6 +350,8 @@ final class SegmentCache: @unchecked Sendable {
     func close() {
         condition.lock()
         closed = true
+        let expiryTimer = nativeLiveExpiryTimer
+        nativeLiveExpiryTimer = nil
         let dir = sessionDir
         let hadEntries = !entries.isEmpty
         entries.removeAll(keepingCapacity: false)
@@ -356,6 +364,7 @@ final class SegmentCache: @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
 
+        expiryTimer?.cancel()
         releaseLiveMarker()
         try? FileManager.default.removeItem(at: dir)
         // A closed cache holds nothing, and that is a resident-set change like any other. The engine
@@ -762,6 +771,63 @@ final class SegmentCache: @unchecked Sendable {
         return bytes
     }
 
+    /// Metadata-only admission from the host setter. Exactly one weakly-owned timer per opted-in
+    /// cache; it progresses even when the pump is parked and AVPlayer makes no playlist requests.
+    func startNativeLiveDVRExpiryChecks() {
+        condition.lock()
+        guard !closed, nativeLiveDVRPolicy != nil, nativeLiveExpiryTimer == nil else {
+            condition.unlock()
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(queue: nativeLiveExpiryQueue)
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in _ = self?.reconcileExpiredNativeLiveDVRRetention() }
+        nativeLiveExpiryTimer = timer
+        timer.resume()
+        condition.unlock()
+    }
+
+    /// Both the independent timer and the producer use this implementation. The cap is evaluated
+    /// by the caller FIRST; then expiry pruning and the current entry count share this lock hold.
+    /// An expired smaller cap cannot park a pump behind unpruned expanded history.
+    @discardableResult
+    func reconcileExpiredNativeLiveDVRRetention(headroomCap: Int? = nil) -> Bool {
+        condition.lock()
+        guard !closed else { condition.unlock(); return false }
+        let expiredOrDenied = nativeLiveDVRPolicy?.snapshot?.retentionBytes == 0
+        let doomed = expiredOrDenied ? pruneOutsideWindow() : []
+        let hasHeadroom = headroomCap.map { entries.count < $0 } ?? true
+        if !doomed.isEmpty { condition.broadcast() }
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
+        return hasHeadroom
+    }
+
+    /// Called off the main actor after a native limit update and each finalized live segment.
+    func applyNativeLiveRetentionFloor(_ floor: Int) {
+        condition.lock()
+        nativeLiveRetentionFloor = max(nativeLiveRetentionFloor, floor)
+        let doomed = pruneOutsideWindow()
+        condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
+    }
+
+    /// The finite exception consists of the consumer's existing handover/prefetch band and
+    /// eight newest segments. No unbounded `[target ... highestStoredIndex]` exception for live.
+    private func isNativeLiveMandatory(_ index: Int) -> Bool {
+        let consumer = currentTargetIndex >= 0 &&
+            index >= currentTargetIndex - backwardWindow && index <= currentTargetIndex + forwardWindow
+        return consumer || index > _highestStoredIndex - LiveWindowSizing.minSafeSegments
+    }
+
+    var nativeLiveMandatoryBytes: Int {
+        condition.lock(); defer { condition.unlock() }
+        return entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
+    }
+
     // MARK: - Internal
 
     /// Prune to [currentTarget - backwardWindow, max(currentTarget + forwardWindow, highestStoredIndex)].
@@ -775,6 +841,24 @@ final class SegmentCache: @unchecked Sendable {
     /// ends keeps each side of the resident span contiguous, so the provider's residency gate
     /// (a resident backward target = no producer restart) holds across the whole retained span.
     private func pruneOutsideWindow() -> [URL] {
+        if let limits = nativeLiveDVRPolicy?.snapshot {
+            var keptBytes = entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
+            var doomed: [URL] = []
+            // Newest-first produces a contiguous playable suffix, even when an older consumer
+            // band must remain pinned. The published DVR range already walks this suffix.
+            for index in entries.keys.sorted(by: >) where !isNativeLiveMandatory(index) {
+                let bytes = entryBytes[index] ?? 0
+                if index >= nativeLiveRetentionFloor && bytes <= max(0, limits.retentionBytes - keptBytes) {
+                    keptBytes += bytes
+                } else if let url = entries.removeValue(forKey: index) {
+                    _totalBytes -= bytes
+                    entryBytes.removeValue(forKey: index)
+                    videoReaches.removeValue(forKey: index)
+                    doomed.append(url)
+                }
+            }
+            return doomed
+        }
         let lo = currentTargetIndex - backwardWindow
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         var doomed: [URL] = []

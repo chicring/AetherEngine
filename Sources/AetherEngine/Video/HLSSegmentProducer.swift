@@ -1928,7 +1928,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     private func awaitLiveWindowHeadroom(head: Int) -> Bool {
-        if cache.count < liveResidentCap() { return true }
+        // Compute a possibly-expired cap before reconciling its retained history. This is the
+        // same expiry handler as the cache timer, so delayed timer delivery cannot wedge this park.
+        if cache.reconcileExpiredNativeLiveDVRRetention(headroomCap: liveResidentCap()) { return true }
         // #240: a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
@@ -1946,7 +1948,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // from the observed cadence and segment size, so it moves while a park holds, and a park
             // that outlived its own reason would keep the origin undrained for nothing.
             let cap = liveResidentCap()
-            if cache.count < cap {
+            if cache.reconcileExpiredNativeLiveDVRRetention(headroomCap: cap) {
                 EngineLog.emit(
                     "[HLSSegmentProducer] live headroom released head=\(head) after=\(parked)s "
                     + "resident=\(cache.count)",
