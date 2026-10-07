@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Timestamped, cancellable resident previews return measured frame positions without opening a second source or seeking playback.
 
 ## [7.29.0] - 2026-10-07
 

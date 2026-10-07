@@ -2018,6 +2018,9 @@ public final class AetherEngine: ObservableObject {
     /// dismissal. A superseded load throws CancellationError at the first checkpoint.
     var loadGeneration: UInt64 = 0
 
+    /// Distinct across engine instances and refreshed whenever teardown invalidates preview work.
+    public private(set) var scrubPreviewSourceGeneration = UUID()
+
     /// #361: generation of the startup the user is currently waiting through. Deliberately NOT
     /// `loadGeneration`, which counts teardowns: an engine-initiated reroute (an HLS playlist found
     /// on the loopback path, a carriage case rerouted onto ingest) tears down and calls `load()`
@@ -7220,6 +7223,7 @@ public final class AetherEngine: ObservableObject {
         endRecordingIfRunning(reason: .sessionEnded)
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
+        scrubPreviewSourceGeneration = UUID()
         resumeAfterInterruption = false
         #if os(iOS) || os(tvOS)
         // A deactivation still queued from a previous teardown must not land on this session (#215).

@@ -35,6 +35,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var swsContext: UnsafeMutablePointer<SwsContext>?
     private var videoStreamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 90000)
+    private var presentationStartSeconds: Double?
     /// Source SAR (sample aspect ratio) read from the stream at open. Anamorphic
     /// sources (NTSC/PAL DVD, anamorphic Blu-ray) store non-square pixels; without
     /// this the thumbnail draws square-pixel and looks stretched. Defaults 1:1.
@@ -198,6 +199,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         videoStreamIndex = videoIdx
         timeBase = stream.pointee.time_base
+        presentationStartSeconds = stream.pointee.start_time == Int64.min || timeBase.den <= 0
+            ? nil : Double(stream.pointee.start_time) * Double(timeBase.num) / Double(timeBase.den)
 
         demuxer.discardAllStreamsExcept([videoIdx])
 
@@ -383,7 +386,10 @@ final class FrameDecodeContext: @unchecked Sendable {
         targetWidth: Int,
         maxSize: CGSize?,
         afterFirstFrame offsetSeconds: Double? = nil,
-        isCancelled: () -> Bool
+        isCancelled: () -> Bool,
+        residentTarget: Double? = nil,
+        reportResidentTime: ((Double, Bool) -> Void)? = nil,
+        residentDeadline: ContinuousClock.Instant? = nil
     ) -> CGImage? {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
 
@@ -413,10 +419,17 @@ final class FrameDecodeContext: @unchecked Sendable {
                 category: .swPlayback)
         }
 
-        demuxer.seek(to: seekSeconds)
+        // A resident reader contains one segment. The request already carries
+        // the raw target restored from its byte epoch, independent of tfdt zero.
+        if let residentTarget, mode == .snapshot {
+            guard let start = presentationStartSeconds, abs(residentTarget - start) <= 12 else { return nil }
+        }
+        demuxer.seek(to: residentTarget == nil ? seekSeconds : 0)
 
+        // A resident frame is compared on its source PTS axis, including any nonzero segment origin.
         // A target the stream's own time base cannot hold is no position in it (audit BIT-105).
-        guard var targetPTS = Demuxer.ticks(forSeconds: seekSeconds, timeBase: timeBase) else { return nil }
+        let targetSeconds = residentTarget ?? seekSeconds
+        guard var targetPTS = Demuxer.ticks(forSeconds: targetSeconds, timeBase: timeBase) else { return nil }
         // AE#711 follow-up: a target measured from the first frame decoded rather than on the stream's
         // axis, for a cache segment whose fMP4 tfdt may be absolute or zero-based (after a producer
         // restart). Fixed on the first frame that carries a PTS.
@@ -425,6 +438,8 @@ final class FrameDecodeContext: @unchecked Sendable {
             guard let ticks = Demuxer.ticks(forSeconds: max(0, offsetSeconds), timeBase: timeBase) else { return nil }
             offsetTicks = ticks
         }
+        let deadline = residentDeadline ?? ContinuousClock.now.advanced(by: .milliseconds(750))
+        var packetCount = 0
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard frame != nil else { return nil }
@@ -497,6 +512,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         var draining = false
         while true {
             if isCancelled() { return nil }
+            if residentTarget != nil, (ContinuousClock.now >= deadline || packetCount >= 900) { return nil }
 
             if !draining {
                 let packetOrNil: UnsafeMutablePointer<AVPacket>?
@@ -510,6 +526,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                     draining = true
                     continue
                 }
+                packetCount += 1
                 if packet.pointee.stream_index != videoStreamIndex {
                     av_packet_unref(packet)
                     av_packet_free_safe(packet)
@@ -565,7 +582,17 @@ final class FrameDecodeContext: @unchecked Sendable {
                         targetWidth: targetWidth,
                         maxSize: maxSize,
                         afterFirstFrame: offsetSeconds,
-                        isCancelled: isCancelled)
+                        isCancelled: isCancelled,
+                        residentTarget: residentTarget,
+                        reportResidentTime: reportResidentTime,
+                        residentDeadline: deadline)
+                }
+                if let residentTarget {
+                    guard f.pointee.pts != Int64.min else { return nil }
+                    let raw = Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)
+                    guard raw.isFinite else { return nil }
+                    reportResidentTime?(raw, mode == .snapshot && raw >= residentTarget &&
+                        presentationStartSeconds.map { residentTarget >= $0 } == true)
                 }
                 return image
             }
