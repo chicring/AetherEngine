@@ -10,14 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.30.0] - 2026-10-08
+
 ### Added
 
-- Timestamped, cancellable resident previews return measured frame positions without opening a second source or seeking playback.
-- Disposable source-backed snapshots accept a caller-supplied budget across opening, stream analysis, seek and decode, with cancellation and measured presentation timestamps.
+- **`scrubPreviewFrame(atSeconds:refined:maxWidth:isCancelled:)` returns a timestamped, cancellable preview (#716).** The same resident bytes `scrubThumbnail` decodes from (native segment cache, software packet cache or DVR ring), never a second source connection and never a playback seek, but the result is a `ScrubFrame` carrying the measured `actualSeconds` on the `seek(to:)` axis, whether the decode reached the target (`refined`), and the resident `validRange` of the run it came from. A request is bounded at 750 ms and 900 packets, and a cancelled, replaced or stale request returns nil. `scrubPreviewSourceGeneration` changes on every teardown so a host can fence late results, `clearResidentPreviewFrames()` drops in-flight work. Contributed by yucelokan.
+- **`FrameExtractor.boundedSnapshot(at:maxSize:limits:cancellation:)` puts one budget over a disposable still (#717).** The caller's `ProbeLimits` and `ProbeCancellation` span open, stream analysis, seek and decode, a stalled HTTP response header included, and the result is a `BoundedStillFrame` with the decoded frame's PTS where the source carries one. A resident preview request cancels a bounded one still in flight on the same extractor. Ordinary `snapshot` and `thumbnail` are unchanged. Contributed by yucelokan.
 
 ### Fixed
 
-- The single-demuxer stream-copy live path recognizes exact source replay using timestamps and payload signatures, discarding duplicates only after both audio and video confirm the overlap. Uncertain candidates return to ordinary discontinuity handling.
+- **A live origin that resends packets after a reconnect no longer plays them twice (#715).** On the single-demuxer stream-copy live path, a backward timestamp jump whose packets match accepted ones in DTS, PTS and SHA-256 of the payload is buffered until both audio and video have passed their old frontier, then the duplicates are dropped and playback continues on the existing timeline. A single mismatch, a read error, EOF or the bound (96 MB, 10,000 packets) hands every buffered packet to the ordinary discontinuity rebase, so a genuine programme boundary loses nothing. Bridged and side audio are excluded. The no-cut watchdog treats the check as intentional while still catching a starved source. Contributed by yucelokan.
 
 ## [7.29.0] - 2026-10-07
 
