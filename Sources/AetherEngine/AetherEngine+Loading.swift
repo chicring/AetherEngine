@@ -2350,7 +2350,16 @@ extension AetherEngine {
         // invalidated by a media-services reset (audit LIF-104).
         let keepAudioSwitchItem = audioStreamIndex != nil && discTitleIDOverride == nil
             && !targetSoftwarePath && !mediaServicesWereReset && nativeHost?.avPlayer.currentItem != nil
-        if keepAudioSwitchItem { nativeHost?.pause() }
+        if keepAudioSwitchItem {
+            nativeHost?.pause()
+            let heldGeneration = loadGeneration
+            await holdPictureAcrossItemSwap()
+            // A stop() or load() that landed while the frame was read owns the engine now.
+            guard loadGeneration == heldGeneration, !Task.isCancelled else {
+                releaseHeldPicture(reason: "rebuild superseded")
+                return nil
+            }
+        }
         stopInternal(resetDisplayCriteria: false,
                      keepNativeHost: !targetSoftwarePath && !mediaServicesWereReset,
                      keepCustomReader: true, keepCurrentItem: keepAudioSwitchItem)
@@ -2598,6 +2607,7 @@ extension AetherEngine {
             return nil
         } catch {
             guard loadGeneration == gen, !Task.isCancelled else { return nil }
+            releaseHeldPicture(reason: "rebuild failed")
             EngineLog.emit(
                 "[AetherEngine] selectAudioTrack reload failed: \(error), playback stopped",
                 category: .engine

@@ -1677,7 +1677,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// The surface the layer is presented on: the most recently bound one that is still alive.
-    private var boundView: AetherPlayerView? {
+    var boundView: AetherPlayerView? {
         boundSurfaces.last { $0.view != nil }?.view
     }
 
@@ -3460,6 +3460,13 @@ public final class AetherEngine: ObservableObject {
     /// `sessionRebuildResumesPlaying`. See `rebuildResumesPlaying`.
     var transportIntentUnderReconstruction: Bool?
     private(set) var audioSelectionTask: Task<Void, Never>?
+    /// AE#711 follow-up: the picture held over an in-place item swap. See `holdPictureAcrossItemSwap`.
+    var heldPictureRelease: AnyCancellable?
+    weak var heldPictureView: AetherPlayerView?
+    var heldPictureToken = 0
+    var heldPictureShownAt: ContinuousClock.Instant?
+    /// What took the last held picture down, for the log line and the tests that pin it.
+    var heldPictureLastRelease: String?
     private var pendingAudioSelection: Int?
     private var audioSelectionEpoch = UUID()
 
@@ -3973,6 +3980,7 @@ public final class AetherEngine: ObservableObject {
         // has already unloaded the item, so there is nothing left to hand over in place.
         let handOverInPlace = consumeInPlaceItemHandoverRequest(priorBackendWasNative: priorBackendWasNative)
         cancelPendingAudioSelection()
+        releaseHeldPicture(reason: "new load")
         pendingInPlaceItemHandover = handOverInPlace
         // #128 follow-up: preserve the previous session's display criteria across the load seam. Nil-ing it
         // here bounces the panel through SDR before apply() re-negotiates the same mode on video->video
@@ -6219,6 +6227,7 @@ public final class AetherEngine: ObservableObject {
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         cancelPendingAudioSelection()
+        releaseHeldPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false
         stopInternal(resetDisplayCriteria: resetDisplayCriteria,
                      finalTeardown: finalTeardown ?? resetDisplayCriteria)

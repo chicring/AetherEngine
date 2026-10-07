@@ -30,6 +30,8 @@ import SwiftUI
 public final class AetherPlayerView: PlatformBaseView {
 
     private var hostedLayer: CALayer?
+    /// AE#711 follow-up: the picture held over an in-place item swap, above `hostedLayer`.
+    private var stillLayer: AVSampleBufferDisplayLayer?
 
     /// Engine-internal. The engine this view was last bound to, so a dismantling surface can unbind
     /// from it synchronously and a second engine binding the view can take it over (AE#536).
@@ -81,10 +83,11 @@ public final class AetherPlayerView: PlatformBaseView {
     #endif
 
     private func applyLayerFrame() {
-        guard let hosted = hostedLayer else { return }
+        guard hostedLayer != nil || stillLayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        hosted.frame = bounds
+        hostedLayer?.frame = bounds
+        stillLayer?.frame = bounds
         CATransaction.commit()
     }
 
@@ -104,9 +107,9 @@ public final class AetherPlayerView: PlatformBaseView {
             hosted.removeFromSuperlayer()
         }
         #if canImport(UIKit)
-        self.layer.addSublayer(layer)
+        if let still = stillLayer { self.layer.insertSublayer(layer, below: still) } else { self.layer.addSublayer(layer) }
         #elseif canImport(AppKit)
-        self.layer?.addSublayer(layer)
+        if let still = stillLayer { self.layer?.insertSublayer(layer, below: still) } else { self.layer?.addSublayer(layer) }
         // Resize the video layer in lockstep with the view's bounds during a
         // live window drag. Without this it only catches up on the next layout()
         // pass, and because an NSView's layer is anchored bottom-left that lag
@@ -123,6 +126,7 @@ public final class AetherPlayerView: PlatformBaseView {
     /// replacement (used on unbind / teardown). Same ownership rule as
     /// `attach`: a layer that has moved to another surface stays there.
     func detach() {
+        clearStill()
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -131,6 +135,74 @@ public final class AetherPlayerView: PlatformBaseView {
         }
         hostedLayer = nil
         CATransaction.commit()
+    }
+
+    // MARK: - Held picture
+
+    /// Engine-internal. Lays `frame` over the hosted layer until `clearStill()`: `replaceCurrentItem`
+    /// drops an AVPlayerLayer to black until the next item's first frame, and an in-place rebuild
+    /// should not show that. A sample-buffer layer rather than `contents`, so an HDR frame is
+    /// presented through its colour attachments the way the software path presents every frame.
+    /// False when the frame cannot be wrapped for display; nothing is shown then.
+    @discardableResult
+    func showStill(_ frame: CVPixelBuffer, gravity: AVLayerVideoGravity, isHDR: Bool) -> Bool {
+        clearStill()
+        guard let sample = Self.stillSample(frame) else { return false }
+        let still = AVSampleBufferDisplayLayer()
+        still.videoGravity = gravity
+        if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
+            still.preferredDynamicRange = isHDR ? .high : .standard
+        } else {
+            #if os(iOS) || os(macOS)
+            still.wantsExtendedDynamicRangeContent = isHDR
+            #endif
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        #if canImport(UIKit)
+        layer.addSublayer(still)
+        #elseif canImport(AppKit)
+        layer?.addSublayer(still)
+        #endif
+        still.frame = bounds
+        still.sampleBufferRenderer.enqueue(sample)
+        stillLayer = still
+        CATransaction.commit()
+        return true
+    }
+
+    /// Engine-internal. Removes the held picture, if any. Idempotent.
+    func clearStill() {
+        guard let still = stillLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        still.removeFromSuperlayer()
+        CATransaction.commit()
+        still.sampleBufferRenderer.flush()
+        stillLayer = nil
+    }
+
+    var isHoldingStill: Bool { stillLayer != nil }
+
+    private static func stillSample(_ frame: CVPixelBuffer) -> CMSampleBuffer? {
+        var description: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescriptionOut: &description
+        ) == noErr, let description else { return nil }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero,
+                                        decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescription: description,
+            sampleTiming: &timing, sampleBufferOut: &sample
+        ) == noErr, let sample else { return nil }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0 {
+            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+        return sample
     }
 }
 
