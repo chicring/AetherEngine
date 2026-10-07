@@ -1892,8 +1892,8 @@ final class NativeAVPlayerHost {
         _ = await seek(to: seconds, deadlineSeconds: nil)
     }
 
-    /// Deadline-bounded seek (#65). Returns `true` if AVPlayer physically landed (or no deadline was set),
-    /// `false` if `deadlineSeconds` elapsed with the seek still pending. On a deadline expiry the in-flight
+    /// Deadline-bounded seek (#65). Returns `true` only for a successful completion near the target,
+    /// `false` for an interrupted/clamped seek or a deadline with the seek still pending. On a deadline expiry the in-flight
     /// `avPlayer.seek` is NOT cancelled (it lands later if it ever can), but `seekInFlight` is cleared for the
     /// latest generation so the periodic observer resumes publishing AVPlayer's real position, letting the
     /// engine reconcile a clock that would otherwise stay latched at an unreachable optimistic target.
@@ -1919,19 +1919,23 @@ final class NativeAVPlayerHost {
                 }
             }
             // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
-            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player = avPlayer] finished in
+                // Sample at completion, before a busy main actor can let playback advance far
+                // enough to make a successful seek appear to have missed the target.
+                let actual = player?.currentTime().seconds ?? .nan
                 Task { @MainActor in
                     guard let self else {
-                        if resumeGuard.claim() { cont.resume(returning: true) }
+                        if resumeGuard.claim() { cont.resume(returning: false) }
                         return
                     }
+                    let landed = gen == self.seekGeneration && Self.seekCompletionReachedTarget(
+                        finished: finished, actual: actual, target: seconds)
                     // Settle the clock on a real landing even if the deadline already returned (late landing).
                     // Superseded seek: leave the newer generation's flags intact.
                     if gen == self.seekGeneration {
                         self.seekInFlight = false
-                        let landed = self.avPlayer.currentTime().seconds
-                        if landed.isFinite {
-                            self.currentTime = landed
+                        if actual.isFinite {
+                            self.currentTime = actual
                             // #49: settle renderedTime so sourceTime settles immediately, BUT only when the
                             // landed frame is actually presented (playing or paused shows the target frame).
                             // #123: while still buffering toward the target (`waitingToPlayAtSpecifiedRate`)
@@ -1940,17 +1944,25 @@ final class NativeAVPlayerHost {
                             // ahead of the picture for the whole chase, because the 100ms periodic observer is
                             // silent while waiting and cannot walk it back. Hold renderedTime on the frozen
                             // frame; the observer settles it to the target when playback resumes.
-                            if AetherEngine.seekLandingSettlesToTarget(
+                            if landed, AetherEngine.seekLandingSettlesToTarget(
                                 bufferingTowardTarget: self.isBufferingTowardSeekTarget) {
                                 self.latestSeekRenderedTimePublished = true
-                                self.renderedTime = landed
+                                self.renderedTime = actual
                             }
                         }
                     }
-                    if resumeGuard.claim() { cont.resume(returning: true) }
+                    EngineLog.emit("[NativeAVPlayerHost] seek completion target=\(String(format: "%.2f", seconds)) actual=\(String(format: "%.2f", actual)) finished=\(finished) landed=\(landed) current=\(gen == self.seekGeneration)", category: .engine)
+                    if resumeGuard.claim() { cont.resume(returning: landed) }
                 }
             }
         }
+    }
+
+    /// A callback can report an interrupted seek or a clamp to the old position. Neither is a
+    /// landing. Allow sub-second clock rounding, but never accept an unrelated playhead merely
+    /// because the requested destination is behind it.
+    nonisolated static func seekCompletionReachedTarget(finished: Bool, actual: Double, target: Double) -> Bool {
+        finished && actual.isFinite && target.isFinite && abs(actual - target) <= 0.75
     }
 
     /// DV/SMB forward-seek revert fix: wait longer for the seek already in flight WITHOUT issuing a

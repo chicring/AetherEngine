@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- HTTP VOD opening retries an unanswered data request without misclassifying seekability. Caller-selected opening budgets and scoped size discovery keep single-request origins serial and cancel losing metadata probes before playback. VOD exposes measured seekability, ignores unsupported saved positions and reports actual native seek completion.
 
 ## [7.28.3] - 2026-10-07
 
