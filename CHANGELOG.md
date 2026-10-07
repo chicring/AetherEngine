@@ -14,11 +14,13 @@ the public-API contract.
 
 - `setSoftwareSubtitleDelay(_:)` applies a persistent, caller-selected subtitle offset to both channels in software PiP without changing the playback clock. Native renditions remain unchanged.
 - `needsForegroundVideoRestore` exposes actual background video teardown so a host can rebuild through the existing reload API before resuming.
+- **`PlaybackErrorKind.storageExhausted`.** The volume holding the loopback segment cache filled up and the session could not write its segments.
 
 ### Fixed
 
 - Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
 - Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
+- **A full segment volume is reported as one, not as a source that cannot be muxed.** When the temporary directory's volume ran out of space, the session directory, the segments or the muxer's staging files could not be written, every muxer revive failed the same way, and the give-up arm surfaced `vodSourceFailed` ("Source audio cannot be muxed"), or `audioBridgeProducedNoOutput` on a bridged track. Both send a host's fallback ladder the wrong way for a file that plays once space is freed. The segment cache now latches an out-of-space write from any of the three, and the give-up arm surfaces `.storageExhausted` ahead of the audio verdicts. Measured on a device with 197 MB free: a 4K60 title failed to start with the muxer message.
 
 ## [7.28.3] - 2026-10-07
 
