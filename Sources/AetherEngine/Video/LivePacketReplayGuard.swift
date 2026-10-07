@@ -16,13 +16,22 @@ struct LivePacketReplayGuard {
         let stream: Stream
         let dts: Int64
         let pts: Int64
-        let digest: [UInt8]
+        let digest: SHA256.Digest
 
         init(stream: Stream, dts: Int64, pts: Int64, payload: Data) {
+            self.init(stream: stream, dts: dts, pts: pts, digest: SHA256.hash(data: payload))
+        }
+
+        /// Hashes the packet's own buffer: every live packet passes through here, so no copy.
+        init(stream: Stream, dts: Int64, pts: Int64, payload: UnsafeRawBufferPointer) {
+            self.init(stream: stream, dts: dts, pts: pts, digest: SHA256.hash(data: payload))
+        }
+
+        private init(stream: Stream, dts: Int64, pts: Int64, digest: SHA256.Digest) {
             self.stream = stream
             self.dts = dts
             self.pts = pts
-            self.digest = Array(SHA256.hash(data: payload))
+            self.digest = digest
         }
     }
 

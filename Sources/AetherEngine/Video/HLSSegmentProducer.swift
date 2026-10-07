@@ -2949,8 +2949,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             timeBaseSeconds = sourceVideoTbSeconds
         } else if let audio = audioConfig,
                   packet.pointee.stream_index == audio.sourceStreamIndex,
-                  (sideAudioDemuxer == nil && origin == .main
-                   || sideAudioDemuxer != nil && origin == .side) {
+                  origin == .main {
             stream = .audio
             timeBaseSeconds = audioSourceTbSeconds
         } else {
@@ -2959,7 +2958,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         guard timeBaseSeconds > 0 else { return nil }
         let signature = LivePacketReplayGuard.Signature(
             stream: stream, dts: packet.pointee.dts, pts: packet.pointee.pts,
-            payload: Data(bytes: bytes, count: Int(packet.pointee.size)))
+            payload: UnsafeRawBufferPointer(start: bytes, count: Int(packet.pointee.size)))
         return LiveReplaySample(signature: signature,
                                 seconds: Double(packet.pointee.dts) * timeBaseSeconds,
                                 timeBaseSeconds: timeBaseSeconds)
