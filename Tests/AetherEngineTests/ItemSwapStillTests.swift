@@ -16,9 +16,7 @@ struct ItemSwapStillTests {
 
     /// Four seconds of H.264 plus silent AAC, long enough to still be playing when the capture runs
     /// and with an audio stream for the audio-switch rebuild to name. The shared fixtures end after
-    /// 0.2 s, before an output attached to them sees a frame. Each track feeds itself through
-    /// `requestMediaDataWhenReady`: an interleaving writer fed from one loop waits on whichever
-    /// track the loop is not on.
+    /// 0.2 s, before an output attached to them sees a frame.
     private static func fixtureURL() async throws -> URL {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("ae711-still-\(UUID().uuidString).mp4")
@@ -49,63 +47,74 @@ struct ItemSwapStillTests {
                                        formatDescriptionOut: &formatOut)
         let audioFormat = try #require(formatOut)
 
-        let videoDone = FixtureFlag()
-        let audioDone = FixtureFlag()
-        do {
-            let frame = FixtureCounter()
-            video.requestMediaDataWhenReady(on: DispatchQueue(label: "ae711.fixture.video")) {
-                while video.isReadyForMoreMediaData && frame.value < 120 {
-                    // Our own buffer, not one from the adaptor's pool: that pool belongs to the
-                    // writer, and drawing from it under load segfaulted the whole test process
-                    // inside CVPixelBufferPoolCreatePixelBuffer.
-                    guard writer.status == .writing else { break }
-                    var buffer: CVPixelBuffer?
-                    CVPixelBufferCreate(nil, 128, 72, kCVPixelFormatType_32BGRA, nil, &buffer)
-                    guard let pixels = buffer else { break }
+        // One loop feeds both tracks, each whenever IT is ready, and never waits on either. The
+        // writer interleaves: it stops taking video once video is far enough ahead of audio, and
+        // then takes nothing more until audio catches up. With a `requestMediaDataWhenReady` block
+        // per track that catching up depends on AVFoundation calling the audio block again, and on
+        // a loaded CI runner it did not: `video 88/120 ready=false, audio 21/40 ready=true`, the
+        // audio block called once in total, until the deadline below. A loop that waits on one
+        // track at a time deadlocks the same way from the other side.
+        let chunk = 4800
+        var frame = 0
+        var chunks = 0
+        var videoDone = false
+        var audioDone = false
+        let deadline = ContinuousClock.now + .seconds(20)
+        while !(videoDone && audioDone), writer.status == .writing, ContinuousClock.now < deadline {
+            var fed = false
+            if !videoDone, video.isReadyForMoreMediaData {
+                // Our own buffer, not one from the adaptor's pool: that pool belongs to the
+                // writer, and drawing from it under load segfaulted the whole test process
+                // inside CVPixelBufferPoolCreatePixelBuffer.
+                var buffer: CVPixelBuffer?
+                CVPixelBufferCreate(nil, 128, 72, kCVPixelFormatType_32BGRA, nil, &buffer)
+                if let pixels = buffer {
                     CVPixelBufferLockBaseAddress(pixels, [])
-                    memset(CVPixelBufferGetBaseAddress(pixels), Int32(frame.value * 2 % 256),
+                    memset(CVPixelBufferGetBaseAddress(pixels), Int32(frame * 2 % 256),
                            CVPixelBufferGetDataSize(pixels))
                     CVPixelBufferUnlockBaseAddress(pixels, [])
-                    adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame.value), timescale: 30))
-                    frame.value += 1
+                    if adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30)) {
+                        frame += 1
+                        fed = true
+                    }
                 }
-                if frame.value >= 120, videoDone.set() { video.markAsFinished() }
+                if frame >= 120 {
+                    video.markAsFinished()
+                    videoDone = true
+                }
             }
-            let chunk = 4800
-            let chunks = FixtureCounter()
-            audio.requestMediaDataWhenReady(on: DispatchQueue(label: "ae711.fixture.audio")) {
-                while audio.isReadyForMoreMediaData && chunks.value < 40 {
-                    guard writer.status == .writing else { break }
-                    var block: CMBlockBuffer?
-                    CMBlockBufferCreateWithMemoryBlock(
-                        allocator: nil, memoryBlock: nil, blockLength: chunk * 2, blockAllocator: nil,
-                        customBlockSource: nil, offsetToData: 0, dataLength: chunk * 2,
-                        flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
-                    guard let data = block else { break }
+            if !audioDone, audio.isReadyForMoreMediaData {
+                var block: CMBlockBuffer?
+                CMBlockBufferCreateWithMemoryBlock(
+                    allocator: nil, memoryBlock: nil, blockLength: chunk * 2, blockAllocator: nil,
+                    customBlockSource: nil, offsetToData: 0, dataLength: chunk * 2,
+                    flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
+                var sample: CMSampleBuffer?
+                if let data = block {
                     CMBlockBufferFillDataBytes(with: 0, blockBuffer: data, offsetIntoDestination: 0,
                                                dataLength: chunk * 2)
-                    var sample: CMSampleBuffer?
                     CMAudioSampleBufferCreateReadyWithPacketDescriptions(
                         allocator: nil, dataBuffer: data, formatDescription: audioFormat,
                         sampleCount: chunk,
-                        presentationTimeStamp: CMTime(value: CMTimeValue(chunks.value * chunk), timescale: 48_000),
+                        presentationTimeStamp: CMTime(value: CMTimeValue(chunks * chunk), timescale: 48_000),
                         packetDescriptions: nil, sampleBufferOut: &sample)
-                    guard let sample else { break }
-                    audio.append(sample)
-                    chunks.value += 1
                 }
-                if chunks.value >= 40, audioDone.set() { audio.markAsFinished() }
+                if let sample, audio.append(sample) {
+                    chunks += 1
+                    fed = true
+                }
+                if chunks >= 40 {
+                    audio.markAsFinished()
+                    audioDone = true
+                }
             }
+            if !fed { try await Task.sleep(for: .milliseconds(5)) }
         }
-        // Polled rather than awaited: a writer that fails stops calling one of the two blocks, and
-        // a group waiting on both would wait for it forever.
-        let deadline = ContinuousClock.now + .seconds(20)
-        while !(videoDone.isSet && audioDone.isSet), writer.status == .writing, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        guard videoDone.isSet, audioDone.isSet else {
+        guard videoDone, audioDone else {
+            let state = "video \(frame)/120 ready=\(video.isReadyForMoreMediaData), "
+                + "audio \(chunks)/40 ready=\(audio.isReadyForMoreMediaData)"
             writer.cancelWriting()
-            throw FixtureWriterFailed(status: writer.status.rawValue, error: writer.error)
+            throw FixtureWriterFailed(status: writer.status.rawValue, error: writer.error, state: state)
         }
         await writer.finishWriting()
         #expect(writer.status == .completed)
@@ -397,21 +406,9 @@ struct ItemSwapStillTests {
     }
 }
 
-/// One track's position in the fixture writer, touched only on that track's own serial queue.
-private final class FixtureCounter: @unchecked Sendable {
-    var value = 0
-}
-
-/// A track that has written all of its samples, read from the test while the track's queue sets it.
-private final class FixtureFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    var isSet: Bool { lock.withLock { value } }
-    /// True only for the call that set it.
-    func set() -> Bool { lock.withLock { defer { value = true }; return !value } }
-}
-
 private struct FixtureWriterFailed: Error {
     let status: Int
     let error: Error?
+    /// Where each track stood when the wait gave up, read the instant before the cancel.
+    let state: String
 }
