@@ -60,8 +60,11 @@ final class SegmentCache: @unchecked Sendable {
     private var inProgress: [Int: URL] = [:]
     /// The staging file each recently adopted segment was renamed from, and its final size, so a
     /// progressive reader can tell that the file IT holds was sealed, rather than the same index
-    /// produced again by a later epoch. Bounded to the most recent adoptions.
-    private var sealedFromStaging: [Int: (staging: URL, bytes: Int)] = [:]
+    /// produced again by a later epoch. Keyed by staging file (unique per segment and epoch) and
+    /// bounded to the most recent adoptions in adoption order: evicting by index dropped every
+    /// adoption below the 64 highest at once, so after a backward seek each reader read as abandoned.
+    private var sealedFromStaging: [URL: Int] = [:]
+    private var sealedStagingOrder: [URL] = []
 
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
@@ -327,11 +330,11 @@ final class SegmentCache: @unchecked Sendable {
         // Sealed or not, this staging file is no longer being written.
         if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
         if renameOK {
-            sealedFromStaging[index] = (stagingPath, byteCount)
-            if sealedFromStaging.count > Self.sealedStagingMemory {
-                for key in sealedFromStaging.keys.sorted().prefix(sealedFromStaging.count - Self.sealedStagingMemory) {
-                    sealedFromStaging.removeValue(forKey: key)
-                }
+            if sealedFromStaging.updateValue(byteCount, forKey: stagingPath) == nil {
+                sealedStagingOrder.append(stagingPath)
+            }
+            while sealedStagingOrder.count > Self.sealedStagingMemory {
+                sealedFromStaging.removeValue(forKey: sealedStagingOrder.removeFirst())
             }
         }
         guard !closed else {
@@ -382,6 +385,7 @@ final class SegmentCache: @unchecked Sendable {
         initVersions.removeAll(keepingCapacity: false)
         inProgress.removeAll(keepingCapacity: false)
         sealedFromStaging.removeAll(keepingCapacity: false)
+        sealedStagingOrder.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
         condition.broadcast()
@@ -530,9 +534,7 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         if inProgress[index] == stagingPath { return .writing }
-        if let sealed = sealedFromStaging[index], sealed.staging == stagingPath {
-            return .sealed(bytes: sealed.bytes)
-        }
+        if let bytes = sealedFromStaging[stagingPath] { return .sealed(bytes: bytes) }
         return .abandoned
     }
 
@@ -1087,9 +1089,10 @@ final class ProgressiveSegmentReader: @unchecked Sendable {
                 break
             case .sealed(let bytes):
                 if offset >= Int64(bytes) { return .finished }
-                // The last fragment landed with the seal: read on. A file shorter than its recorded
-                // size is not a state to spin in.
-                if statOK, st.st_size > offset { continue }
+                // The last fragment can land with the seal, after the stat above, so stat again and
+                // read on. A file shorter than its recorded size is not a state to spin in.
+                var sealedStat = stat()
+                if fstat(fd, &sealedStat) == 0, sealedStat.st_size > offset { continue }
                 return .abandoned
             case .abandoned:
                 return .abandoned

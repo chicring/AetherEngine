@@ -66,6 +66,28 @@ struct ProgressiveSegmentDeliveryTests {
         #expect(reader.next() == .abandoned)
     }
 
+    @Test("a low index sealed after many higher adoptions still finishes (backward seek)")
+    func lowIndexSealedAfterManyHigherAdoptions() throws {
+        let cache = makeCache()
+        defer { cache.close() }
+        let payload = bytes(100, seed: 3)
+        for index in 100..<(100 + SegmentCache.sealedStagingMemory) {
+            let (staging, handle) = try makeStaging(cache, index: index)
+            handle.write(payload)
+            try handle.close()
+            cache.beginInProgress(index: index, stagingPath: staging)
+            cache.adopt(index: index, stagingPath: staging, byteCount: payload.count)
+        }
+        let (staging, handle) = try makeStaging(cache, index: 10)
+        handle.write(payload)
+        try handle.close()
+        cache.beginInProgress(index: 10, stagingPath: staging)
+        let reader = try #require(ProgressiveSegmentReader(cache: cache, index: 10, stagingPath: staging))
+        #expect(reader.next() == .bytes(payload))
+        cache.adopt(index: 10, stagingPath: staging, byteCount: payload.count)
+        #expect(reader.next(pollInterval: 0.01, idleTimeout: 0.5) == .finished)
+    }
+
     @Test("a producer that stops writing does not hold a reader forever")
     func idleReaderGivesUp() throws {
         let cache = makeCache()

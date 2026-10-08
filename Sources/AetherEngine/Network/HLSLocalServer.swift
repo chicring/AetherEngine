@@ -1324,8 +1324,6 @@ final class HLSLocalServer: @unchecked Sendable {
     static let chunkFrameTrailer = Data("\r\n".utf8)
     static let chunkedFinal = Data("0\r\n\r\n".utf8)
 
-    /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
-    /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
     /// Body for a progressively delivered segment: one chunk per read (usually the fragment the muxer
     /// just flushed), the final chunk once the sealed segment is read to its end. Returns false
     /// without the final chunk when the producer abandons the segment.
@@ -1357,6 +1355,8 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
+    /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
+    /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
     private func sendChunkedBody(fd: Int32, path: String, data: Data) -> Bool {
         EngineLog.emit(
             "[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=video/mp4 [chunked, early header]",
