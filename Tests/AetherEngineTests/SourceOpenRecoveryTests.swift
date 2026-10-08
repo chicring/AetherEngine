@@ -2,6 +2,30 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
+/// Fires `action` from a thread of its own the moment `condition` holds. The engine work runs on
+/// `ProbeTestJob`'s thread, so a step that must land inside one of its short windows (a slot wait,
+/// a stalled body) cannot be left to an async test task: on a loaded runner the cooperative pool
+/// resumed those 20 ms polls tens of seconds late, missed the window, and the test hung or saw a
+/// timeout it was not about.
+private final class ProbeTestTrigger: @unchecked Sendable {
+    private let fired = ProbeTestBox(false)
+    var didFire: Bool { fired.value }
+
+    init(deadline seconds: TimeInterval = 60, when condition: @escaping @Sendable () -> Bool,
+         _ action: @escaping @Sendable () -> Void) {
+        let fired = self.fired
+        Thread.detachNewThread {
+            let end = Date(timeIntervalSinceNow: seconds)
+            while !condition() {
+                guard Date() < end else { return }
+                usleep(1_000)
+            }
+            action()
+            fired.update { $0 = true }
+        }
+    }
+}
+
 @Suite(.timeLimit(.minutes(2)))
 struct SourceOpenRecoveryTests {
     private let bytes = Data(repeating: 0x47, count: 8192)
@@ -74,11 +98,18 @@ struct SourceOpenRecoveryTests {
             sourceOpenPolicy: .init(firstByteTimeout: 0.2, sizeProbeTimeout: 2))
         defer { reader.markClosed(); reader.close(); origin.stop() }
         let job = ProbeTestJob { try reader.open() }
-        try await waitFor { origin.blocked.entered }
+        // Release the body the moment the open returns, before the stall machinery can give up on
+        // it, and count the requests at that same moment.
+        let requestsAtOpen = ProbeTestBox(-1)
+        let release = ProbeTestTrigger(when: { job.isFinished }) {
+            requestsAtOpen.update { $0 = origin.requests.count }
+            origin.blocked.open()
+        }
         try await job.outcome().get()
+        try await waitFor { release.didFire }
+        #expect(origin.blocked.entered)
         #expect(reader.isSeekable)
-        #expect(origin.requests.count == 1, "a slow body must not cause a redundant size probe")
-        origin.blocked.open()
+        #expect(requestsAtOpen.value == 1, "a slow body must not cause a redundant size probe")
         #expect(try await readPrefix(reader) == bytes.prefix(16))
         // Reading can legitimately trigger a new forward prefetch after the initial window.
         // It must not repeat discovery or restart from zero.
@@ -140,9 +171,16 @@ struct SourceOpenRecoveryTests {
             sourceOpenPolicy: .init(firstByteTimeout: 1, sizeProbeTimeout: 30))
         defer { reader.close(); OriginRequestBudget.shared.release(ticket); origin.stop() }
         let job = ProbeTestJob { try reader.open() }
-        try await waitFor { OriginRequestBudget.shared.snapshot(for: source)?.waiting == 1 }
-        reader.markClosed()
+        let parked = ProbeTestBox(false)
+        let teardown = ProbeTestTrigger(when: {
+            OriginRequestBudget.shared.snapshot(for: source)?.waiting == 1 || job.isFinished
+        }) {
+            parked.update { $0 = !job.isFinished }
+            reader.markClosed()
+        }
         let result = try await job.outcome()
+        try await waitFor { teardown.didFire }
+        try #require(parked.value, "the size probe never parked for the held slot")
         if case .success = result { Issue.record("cancelled open must not succeed") }
         #expect(origin.requests.isEmpty)
         #expect(OriginRequestBudget.shared.snapshot(for: source)?.inflight == 1)
@@ -177,9 +215,11 @@ struct SourceOpenRecoveryTests {
             sourceOpenPolicy: .init(firstByteTimeout: 0.15, sizeProbeTimeout: 30))
         defer { reader.close(); gate.open(); origin.stop() }
         let job = ProbeTestJob { try reader.open() }
-        try await waitFor { origin.requests.count == 2 }
-        reader.markClosed()
+        let teardown = ProbeTestTrigger(when: { origin.requests.count == 2 || job.isFinished }) {
+            reader.markClosed()
+        }
         let result = try await job.outcome()
+        try await waitFor { teardown.didFire }
         if case .failure(let error) = result { #expect(error is CancellationError) }
         else { Issue.record("cancelled data retry must not open") }
         #expect(OriginRequestBudget.shared.snapshot(for: source)?.inflight == 0)
