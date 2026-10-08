@@ -17,7 +17,7 @@ the public-API contract.
 
 ### Fixed
 
-- **A full segment volume is reported as one, not as a source that cannot be muxed.** When the temporary directory's volume ran out of space, the session directory, the segments or the muxer's staging files could not be written, every muxer revive failed the same way, and the give-up arm surfaced `vodSourceFailed` ("Source audio cannot be muxed"), or `audioBridgeProducedNoOutput` on a bridged track. Both send a host's fallback ladder the wrong way for a file that plays once space is freed. The segment cache now latches an out-of-space write from any of the three, and the give-up arm surfaces `.storageExhausted` ahead of the audio verdicts. Measured on a device with 197 MB free: a 4K60 title failed to start with the muxer message.
+- **A full segment volume is reported as one, not as a source that cannot be muxed.** When the temporary directory's volume ran out of space, the session directory, the segments or the muxer's staging files could not be written, every muxer revive failed the same way, and the give-up arm surfaced `vodSourceFailed` ("Source audio cannot be muxed"), or `audioBridgeProducedNoOutput` on a bridged track. Both send a host's fallback ladder the wrong way for a file that plays once space is freed. The segment cache now latches an out-of-space write from any of the three, and the give-up arm surfaces `.storageExhausted` (`underlyingCode` -28, `AVERROR(ENOSPC)`) ahead of the audio verdicts. A store whose session directory had to be restored first latches on the retry's own error, so a full volume behind a missing directory is caught too. Contributed by yipengfei329. Measured on a device with 197 MB free: a 4K60 title failed to start with the muxer message.
 
 ## [7.31.2] - 2026-10-08
 

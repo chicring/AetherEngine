@@ -709,7 +709,7 @@ extension HLSVideoEngine {
             // as well as an unwritable moov, and neither the source nor its audio is at fault. A host
             // reading `vodSourceFailed` here ended its ladder on a file that plays once space is freed.
             if cache?.storageExhausted == true {
-                surfaceVODSourceFailure(FFmpegErr.einval, "Device storage is full: video segments cannot be written",
+                surfaceVODSourceFailure(FFmpegErr.enospc, "Device storage is full: video segments cannot be written",
                                         kind: .storageExhausted)
                 return
             }

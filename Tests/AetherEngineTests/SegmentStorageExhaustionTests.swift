@@ -67,7 +67,7 @@ struct SegmentStorageExhaustionTests {
 
         #expect(surfaced.snapshot?.kind == .storageExhausted,
                 "vodSourceFailed reads as a dead source and ends a host's fallback ladder")
-        #expect(surfaced.snapshot?.code == FFmpegErr.einval)
+        #expect(surfaced.snapshot?.code == FFmpegErr.enospc)
     }
 
     @Test("an exhausted revive with room on the volume keeps the muxer verdict")

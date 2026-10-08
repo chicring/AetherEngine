@@ -278,6 +278,7 @@ final class SegmentCache: @unchecked Sendable {
         } catch {
             EngineLog.emit("[SegmentCache] session dir restore failed at \(sessionDir.path): \(error)",
                            category: .session)
+            if Self.isOutOfSpace(error) { noteStorageExhausted() }
             return false
         }
         releaseLiveMarker()
@@ -297,13 +298,24 @@ final class SegmentCache: @unchecked Sendable {
             try data.write(to: fileURL, options: [.atomic])
             writeOK = true
         } catch {
-            if restoreSessionDirIfMissing(), (try? data.write(to: fileURL, options: [.atomic])) != nil {
-                writeOK = true
-            } else {
-                EngineLog.emit("[SegmentCache] write failed seg-\(index): \(error)",
+            // The retry's own error decides: a missing directory restored onto a full volume fails
+            // the second write with ENOSPC, behind a first error that only said the file was missing.
+            var finalError: Error? = error
+            if restoreSessionDirIfMissing() {
+                do {
+                    try data.write(to: fileURL, options: [.atomic])
+                    finalError = nil
+                } catch {
+                    finalError = error
+                }
+            }
+            if let finalError {
+                EngineLog.emit("[SegmentCache] write failed seg-\(index): \(finalError)",
                                category: .session)
-                if Self.isOutOfSpace(error) { noteStorageExhausted() }
+                if Self.isOutOfSpace(finalError) { noteStorageExhausted() }
                 writeOK = false
+            } else {
+                writeOK = true
             }
         }
 
