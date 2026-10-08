@@ -18,6 +18,7 @@ the public-API contract.
 
 - Two CI flakes on `main` traced to their timing assumptions, both reproduced on demand. #309's detection test opened with a 0.6 s stall threshold, so a first byte slower than that on a loaded runner failed the open (the watchdog fix above; measured 0.4 s opened, 0.8 s failed), and it gave positive events it needed fixed deadlines (10 s, 5 s), which a loaded runner spent. Those waits now follow the suite's rule: a step that has to happen gets no deadline, the test's `.timeLimit` catches a hang. #377's idle-refill test slept a fixed 8 s for a paused budget that only starts once the window is full, so a slow fill kept the connection alive (`asks == [0]`, reproduced with a 2.5 MB/s origin); it now waits for the end itself, and reads `asks[1]` only behind `#require`, since the trap took the whole test process and every buffered result with it.
 - `StreamingBufferTrimTests` asked for two chunks kept after the first trim, which depends on how URLSession cuts the body; a loaded machine coalesces it, leaves one, and the run went red. One kept chunk carries the same address check.
+- `RemoteDiscSessionReleaseTests` proved that the open reached the origin by the sockets open at that instant, which URLSession had already released on a CI runner; it counts accepted connections, as its sibling test does.
 
 ## [7.32.2] - 2026-10-08
 

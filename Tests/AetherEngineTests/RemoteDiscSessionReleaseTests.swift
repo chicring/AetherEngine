@@ -101,7 +101,9 @@ extension PrewarmStoreSuites {
             let demuxer = Demuxer()
             try demuxer.open(url: url(origin))
             #expect(demuxer.isDiscSource, "the fixture was not taken for a disc")
-            #expect(origin.openConnectionCount > 0, "the open never reached the origin")
+            // Accepted, not open: whether URLSession still pools the keep-alive socket at this
+            // instant is not this test's question, and on a CI runner it had already let go (0).
+            #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
             demuxer.close()
 
             #expect(try await drained(origin), "sockets left open: \(origin.openConnectionCount)")
