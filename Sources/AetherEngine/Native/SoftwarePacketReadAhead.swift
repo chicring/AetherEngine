@@ -230,8 +230,9 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     /// does not hold yet, and the frame before it is the wrong answer. The consumer cursor is not
     /// touched, so playback reads on from where it stood.
     func stillRun(atSeconds seconds: Double, maxPackets: Int, maxSpanSeconds: Double,
-                  reorderTail: Int) -> [SoftwareStoredPacket]? {
-        guard seconds.isFinite, maxPackets > 0 else { return nil }
+                  reorderTail: Int, isCancelled: (() -> Bool)? = nil) -> [SoftwareStoredPacket]? {
+        guard seconds.isFinite, maxPackets > 0, isCancelled?() != true else { return nil }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         condition.lock()
         let eligible = !closed && !sourceRepositioning && !resetPending && failure == nil
             && (frontierLocked(at: seconds).map { $0 > seconds } ?? false)
@@ -246,6 +247,9 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         var overflow = false
         do {
             try fifo.readHistory(from: anchor.cursor) { data in
+                if isCancelled?() == true || (isCancelled != nil && ContinuousClock.now >= deadline) {
+                    overflow = true; return false
+                }
                 let packet = try SoftwareStoredPacket.decode(data)
                 guard packet.streamIndex == video.index else { return true }
                 if run.isEmpty, packet.flags & 1 == 0 { overflow = true; return false }
@@ -264,7 +268,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         } catch {
             return nil
         }
-        guard reached, !overflow else { return nil }
+        guard reached, !overflow, isCancelled?() != true else { return nil }
         return run
     }
 

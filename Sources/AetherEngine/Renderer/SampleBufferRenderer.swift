@@ -400,12 +400,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// AE#711 follow-up: the newest frame handed to the layer, before the subtitle compositor, for a
+    /// rebuild to hold when the layer cannot say what it is showing (off screen, or before tvOS 17.4's
+    /// readback has anything). At most one buffer, released by `flush`.
+    private var _lastEnqueuedFrame: CVPixelBuffer?
+    var lastEnqueuedFrame: CVPixelBuffer? {
+        reorderLock.lock(); defer { reorderLock.unlock() }
+        return _lastEnqueuedFrame
+    }
+
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
     /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
     /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        _lastEnqueuedFrame = nil
         // #407: the next frame handed over will not follow the last one, so the gap between them is
         // not a cadence measurement. Left standing, every seek would report one enormous interval.
         _lastHandedPtsSeconds = nil
@@ -483,6 +493,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
             EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
         }
         target.enqueue(sampleBuffer)
+        reorderLock.lock()
+        _lastEnqueuedFrame = pixelBuffer
+        reorderLock.unlock()
 
         // #311: reported here rather than at admission, so it describes frames the compositor has
         // been given. A frame refused for an unschedulable timestamp, skipped after a seek, or lost

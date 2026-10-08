@@ -10,16 +10,56 @@ the public-API contract.
 
 ## [Unreleased]
 
-### Added
+### Fixed
 
-- `setSoftwareSubtitleDelay(_:)` applies a persistent, caller-selected subtitle offset to both channels in software PiP without changing the playback clock. Native renditions remain unchanged.
-- `needsForegroundVideoRestore` exposes actual background video teardown so a host can rebuild through the existing reload API before resuming.
+- **A remote disc image reports the bytes it pulls from the origin (#719).** `LiveTelemetry.demuxerBytesFetched` read 0 for every custom-reader source, so a disc image played over HTTP showed no `origin` bytes and, on the software path, no `networkThroughputMbps`, while `HTTPDiscIOReader` pulled the title. The engine's own disc reader now counts the response bodies it receives and the extent map passes the count through; a host's own `IOReader` still reports 0. Measured on a 49.5 GB Blu-ray ISO served over HTTP: 0.0 MB across a 15 s `aetherctl play` before, 107.5 MB rising to 367.5 MB over 25 s after. Contributed by yipengfei329.
+
+## [7.31.1] - 2026-10-08
 
 ### Fixed
 
-- Video routing consults the AV1 hardware decoder only for AV1 sources, avoiding supplemental decoder registration on unrelated playback starts.
-- Rapid audio-track selections coalesce into serialized rebuilds. Stop/load invalidate queued work, and play/pause commands received during a rebuild supply its final transport intent. Native handover retains the old item until replacement unless media services were reset.
-- **A remote disc image reports the bytes it pulls from the origin.** `LiveTelemetry.demuxerBytesFetched` read 0 for every custom-reader source, so a disc image played over HTTP showed no `origin` bytes and, on the software path, no `networkThroughputMbps`, while `HTTPDiscIOReader` pulled the title. The engine's own disc reader now counts the response bodies it receives and the extent map passes the count through; a host's own `IOReader` still reports 0. Measured on a 49.5 GB Blu-ray ISO served over HTTP: 0.0 MB across a 15 s `aetherctl play` before, 107.5 MB rising to 367.5 MB over 25 s after.
+- **HEVC declared as private PES takes the #268 VOD ingest (#718).** The carriage probe only read PMT `stream_type 0x24` as HEVC, so a finite HEVC-in-MPEG-TS HLS VOD that declares its video as `stream_type 0x06` plus `registration_descriptor("HEVC")` stayed on the native route, where AVFoundation builds no video track (`0x0` dimensions). That form now counts as HEVC when the registration descriptor is well formed; a truncated descriptor or ES_info loop is not evidence, and the registration never reinterprets another stream type. Checked with aetherctl on a twin of the offset fixture that differs only in the PMT stream type: before, no displayable frame; after, the ingest route with seeks to 90 s and 30 s landing like the `0x24` original. Reported by qoli.
+
+## [7.31.0] - 2026-10-08
+
+### Added
+
+- **`LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` tune a `.fastZap` start on long-GOP sources (#712).** A long GOP cannot finalize a segment before the next keyframe, so the two-segment minimum cost a second whole GOP; a host can now let one long enough segment start the session and choose the grace after it. Both default to nil, which keeps today's policy, and neither touches segment cuts, TARGETDURATION or HOLD-BACK. Contributed by yucelokan.
+- **Live rewind history is published as soon as it is played, and stays on one timeline (#712).** AVPlayer's seekable-range mirror can lag the cache for seconds after a fast join, which advertised no history while the picture already played; already-played contiguous resident media now counts, prefetched media never does. On the native loopback path display time and seek targets keep the session's shift through a source timestamp reset (`clock.sourceTime` still follows the frame's PTS for cues). `seekToLiveEdge(offsetSeconds:)` returns to a caller-chosen distance behind the edge, `currentItemLiveEdgeTime` and `liveTargetDurationSeconds` are public, and a resume clamp queued by an earlier `play()` yields to a newer seek. Contributed by yucelokan.
+- **Live DVR retention leases (#714).** `setNativeLiveDVRLimits(_:availableCapacityBytes:)` and, with the new `LoadOptions.softwareDVRRetention`, `setSoftwareLiveDVRLimits(_:availableCapacityBytes:)` renew a time and disk allowance (`LiveDVRLimits`) on a running session without a reload or a second source. An expired lease withdraws the optional history and the playback cushion stays; `nativeLiveDVRMandatoryBytes` and `softwareLiveDVRBytes` report what is held. Measured against a public HLS channel: a 15 s lease set at t=10 withdrew the range at t=25 and playback stayed at the edge with about 27 MB pinned. Contributed by yucelokan.
+- **`LoadOptions.sourceOpenPolicy`, `isSourceSeekable` and `canSeek` (#713).** See Fixed. Contributed by yucelokan.
+
+### Fixed
+
+- **An HTTP VOD source that does not answer its first request is retried, not demoted to forward-only (#713).** An unanswered open retries once with an open-ended Range within `SourceOpenPolicy` budgets (15 s first byte, 25 s recovery) and keeps that connection for playback; two unanswered requests fail as `.sourceOpenFailed` instead of repeating the whole open. Size discovery runs as one bounded operation, serial on single-request origins, and joins its losing probes before playback. A forward-only VOD ignores a saved start position and rejects seeks with `SeekEvent.Rejection.sourceNotSeekable`, and a native seek reports a landing only when AVPlayer completed within 0.75 s of the target. Checked against a 25 GB 4K mkv from a Jellyfin server: opens in 58 ms, a 7,700 s jump, a paused seek and a 10-seek burst all land exactly, the same as 7.30.0. Contributed by yucelokan.
+- **The #713 recovery tests drive their timing steps from a thread.** On a starved CI runner the async poll missed the window and one test hung into its time limit. Test-only.
+
+## [7.30.0] - 2026-10-08
+
+### Added
+
+- **`scrubPreviewFrame(atSeconds:refined:maxWidth:isCancelled:)` returns a timestamped, cancellable preview (#716).** The same resident bytes `scrubThumbnail` decodes from (native segment cache, software packet cache or DVR ring), never a second source connection and never a playback seek, but the result is a `ScrubFrame` carrying the measured `actualSeconds` on the `seek(to:)` axis, whether the decode reached the target (`refined`), and the resident `validRange` of the run it came from. A request is bounded at 750 ms and 900 packets, and a cancelled, replaced or stale request returns nil. `scrubPreviewSourceGeneration` changes on every teardown so a host can fence late results, `clearResidentPreviewFrames()` drops in-flight work. Contributed by yucelokan.
+- **`FrameExtractor.boundedSnapshot(at:maxSize:limits:cancellation:)` puts one budget over a disposable still (#717).** The caller's `ProbeLimits` and `ProbeCancellation` span open, stream analysis, seek and decode, a stalled HTTP response header included, and the result is a `BoundedStillFrame` with the decoded frame's PTS where the source carries one. A resident preview request cancels a bounded one still in flight on the same extractor. Ordinary `snapshot` and `thumbnail` are unchanged. Contributed by yucelokan.
+
+### Fixed
+
+- **A live origin that resends packets after a reconnect no longer plays them twice (#715).** On the single-demuxer stream-copy live path, a backward timestamp jump whose packets match accepted ones in DTS, PTS and SHA-256 of the payload is buffered until both audio and video have passed their old frontier, then the duplicates are dropped and playback continues on the existing timeline. A single mismatch, a read error, EOF or the bound (96 MB, 10,000 packets) hands every buffered packet to the ordinary discontinuity rebase, so a genuine programme boundary loses nothing. Bridged and side audio are excluded. The no-cut watchdog treats the check as intentional while still catching a starved source. Contributed by yucelokan.
+
+## [7.29.0] - 2026-10-07
+
+### Added
+
+- **An audio-track switch holds the picture instead of flashing black.** Every switch rebuilds the session, and every rebuild showed black until the new pipeline's first frame. The outgoing frame is now read and laid over the video until then. Native path: #711 keeps the old item mounted while the source reopens, but `replaceCurrentItem` still blanks the player layer until the new item decodes, so the frame is read from the paused item through an `AVPlayerItemVideoOutput` (about 20 ms paused). Software path: the rebuild replaces host and layer, and the old host's `stop()` flushed its layer for the whole startup of the new one; the frame is read back from the renderer (`displayedPixelBuffer`, or the newest frame enqueued). Dolby Vision with a displayable base layer (8.x, 10.1+) holds that base layer as HDR. Profile 5 and AV1 Profile 10 have none, so their frame is decoded from the resident segment through the RPU reshaping the scrub stills already use, frame-accurately and 960 wide (measured on an M1 Pro, Profile 5 UHD: 1.53 s at 1920 wide, 0.40 s at 960, the reshaping runs per pixel on the CPU); the switch waits up to 3 s for it with the outgoing picture paused. Nothing is held in PiP or on external playback. Verified on an Apple TV 4K for native H.264; the software path and Dolby Vision are covered by tests, Profile 5 and 8.1 against Dolby's own clips.
+- **`AetherStillView`, `bindStillView(_:)`, `unbindStillView(_:)`** for a host that renders the native path through AVKit rather than `AetherPlayerView` and so gave the engine no surface to hold the picture on. Transparent and input-free; place it above the video and below the host's chrome (for instance at the top of `AVPlayerViewController.contentOverlayView`) and set its `videoGravity` to the host player's fill.
+- **`setSoftwareSubtitleDelay(_:)` and `softwareSubtitleDelaySeconds` (#709).** A media-time offset for both subtitle channels composited into software PiP frames, persistent across loads, taking effect on the next frame without a seek or a clock change. Native renditions, native PiP and AirPlay are not shifted. Contributed by yucelokan.
+- **`needsForegroundVideoRestore` (#710).** True once background policy has actually released the video item, so a host restores through `reloadAtCurrentPosition(applying:)` before playing instead of inferring a teardown from `state` and `playbackBackend`. Contributed by yucelokan.
+
+### Fixed
+
+- **Rapid audio-track picks coalesce into one rebuild at a time (#711).** A second pick during a rebuild used to race the first one's generation check. A pick back to the active track now costs nothing, and `stop()` or a new `load` drops what is queued. Contributed by yucelokan.
+- **A play or pause pressed during any session rebuild decides how it comes back.** An audio or disc-title switch, `reloadAtCurrentPosition()` or an engine-raised rebuild came back in the transport state it started from, so a pause pressed while it ran was lost. `play()` and `pause()` now write the transport the rebuild settles from, `transportIntentUnderReconstruction` (#464 round 3), while one runs. #711 had added this for audio picks in a field of its own; the two are one now.
+- **Video routing asks for the AV1 hardware decoder only for AV1 sources (#708).** It registered the supplemental decoder on every first load, H.264 and HEVC included. Contributed by yucelokan.
+- **The #243 fetch-tally test tolerates a parallel session start.** A session start zeroes the process-wide tally, so an engine test loading in parallel failed it on CI. Test-only.
 
 ## [7.28.3] - 2026-10-07
 
