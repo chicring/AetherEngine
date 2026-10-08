@@ -12,6 +12,12 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.31.1] - 2026-10-08
+
+### Fixed
+
+- **HEVC declared as private PES takes the #268 VOD ingest (#718).** The carriage probe only read PMT `stream_type 0x24` as HEVC, so a finite HEVC-in-MPEG-TS HLS VOD that declares its video as `stream_type 0x06` plus `registration_descriptor("HEVC")` stayed on the native route, where AVFoundation builds no video track (`0x0` dimensions). That form now counts as HEVC when the registration descriptor is well formed; a truncated descriptor or ES_info loop is not evidence, and the registration never reinterprets another stream type. Checked with aetherctl on a twin of the offset fixture that differs only in the PMT stream type: before, no displayable frame; after, the ingest route with seeks to 90 s and 30 s landing like the `0x24` original. Reported by qoli.
+
 ## [7.31.0] - 2026-10-08
 
 ### Added
