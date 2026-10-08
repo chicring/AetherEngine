@@ -10,7 +10,7 @@ import Foundation
 /// into the cause of the next one, forever. The live threshold absorbs the burst ONCE;
 /// the end-and-refill stays as the memory backstop for a "live" source that sustainedly
 /// outruns realtime (a misdeclared VOD). These tests pin both halves.
-@Suite("AVIOReader live window backpressure")
+@Suite("AVIOReader live window backpressure", .offCooperativePool)
 struct LiveWindowBackpressureTests {
 
     @Test("a live join burst past the VOD high water keeps its one connection",

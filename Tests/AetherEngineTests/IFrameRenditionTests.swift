@@ -27,6 +27,7 @@ private final class Recorder: @unchecked Sendable {
     var waits: Int { lock.lock(); defer { lock.unlock() }; return _waits }
 }
 
+@Suite(.offCooperativePool)
 struct IFrameRenditionTests {
     private func make(_ rec: Recorder, count: Int = 5) -> (IFrameRendition, URL) {
         let dir = FileManager.default.temporaryDirectory

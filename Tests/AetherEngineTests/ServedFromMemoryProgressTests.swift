@@ -15,6 +15,7 @@ import Foundation
 /// to the #377 budget, which caps it to one request and takes the detour out of service
 /// (`originRequiresSerialRequests`), while the spans keep serving. That is the field shape #380
 /// described as "one served byte reset the whole ladder and it started over".
+@Suite(.offCooperativePool)
 struct ServedFromMemoryProgressTests {
 
     /// The frontier refill is only requested once the initial range has COMPLETED (`activeTask`

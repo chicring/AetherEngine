@@ -11,7 +11,7 @@ import Testing
 /// `bufferedPosition` stuck at the end of the current island. And a coverage that reached its range
 /// cap stopped describing new packets (plain) or invalidated itself (successor model) instead of
 /// forgetting the history behind the playhead.
-@Suite("Software VOD packet coverage (#613)")
+@Suite("Software VOD packet coverage (#613)", .offCooperativePool)
 struct Issue613PacketCoverageTests {
 
     private static let tickRate: Int32 = 1000

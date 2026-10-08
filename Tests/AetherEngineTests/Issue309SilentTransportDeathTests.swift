@@ -24,7 +24,7 @@ import Foundation
 /// other's timing is worth more than running them concurrently. The stall threshold and the consumer
 /// pace are deliberately NOT process-wide hooks: swift-testing runs suites in parallel, and a hook
 /// that every reader reads at init would reach into whatever suite happens to run alongside this one.
-@Suite("Silent transport death (#309)", .serialized)
+@Suite("Silent transport death (#309)", .serialized, .offCooperativePool)
 struct Issue309SilentTransportDeathTests {
 
     private static let totalSize: Int64 = 256 * 1024 * 1024

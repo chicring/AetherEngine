@@ -238,7 +238,7 @@ final class ScriptedOriginServer: @unchecked Sendable {
     }
 }
 
-@Suite("#255 a declared Content-Length never sizes an allocation", .serialized)
+@Suite("#255 a declared Content-Length never sizes an allocation", .serialized, .offCooperativePool)
 struct Issue255BodyReserveTests {
 
     /// The reported source: 12.4 GB, the number the HEAD declared and malloc refused.

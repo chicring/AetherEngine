@@ -2,8 +2,13 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite(.timeLimit(.minutes(2)))
+@Suite(.timeLimit(.minutes(2)), .offCooperativePool)
 struct LiveStartupAdmissionTests {
+    /// A parked job ends on an append or `cancelWaiters()`, never on its own deadline: past it the
+    /// gate takes the undersized-cushion exit and returns true, which a test task resumed late
+    /// read as an admission the policy never made (CI, 2026-10-08, with a 30 s deadline).
+    private static let parkedJobTimeout: TimeInterval = 86_400
+
     private func provider(grace: Double? = nil, fast: Bool = true, singleSegmentMinimum: Double? = nil, holdbackFloor: Bool = false) -> (VideoSegmentProvider, SegmentCache) {
         let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
         let provider = VideoSegmentProvider(cache: cache, segments: [],
@@ -62,7 +67,7 @@ struct LiveStartupAdmissionTests {
         let (provider, cache) = provider(grace: 0)
         defer { provider.cancelWaiters(); cache.close() }
         append(provider, 0)
-        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: 30) }
+        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: Self.parkedJobTimeout) }
         try await waitFor { provider.parkedWaiterCount == 1 }
         #expect(!(try await waitFor(upTo: .milliseconds(100)) { job.isFinished }))
         append(provider, 1)
@@ -74,7 +79,7 @@ struct LiveStartupAdmissionTests {
         let (provider, cache) = provider(grace: 0, fast: false)
         defer { provider.cancelWaiters(); cache.close() }
         append(provider, 0); append(provider, 1)
-        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: 30) }
+        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: Self.parkedJobTimeout) }
         try await waitFor { provider.parkedWaiterCount == 1 }
         #expect(!(try await waitFor(upTo: .milliseconds(100)) { job.isFinished }))
         provider.cancelWaiters()
@@ -98,7 +103,7 @@ struct LiveStartupAdmissionTests {
         let (provider, cache) = provider(grace: 0, singleSegmentMinimum: 5)
         defer { provider.cancelWaiters(); cache.close() }
         provider.appendLiveSegment(index: 0, startSeconds: 0, durationSeconds: 2)
-        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: 30) }
+        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: Self.parkedJobTimeout) }
         try await waitFor { provider.parkedWaiterCount == 1 }
         #expect(!(try await waitFor(upTo: .milliseconds(100)) { job.isFinished }))
         provider.appendLiveSegment(index: 1, startSeconds: 2, durationSeconds: 2)
@@ -110,7 +115,7 @@ struct LiveStartupAdmissionTests {
         let (provider, cache) = provider(grace: 0, singleSegmentMinimum: threshold)
         defer { provider.cancelWaiters(); cache.close() }
         append(provider, 0)
-        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: 30) }
+        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: Self.parkedJobTimeout) }
         try await waitFor { provider.parkedWaiterCount == 1 }
         #expect(!(try await waitFor(upTo: .milliseconds(100)) { job.isFinished }))
         provider.cancelWaiters()
@@ -122,7 +127,7 @@ struct LiveStartupAdmissionTests {
         let (provider, cache) = provider(grace: 0, fast: false, singleSegmentMinimum: 5)
         defer { provider.cancelWaiters(); cache.close() }
         append(provider, 0)
-        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: 30) }
+        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: Self.parkedJobTimeout) }
         try await waitFor { provider.parkedWaiterCount == 1 }
         #expect(!(try await waitFor(upTo: .milliseconds(100)) { job.isFinished }))
         provider.cancelWaiters()
@@ -146,7 +151,7 @@ struct LiveStartupAdmissionTests {
         let (provider, cache) = provider(grace: 0, singleSegmentMinimum: 5, holdbackFloor: true)
         defer { provider.cancelWaiters(); cache.close() }
         append(provider, 0)
-        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: 30) }
+        let job = ProbeTestJob { provider.waitForFirstLiveSegment(timeout: Self.parkedJobTimeout) }
         try await waitFor { provider.parkedWaiterCount == 1 }
         #expect(!(try await waitFor(upTo: .milliseconds(100)) { job.isFinished }))
         provider.cancelWaiters()
