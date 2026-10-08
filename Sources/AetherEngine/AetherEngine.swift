@@ -90,6 +90,34 @@ public final class AetherEngine: ObservableObject {
     /// still need to re-anchor and decode at the target.
     @Published public internal(set) var residentRanges: [ClosedRange<Double>] = []
 
+    /// Byte-source seekability learned during this load. Nil means the source has not been
+    /// probed, or AVFoundation owns it directly. A duration alone never establishes seekability.
+    @Published public internal(set) var isSourceSeekable: Bool? = nil {
+        didSet {
+            guard oldValue != isSourceSeekable, let isSourceSeekable else { return }
+            EngineLog.emit("[SourceOpen] phase=capability seekability=\(isSourceSeekable ? "seekable" : "forward-only")", category: .demux)
+        }
+    }
+
+    /// Whether the active session accepts a seek. Live playback requires a DVR window;
+    /// forward-only VOD never advertises arbitrary seeking even when its duration is known.
+    /// Remote HLS uses the native item's measured range instead of container metadata.
+    public var canSeek: Bool {
+        guard isSessionReady else { return false }
+        switch state {
+        case .idle, .loading, .ended, .error: return false
+        default: break
+        }
+        if isLive { return seekableLiveRange != nil }
+        guard !loadedOptions.sequentialOrigin, isSourceSeekable != false,
+              duration.isFinite, duration > 0 else { return false }
+        if videoRoute == .remoteBypass {
+            guard let nativeHost else { return false }
+            return nativeHost.seekableEnd > nativeHost.seekableStart
+        }
+        return isSourceSeekable == true
+    }
+
     /// The same spans as `residentRanges`, unfolded, on the producer's playlist axis. Held because the
     /// fold onto the display axis moves when the producer publishes a new shift, and a shift change is
     /// not a cache change: without the raw spans the band would keep the retired epoch's offset until
@@ -3963,6 +3991,7 @@ public final class AetherEngine: ObservableObject {
         attempt: LoadAttempt
     ) async throws -> SourceProbe? {
         var source = source
+        var startPosition = startPosition
         var options = options
         options = Self.applyingSharedOutputRole(options)
         SharedOutputCoordinator.shared.join(ObjectIdentifier(self), role: options.sharedOutputRole, tag: logTag, owner: self)
@@ -4308,6 +4337,7 @@ public final class AetherEngine: ObservableObject {
                     .withSequentialOrigin(options.sequentialOrigin,
                                           declaredDuration: options.declaredDurationSeconds)
                     .withHeldSourceConnection(options.heldSourceConnection)
+                    .withSourceOpenPolicy(options.sourceOpenPolicy)
                 switch source {
                 case .url(let u):
                     // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
@@ -4430,6 +4460,15 @@ public final class AetherEngine: ObservableObject {
             throw DemuxerError.openFailed(code: -1)
         }
 
+        // The reader already spent the configured initial and recovery budgets. Reopening
+        // the same source in HLSVideoEngine would silently repeat that entire wait.
+        if !options.isLive, let failure = probeFailure as? AVIOReaderError,
+           failure == .requestTimeout || failure == .noResponse {
+            let transport = URLError(failure == .requestTimeout ? .timedOut : .cannotConnectToHost)
+            publishError(.sourceOpenFailed, "Source did not respond within the opening budget", underlying: transport)
+            throw failure
+        }
+
         // AE#363: an HLS playlist URL on the raw-byte live path, which AE#140 detects at the byte source
         // (#EXTM3U where a container's first byte belongs) instead of looping its endless-feed reconnect.
         // That detection stays; its destination changes. AE#140 handed the host a typed rejection naming
@@ -4515,6 +4554,14 @@ public final class AetherEngine: ObservableObject {
 
         // Forward-only custom sources cannot rewind; audio-switch and background-reload stay no-op for them.
         customSourceIsSeekable = isCustomSource ? probe.isSourceSeekable : false
+        isSourceSeekable = probeOpened ? probe.isSourceSeekable : nil
+        if !options.isLive, isSourceSeekable == false {
+            // The byte source and AVPlayer must mount at the same place. A container duration
+            // does not make a saved position reachable on a forward-only source.
+            startPosition = nil
+            positionUnderReconstruction = nil
+            clock.currentTime = 0
+        }
 
         // sourceVideoFormat = what's in the file; videoFormat = what the panel shows (published after
         // the criteria handshake; see panelHDRAfterHandshake below).
@@ -5530,6 +5577,18 @@ public final class AetherEngine: ObservableObject {
                 return
             }
         }
+        if !isLive, loadedOptions.sequentialOrigin || isSourceSeekable == false {
+            EngineLog.emit("[AetherEngine] seek(to:\(seconds)) rejected: source is forward-only", category: .engine)
+            // A seek stashed during load must relinquish its optimistic clock as well.
+            let wasDeferred = deferredSeekInFlight
+            endDeferredSeek(.superseded)
+            if wasDeferred {
+                clock.currentTime = nativeHost.map { displaySeconds(forPlaylistSeconds: $0.currentTime) }
+                    ?? PresentationAxis.display(sourcePTS: clock.sourceTime, origin: sourcePresentationOrigin)
+            }
+            emitSeekRejected(.sourceNotSeekable, target: seconds)
+            return
+        }
         // #127: pre-ready native item (background-teardown reload, cold start): forwarding the seek now
         // would clamp to 0 against empty seekable ranges and replace load()'s pending startPosition seek.
         // Stash the latest target (publishing it optimistically so scrub UI follows) and replay at readiness.
@@ -6060,10 +6119,13 @@ public final class AetherEngine: ObservableObject {
         // A superseding seek owns the final state.
         guard loadGeneration == gen, seekGeneration == seekGen else { return }
         setPendingRecoverySeekTarget(nil)
-        nativeClockSeconds = clockTarget
-        clock.currentTime = target
-        // sourceTime + subtitle re-arm need true source PTS; map the display target back (0 off disc). AE#105.
-        let landedSourcePTS = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin)
+        // Publish the measured native landing, not the optimistic request. The two can differ
+        // slightly even after a successful callback; subtitle anchors and SeekEvent must agree.
+        let landedClock = nativeOnly ? (nativeHost?.currentTime ?? clockTarget) : clockTarget
+        let landedDisplay = nativeOnly ? displaySeconds(forPlaylistSeconds: landedClock) : target
+        nativeClockSeconds = landedClock
+        clock.currentTime = landedDisplay
+        let landedSourcePTS = PresentationAxis.source(displayTime: landedDisplay, origin: sourcePresentationOrigin)
         // #123: only settle sourceTime onto the target when the landed frame is actually presented (see
         // applySeekFinalizeSourceTime); while buffering toward it the picture is frozen behind the target,
         // so hold sourceTime on the rendered frame and let the $renderedTime sink settle it when the frame
@@ -7310,6 +7372,7 @@ public final class AetherEngine: ObservableObject {
         // #127: readiness + deferred host seeks are session-scoped; the host-side sink can't clear them
         // once nativeCancellables are gone.
         isSessionReady = false
+        isSourceSeekable = nil
         // #315: session-scoped for the same reason, and the host mirrors are being cut here.
         hasFirstFrameReadyForDisplay = false
         // AE#440: so does "this session has moved once". A reused native host carries the outgoing

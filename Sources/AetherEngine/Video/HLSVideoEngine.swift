@@ -487,6 +487,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AE#270: source PTS the container's timeline starts at, clamped at 0. The published playhead folds
     /// it out so it stays on the same 0-based axis as `duration`.
     public private(set) var sourceStartSeconds: Double = 0
+    /// Written during start(), consumed after that operation has joined. Does not poll the
+    /// mutable demuxer from the main actor while playback is reading or tearing down.
+    private(set) var openedSourceIsSeekable = false
 
     /// Result of the stream-copy / FLAC-bridge / video-only cascade. Possible values:
     /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → FLAC bridge"`.
@@ -927,6 +930,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
+        sourceOpenPolicy: SourceOpenPolicy = .init(),
         liveCutTargetSeconds: Double? = nil,
         blockingReloadOverride: Bool? = nil,
         liveCadenceObservation: (@Sendable () -> Double?)? = nil,
@@ -960,6 +964,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .withSourceOpenPolicy(sourceOpenPolicy)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -1095,6 +1100,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// against the origin that punishes them, half way through and with nothing saying so.
     var restartReopenProfile: DemuxerOpenProfile {
         DemuxerOpenProfile.restartReopen
+            .withSourceOpenPolicy(openProfile.sourceOpenPolicy)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
     }
@@ -1164,6 +1170,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
         demuxer = dem
+        openedSourceIsSeekable = dem.isSourceSeekable
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged   // surface source stall/reconnect to playbackPhase (#85)
         dem.playIntentProvider = playIntentProvider   // a held connection ends on a pause, not on a parked producer
 

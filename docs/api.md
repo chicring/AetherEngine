@@ -1152,3 +1152,41 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
+
+
+### HTTP VOD opening budgets
+
+`LoadOptions.sourceOpenPolicy` carries a `SourceOpenPolicy` into the initial reader
+and source reopens. `firstByteTimeout` bounds the initial data wait;
+`sizeProbeTimeout` bounds the alternate data request or the entire size-discovery
+phase, including time spent waiting for an origin slot. Nonpositive/nonfinite
+values use the defaults and excessive values are clamped. These are opening
+budgets, not a timeout for decoding or the playback session.
+
+A request that returns no response is retried once with an open-ended Range. A
+successful retry remains the playback connection. Two unanswered requests fail as
+a transport error rather than claiming the source is forward-only or repeating
+the whole open from routing. A known-size response with a delayed body keeps its
+original connection. A real length-less/range-ignoring response retains ordinary
+sequential handling. Single-request origins run size probes serially. Other
+origins may race probes; a winning result cancels siblings and joins their request
+ownership before playback proceeds. Live, explicitly sequential, remote HLS and
+disposable probe paths retain their respective contracts.
+
+
+### Measured VOD seek capability
+
+`isSourceSeekable` is a published optional Boolean for this load: nil means unknown
+or AVFoundation-owned, false means forward-only, and true means the engine's byte
+source supports seeking. `canSeek` describes the ready, active session; a container
+duration alone is not proof of seekability. Native remote HLS also needs a measured
+item range, and live playback requires retained DVR history. Stop clears the
+measured source capability.
+
+Forward-only VOD ignores saved start positions and rejects arbitrary seeks through
+`SeekEvent.Rejection.sourceNotSeekable`, without publishing a false landing. A
+queued seek discovered to be unsupported drops its optimistic transport clock.
+Native seek completion honors AVPlayer's completion flag and measured landing;
+an interrupted or clamped request is not reported as successfully reaching the
+target. The optional `Scripts/test-vod-open-seek.sh` fixture exercises native forward,
+backward, paused and sequential-source behavior on macOS AVPlayer.

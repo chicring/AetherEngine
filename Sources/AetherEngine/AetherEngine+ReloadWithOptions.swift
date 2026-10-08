@@ -394,7 +394,7 @@ enum SessionOptionCorrection {
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "isLive", "audioOnly",
         "dvrWindowSeconds",
-        "liveBlockingReload", "liveJoinProfile", "liveJoinStartsImmediately",
+        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
