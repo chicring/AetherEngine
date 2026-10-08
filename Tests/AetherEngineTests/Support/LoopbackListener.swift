@@ -16,6 +16,9 @@ final class LoopbackListener: @unchecked Sendable {
     private let wakeWrite: Int32
     private let lock = NSLock()
     private var stopped = false
+    /// Set by the accept loop under `lock` as it closes the listener and the pipe, so `stop()` never
+    /// writes to a pipe number that may already be another socket's.
+    private var closed = false
 
     init?(backlog: Int32 = 32) {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -59,19 +62,22 @@ final class LoopbackListener: @unchecked Sendable {
     /// Idempotent. Wakes the accept loop, which closes the listener on its way out.
     func stop() {
         lock.lock()
-        let alreadyStopped = stopped
+        defer { lock.unlock() }
+        guard !stopped else { return }
         stopped = true
-        lock.unlock()
-        guard !alreadyStopped else { return }
+        guard !closed else { return }
         var byte: UInt8 = 1
         _ = write(wakeWrite, &byte, 1)
     }
 
     private func acceptLoop(_ onAccept: (Int32) -> Bool) {
         defer {
+            lock.lock()
+            closed = true
             close(listenFD)
             close(wakeRead)
             close(wakeWrite)
+            lock.unlock()
         }
         while true {
             var fds = [

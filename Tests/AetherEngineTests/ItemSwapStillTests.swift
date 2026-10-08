@@ -49,16 +49,18 @@ struct ItemSwapStillTests {
                                        formatDescriptionOut: &formatOut)
         let audioFormat = try #require(formatOut)
 
-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            let group = DispatchGroup()
-            group.enter()
+        let videoDone = FixtureFlag()
+        let audioDone = FixtureFlag()
+        do {
             let frame = FixtureCounter()
             video.requestMediaDataWhenReady(on: DispatchQueue(label: "ae711.fixture.video")) {
                 while video.isReadyForMoreMediaData && frame.value < 120 {
+                    // Our own buffer, not one from the adaptor's pool: that pool belongs to the
+                    // writer, and drawing from it under load segfaulted the whole test process
+                    // inside CVPixelBufferPoolCreatePixelBuffer.
+                    guard writer.status == .writing else { break }
                     var buffer: CVPixelBuffer?
-                    if let pool = adaptor.pixelBufferPool {
-                        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
-                    }
+                    CVPixelBufferCreate(nil, 128, 72, kCVPixelFormatType_32BGRA, nil, &buffer)
                     guard let pixels = buffer else { break }
                     CVPixelBufferLockBaseAddress(pixels, [])
                     memset(CVPixelBufferGetBaseAddress(pixels), Int32(frame.value * 2 % 256),
@@ -67,13 +69,13 @@ struct ItemSwapStillTests {
                     adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame.value), timescale: 30))
                     frame.value += 1
                 }
-                if frame.value >= 120 { video.markAsFinished(); group.leave() }
+                if frame.value >= 120, videoDone.set() { video.markAsFinished() }
             }
-            group.enter()
             let chunk = 4800
             let chunks = FixtureCounter()
             audio.requestMediaDataWhenReady(on: DispatchQueue(label: "ae711.fixture.audio")) {
                 while audio.isReadyForMoreMediaData && chunks.value < 40 {
+                    guard writer.status == .writing else { break }
                     var block: CMBlockBuffer?
                     CMBlockBufferCreateWithMemoryBlock(
                         allocator: nil, memoryBlock: nil, blockLength: chunk * 2, blockAllocator: nil,
@@ -92,9 +94,18 @@ struct ItemSwapStillTests {
                     audio.append(sample)
                     chunks.value += 1
                 }
-                if chunks.value >= 40 { audio.markAsFinished(); group.leave() }
+                if chunks.value >= 40, audioDone.set() { audio.markAsFinished() }
             }
-            group.notify(queue: .main) { done.resume() }
+        }
+        // Polled rather than awaited: a writer that fails stops calling one of the two blocks, and
+        // a group waiting on both would wait for it forever.
+        let deadline = ContinuousClock.now + .seconds(20)
+        while !(videoDone.isSet && audioDone.isSet), writer.status == .writing, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard videoDone.isSet, audioDone.isSet else {
+            writer.cancelWriting()
+            throw FixtureWriterFailed(status: writer.status.rawValue, error: writer.error)
         }
         await writer.finishWriting()
         #expect(writer.status == .completed)
@@ -389,4 +400,18 @@ struct ItemSwapStillTests {
 /// One track's position in the fixture writer, touched only on that track's own serial queue.
 private final class FixtureCounter: @unchecked Sendable {
     var value = 0
+}
+
+/// A track that has written all of its samples, read from the test while the track's queue sets it.
+private final class FixtureFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    /// True only for the call that set it.
+    func set() -> Bool { lock.withLock { defer { value = true }; return !value } }
+}
+
+private struct FixtureWriterFailed: Error {
+    let status: Int
+    let error: Error?
 }
