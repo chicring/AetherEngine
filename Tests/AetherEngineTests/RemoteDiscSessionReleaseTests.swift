@@ -11,7 +11,7 @@ extension PrewarmStoreSuites {
     ///
     /// The origin counts sockets that are still open, which is the one place the leak shows.
     /// `.serialized`: the warm case goes through the process-wide prewarm store.
-    @Suite("Remote disc image sessions are released (audit NET-110)", .serialized)
+    @Suite("Remote disc image sessions are released (audit NET-110)", .serialized, .timeLimit(.minutes(2)))
     struct RemoteDiscSessionReleaseTests {
 
         /// 0.5 s of 64x64 MPEG-2 video in an MPEG-PS pack stream (ffmpeg `-f vob`), 4096 bytes: the
@@ -89,8 +89,8 @@ extension PrewarmStoreSuites {
             URL(string: "http://127.0.0.1:\(origin.port)/\(name)")!
         }
 
-        private func drained(_ origin: KeepAliveRangeOrigin) async throws -> Bool {
-            try await waitFor(upTo: .seconds(10)) { origin.openConnectionCount == 0 }
+        private func drained(_ origin: KeepAliveRangeOrigin) async throws {
+            try await waitFor { origin.openConnectionCount == 0 }
         }
 
         @Test("a disc image that opens releases its session when the demuxer closes")
@@ -106,7 +106,7 @@ extension PrewarmStoreSuites {
             #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
             demuxer.close()
 
-            #expect(try await drained(origin), "sockets left open: \(origin.openConnectionCount)")
+            try await drained(origin)
         }
 
         @Test("a disc image whose open throws releases its session")
@@ -123,7 +123,7 @@ extension PrewarmStoreSuites {
             }
             #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
 
-            #expect(try await drained(origin), "sockets left open: \(origin.openConnectionCount)")
+            try await drained(origin)
         }
 
         /// The root directory's length, past the reader's extent cap: `wrap` throws `malformed` instead of
@@ -145,7 +145,7 @@ extension PrewarmStoreSuites {
             demuxer.close()
 
             #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
-            #expect(try await drained(origin), "sockets left open: \(origin.openConnectionCount)")
+            try await drained(origin)
         }
 
         @Test("a disc image whose structure cannot be parsed hands the warm back")

@@ -10,7 +10,11 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Tests and CI
+
+- **Every wait in the suite now follows the rule in `TestWaiting.swift`.** An audit of 79 test files found around 80 places where a step that has to happen carried a wall-clock bound of its own (`waitFor(upTo:)`, hand-rolled `Date()` loops, short semaphore and XCTest timeouts) or a fixed sleep stood in for an observable state, the pattern behind four of the five CI flakes fixed in 7.32.3. Those now wait unbounded under a `.timeLimit`, or wait for the state itself; sync helpers that cannot await keep a generous bound. `try?` around loop sleeps became `try`. Bounds that are the assertion (must not happen within n seconds) stay, and latency assertions that are the point of their test stay with their margin unchanged.
+- **`SourceOpenRecoveryTests` "exhausted opening budget" can no longer hang.** It waited unbounded for the open's retry to reach the origin, but the reader cancels that retry `sizeProbeTimeout` after resuming it, and on a loaded machine it can be cancelled before it is on the wire. The retry now gets a grace and the verdict is the ceiling (no third request).
+- **`Issue93SlowSegmentServeTests`' raw GET reads to the end of the response** (Content-Length or the chunked terminator) instead of to one second of silence on a keep-alive connection, which left the slow-body test 0.15 s of margin.
 
 ## [7.32.3] - 2026-10-08
 

@@ -152,7 +152,7 @@ private final class ReaderDrain: @unchecked Sendable {
 
 final class Issue684PumpJoinSpentTests: XCTestCase {
 
-    private func waitUntil(_ what: String, timeout: TimeInterval = 60, _ condition: () -> Bool) {
+    private func waitUntil(_ what: String, timeout: TimeInterval = 300, _ condition: () -> Bool) {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {
             if Date() >= deadline { return XCTFail("timed out waiting for: \(what)") }

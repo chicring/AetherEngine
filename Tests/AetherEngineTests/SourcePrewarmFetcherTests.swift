@@ -9,7 +9,7 @@ extension PrewarmStoreSuites {
     /// budget, which is process-wide too: a global reset from here tore the budget out from under
     /// suites running in parallel (measured, two unrelated failures), so a test that needs a ceiling
     /// sets it for its own origin and clears that one again.
-    @Suite("Source prewarm fetch (#551)", .serialized)
+    @Suite("Source prewarm fetch (#551)", .serialized, .timeLimit(.minutes(2)))
     struct SourcePrewarmFetcherTests {
 
         private let fileSize: Int64 = 64 * 1024 * 1024
@@ -97,7 +97,7 @@ extension PrewarmStoreSuites {
         @Test("a cancelled warm stores nothing")
         func cancelledWarmStoresNothing() async throws {
             let stalling = ThrottledOriginServer(totalSize: fileSize,
-                                                 firstByteDelayUs: { _ in 3_000_000 })
+                                                 firstByteDelayUs: { _ in 30_000_000 })
             let server = try #require(stalling)
             defer { server.stop() }
             let store = SourcePrewarmStore(totalByteCap: 8 << 20)
@@ -107,7 +107,9 @@ extension PrewarmStoreSuites {
                 await SourcePrewarmFetcher.warm(
                     url: target, extraHeaders: [:], byteBudget: 128 * 1024, into: store)
             }
-            try await Task.sleep(nanoseconds: 300_000_000)
+            // Cancel once the fetch is on the wire, inside the stalled first byte. A fixed sleep here
+            // could outlast the stall on a loaded runner and let the warm complete.
+            try await waitFor { server.rangeRequestCount > 0 }
             task.cancel()
             let report = await task.value
 

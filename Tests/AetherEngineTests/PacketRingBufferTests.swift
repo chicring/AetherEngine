@@ -94,7 +94,7 @@ final class PacketRingBufferTests: XCTestCase {
 
         ring.close()
 
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(120)
         while FileManager.default.fileExists(atPath: scratch.path), Date() < deadline {
             usleep(20_000)
         }

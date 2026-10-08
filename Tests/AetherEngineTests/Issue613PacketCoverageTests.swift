@@ -57,15 +57,13 @@ struct Issue613PacketCoverageTests {
         return try body(root)
     }
 
-    /// Waits for the producer to park, read as a packet count that stops moving.
+    /// Waits for the producer to park. The park itself, not a packet count that held still: a
+    /// producer that is merely slow on a loaded machine looks parked to that. Sync, so the bound is
+    /// a generous hang catcher rather than a verdict.
     private func waitForPark(_ source: SoftwarePacketReadAhead) {
-        let deadline = Date().addingTimeInterval(10)
-        var previous = -1
-        while Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.15)
-            let now = source.snapshot.packetCount
-            if now == previous, now > 0 { return }
-            previous = now
+        let deadline = Date().addingTimeInterval(120)
+        while !source.producerParkedForTesting, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
         }
     }
 
@@ -118,7 +116,7 @@ struct Issue613PacketCoverageTests {
     private func frontierAfterConsuming(_ count: Int, source: SoftwarePacketReadAhead) throws -> Double? {
         source.start()
         for _ in 0..<count {
-            let deadline = Date().addingTimeInterval(5)
+            let deadline = Date().addingTimeInterval(120)
             while source.snapshot.packetCount < 40, Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.001)
             }

@@ -39,7 +39,7 @@ private final class RecordingHeldDelegate: HeldSourceConnectionDelegate, @unchec
     var endError: Error? { lock.lock(); defer { lock.unlock() }; return _endError }
 
     @discardableResult
-    func waitForEnd(seconds: Double = 20) -> Bool {
+    func waitForEnd(seconds: Double = 120) -> Bool {
         finished.wait(timeout: .now() + seconds) == .success
     }
 
@@ -363,7 +363,7 @@ struct Issue377HeldReaderTests {
         server.requestedRanges.map(\.start).filter { $0 < totalSize - 1024 * 1024 }
     }
 
-    private func drain(_ reader: AVIOReader, bytes target: Int, timeout: TimeInterval = 60) -> Int {
+    private func drain(_ reader: AVIOReader, bytes target: Int, timeout: TimeInterval = 120) -> Int {
         let sliceCap = 256 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
@@ -417,7 +417,8 @@ struct Issue377HeldReaderTests {
                 "a held connection asked \(heldAsks.count) times for one continuous read: \(heldAsks)")
     }
 
-    @Test("a PAUSED consumer ends the held connection inside its budget and holds no flow")
+    @Test("a PAUSED consumer ends the held connection inside its budget and holds no flow",
+          .timeLimit(.minutes(2)))
     func pausedConsumerEndsTheHeldConnection() async throws {
         let totalSize: Int64 = 256 * 1024 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: totalSize))
@@ -430,8 +431,11 @@ struct Issue377HeldReaderTests {
         try reader.open()
 
         // Nobody consumes AND the consumer says it is paused. #310's worst episode came out of
-        // exactly this state, so the connection has to be gone rather than merely quiet.
-        try await Task.sleep(for: .seconds(8))
+        // exactly this state, so the connection has to be gone rather than merely quiet. The budget
+        // runs from the moment the window is full, which is the origin's pace, so wait for the end
+        // itself and then leave a window in which a re-request with nothing draining would show.
+        try await waitFor { !reader.hasLiveConnectionForTesting && reader.windowDiagnostics.parked }
+        try await Task.sleep(for: .seconds(1))
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a paused consumer must hold no flow, which is the #310 invariant 6.11.0 shipped")

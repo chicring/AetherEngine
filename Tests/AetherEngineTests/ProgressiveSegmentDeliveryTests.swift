@@ -245,7 +245,10 @@ struct ProgressiveSegmentDeliveryTests {
     }
 
     /// Raw-socket GET on its own thread (a blocking `recv` may not sit on the test's thread), read
-    /// until the server closes or goes quiet for 1.5 s. Returns the bytes and the time to first byte.
+    /// until the server closes or goes quiet for 30 s. Returns the bytes and the time to first byte.
+    /// The quiet bound is only a hang guard (this thread is out of `.timeLimit`'s reach): both tests
+    /// end on a terminator or a close, and a loaded runner can leave a live response silent for
+    /// well over a second.
     private static func get(port: UInt16, path: String) async -> (Data, TimeInterval) {
         await withCheckedContinuation { continuation in
             Thread.detachNewThread {
@@ -288,7 +291,7 @@ struct ProgressiveSegmentDeliveryTests {
                 if collected.range(of: Data("\r\n0\r\n\r\n".utf8)) != nil { break }
             } else if n == 0 {
                 break
-            } else if Double(DispatchTime.now().uptimeNanoseconds - lastByteAt.uptimeNanoseconds) / 1e9 > 1.5 {
+            } else if Double(DispatchTime.now().uptimeNanoseconds - lastByteAt.uptimeNanoseconds) / 1e9 > 30 {
                 break
             }
         }

@@ -11,7 +11,7 @@ private final class ProbeTestTrigger: @unchecked Sendable {
     private let fired = ProbeTestBox(false)
     var didFire: Bool { fired.value }
 
-    init(deadline seconds: TimeInterval = 60, when condition: @escaping @Sendable () -> Bool,
+    init(deadline seconds: TimeInterval = 300, when condition: @escaping @Sendable () -> Bool,
          _ action: @escaping @Sendable () -> Void) {
         let fired = self.fired
         Thread.detachNewThread {
@@ -276,10 +276,12 @@ struct SourceOpenRecoveryTests {
         } catch {
             #expect(error as? AVIOReaderError == .requestTimeout)
         }
-        // The retry can still be on its way to the origin's parser when load() gives up, so the
-        // count is read once it has arrived rather than at that instant.
-        try await waitFor { origin.requests.count >= 2 }
-        #expect(origin.requests.count == 2)
+        // The retry can still be on its way to the origin's parser when load() gives up, or never
+        // reach it: the reader cancels it sizeProbeTimeout after resume, and a loaded machine may
+        // not have put it on the wire by then. So its arrival gets a grace, not an unbounded wait,
+        // and the verdict is the ceiling: routing must not add a third request.
+        try await waitFor(upTo: .seconds(2)) { origin.requests.count >= 2 }
+        #expect(origin.requests.count <= 2, "routing must not repeat the open")
         #expect(engine.errorInfo?.kind == .sourceOpenFailed)
         #expect(engine.errorInfo?.underlyingDomain == NSURLErrorDomain)
         #expect(!engine.canSeek)

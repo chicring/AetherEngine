@@ -12,7 +12,7 @@ import Foundation
 /// being served concurrently. Serial fetch never exceeds 1; the pipeline must overlap
 /// (>= 2) while staying inside its window (<= 4). Byte order in the FIFO stays playlist
 /// order even when a slow segment completes after its successors.
-@Suite("HLS live ingest bounded prefetch (#177)", .offCooperativePool)
+@Suite("HLS live ingest bounded prefetch (#177)", .offCooperativePool, .timeLimit(.minutes(2)))
 struct Issue177IngestPrefetchTests {
 
     // MARK: - Loopback HLS origin
@@ -152,12 +152,11 @@ struct Issue177IngestPrefetchTests {
         return data
     }
 
-    /// `timeout` is a backstop against a wedged reader, not a pacing bound: the loop exits the
-    /// moment `expectedBytes` arrived (~0.5 s healthy). Keep it wide (90 s, the repo's starved-CI
-    /// backstop width): under parallel-suite starvation the tail segments can arrive tens of
-    /// seconds late while the reader is perfectly healthy, and a 15 s cap turned exactly that
-    /// into a byte-count flake (8/11 segments at deadline, CI 2026-07-21).
-    private func drain(_ reader: HLSLiveIngestReader, expectedBytes: Int, timeout: TimeInterval) -> Data {
+    /// Returns the moment `expectedBytes` arrived (~0.5 s healthy). It has no deadline of its own:
+    /// under parallel-suite starvation the tail segments can arrive tens of seconds late while the
+    /// reader is perfectly healthy, and a 15 s cap turned exactly that into a byte-count flake
+    /// (8/11 segments at deadline, CI 2026-07-21). The suite's `.timeLimit` is the hang catcher.
+    private func drain(_ reader: HLSLiveIngestReader, expectedBytes: Int) async throws -> Data {
         final class Box: @unchecked Sendable {
             let lock = NSLock()
             var data = Data()
@@ -181,23 +180,14 @@ struct Issue177IngestPrefetchTests {
             box.done = true
             box.lock.unlock()
         }
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            box.lock.lock()
-            let done = box.done
-            box.lock.unlock()
-            if done { break }
-            usleep(20_000)
-        }
-        box.lock.lock()
-        defer { box.lock.unlock() }
-        return box.data
+        try await waitFor { box.lock.withLock { box.done } }
+        return box.lock.withLock { box.data }
     }
 
     // MARK: - Tests
 
     @Test("backlog fetches overlap within the window and commit in playlist order")
-    func prefetchOverlapsAndPreservesOrder() throws {
+    func prefetchOverlapsAndPreservesOrder() async throws {
         // First playlist advertises seg0..7 (1 s segments, so the tracker's 8 s coverage target
         // wants the whole window and the eviction margin leaves the oldest, joining seg1..7); the
         // refresh advertises seg0..15 with ENDLIST, delivering seg8..15 as one 8-segment batch
@@ -225,7 +215,7 @@ struct Issue177IngestPrefetchTests {
 
         // Join takes seg1..7 per the tracker's edge policy, the refresh appends seg8..15.
         let expected = segments[1...].reduce(Data(), +)
-        let got = drain(reader, expectedBytes: expected.count, timeout: 90)
+        let got = try await drain(reader, expectedBytes: expected.count)
 
         #expect(reader.terminalError == nil)
         #expect(got == expected, "FIFO bytes must be exact playlist order regardless of completion order")
@@ -237,7 +227,7 @@ struct Issue177IngestPrefetchTests {
     }
 
     @Test("a declared single-request origin gets its segments one at a time (AE#678)")
-    func declaredRequestCeilingSerializesTheBacklog() throws {
+    func declaredRequestCeilingSerializesTheBacklog() async throws {
         let segmentCount = 16
         let segments = (0..<segmentCount).map { makeSegment(index: $0) }
         var delays = [Int](repeating: 20, count: segmentCount)
@@ -253,7 +243,7 @@ struct Issue177IngestPrefetchTests {
         defer { reader.close() }
 
         let expected = segments[1...].reduce(Data(), +)
-        let got = drain(reader, expectedBytes: expected.count, timeout: 90)
+        let got = try await drain(reader, expectedBytes: expected.count)
 
         #expect(reader.terminalError == nil)
         #expect(got == expected)
@@ -269,7 +259,7 @@ struct Issue177IngestPrefetchTests {
     }
 
     @Test("single-segment playlists still ingest correctly through the pipeline")
-    func singleSegmentStillWorks() throws {
+    func singleSegmentStillWorks() async throws {
         let segments = [makeSegment(index: 7)]
         let origin = try #require(LoopbackHLSOrigin(
             segments: segments, delaysMs: [10], initialWindow: 1))
@@ -279,7 +269,7 @@ struct Issue177IngestPrefetchTests {
         let reader = HLSLiveIngestReader(playlistURL: url)
         defer { reader.close() }
 
-        let got = drain(reader, expectedBytes: segments[0].count, timeout: 90)
+        let got = try await drain(reader, expectedBytes: segments[0].count)
         #expect(reader.terminalError == nil)
         #expect(got == segments[0])
     }

@@ -77,7 +77,7 @@ struct Issue309SilentTransportDeathTests {
     /// setting it would throttle the readers of every suite swift-testing happens to run in parallel
     /// with this one. Pacing here is local by construction.
     private static func read(_ reader: AVIOReader, bytes target: Int, sliceCap: Int = 256 * 1024,
-                            deadline: TimeInterval = 30, bytesPerSecond: Int = 0) -> Int {
+                            deadline: TimeInterval = 120, bytesPerSecond: Int = 0) -> Int {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
         var got = 0
@@ -232,8 +232,7 @@ struct Issue309SilentTransportDeathTests {
         // Read straight through the death. 7 MB is past everything the silenced generation and the
         // first range delivered (6 MB), so completing it can only happen through a replacement.
         let target = 7 * 1024 * 1024
-        let got = Self.read(reader, bytes: target, deadline: 60,
-                            bytesPerSecond: consumerBytesPerSecond)
+        let got = Self.read(reader, bytes: target, bytesPerSecond: consumerBytesPerSecond)
         #expect(got == target, "read stopped at \(got / 1024) KB of \(target / 1024) KB")
 
         let runway = try #require(probe.runwayAtRequest,

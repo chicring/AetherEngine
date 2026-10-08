@@ -11,7 +11,7 @@ extension PrewarmStoreSuites {
     ///
     /// `.serialized`: the prewarm store is process-wide. The origin budget is too, so nothing here
     /// resets it globally; each server has its own port and therefore its own origin key.
-    @Suite("Source prewarm adoption (#551)", .serialized)
+    @Suite("Source prewarm adoption (#551)", .serialized, .timeLimit(.minutes(2)))
     struct SourcePrewarmAdoptionTests {
 
         private let fileSize: Int64 = 64 * 1024 * 1024
@@ -30,7 +30,7 @@ extension PrewarmStoreSuites {
         /// is still on the wire when `open()` returns. Waiting for it here is the test's job, not the
         /// reader's.
         private func waitForRequest(_ server: ThrottledOriginServer, startingAt start: Int64) async throws {
-            try await waitFor(upTo: .seconds(10)) {
+            try await waitFor {
                 server.requestedRanges.contains(where: { $0.start == start })
             }
         }

@@ -298,10 +298,10 @@ struct Issue255BodyReserveTests {
         // "the HEAD fallback never ran" from a request log that only held the primary probe (one
         // observed failure, green on the next run of the same commit). The wait exits as soon as a
         // size resolves, so a wider ceiling costs nothing in the healthy case and only buys the
-        // fallback the room to actually be measured.
+        // fallback the room to actually be measured. 25 is the most the ladder takes (`min(25, _)`).
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/big.mkv")!,
                                 chunkSize: 1024 * 1024, prefetchEnabled: false,
-                                chunkRequestTimeout: 15)
+                                chunkRequestTimeout: 25)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
@@ -329,7 +329,7 @@ struct Issue255BodyReserveTests {
         let chunk = 1024 * 1024
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/big.mkv")!,
                                 chunkSize: chunk, prefetchEnabled: false,
-                                chunkRequestTimeout: 5, chunkMaxRetries: 1)
+                                chunkRequestTimeout: 30, chunkMaxRetries: 1)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 

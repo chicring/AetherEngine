@@ -9,7 +9,8 @@ import Foundation
 struct Issue694AudioHostEndOfMediaParkTests {
 
     @MainActor
-    @Test("after end of media the clock stands still on the last sample, even when the park runs late")
+    @Test("after end of media the clock stands still on the last sample, even when the park runs late",
+          .timeLimit(.minutes(2)))
     func clockParksOnTheLastSample() async throws {
         let host = AudioPlaybackHost()
         let demuxer = Demuxer()
@@ -18,19 +19,13 @@ struct Issue694AudioHostEndOfMediaParkTests {
         defer { host.stop() }
         host.play()
 
-        let deadline = Date().addingTimeInterval(8)
-        while !host.didReachEnd, Date() < deadline {
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
+        try await waitFor { host.didReachEnd }
         #expect(host.didReachEnd)
         // What a loaded runner does to the deferred park (CI: parked at 1.149 s): hold the main actor
         // past the queued tail, so the park runs after the clock has walked on.
         usleep(500_000)
 
-        let parkDeadline = Date().addingTimeInterval(2)
-        while host.clockRateForTesting != 0, Date() < parkDeadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { host.clockRateForTesting == 0 }
         #expect(host.clockRateForTesting == 0)
         #expect(host.rate == 0)
 
