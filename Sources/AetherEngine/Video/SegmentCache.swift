@@ -120,6 +120,38 @@ final class SegmentCache: @unchecked Sendable {
     /// every fold counter at 0, which is exactly what disarms the #358 recovery arms.)
     static let maxFoldRunLength = 64
 
+    /// The volume holding `sessionDir` ran out of space while this session wrote to it: the
+    /// directory, a segment, or a muxer's staging file. Read when the pump gives up, so the failure
+    /// names the full disk instead of the audio or the source, neither of which is at fault.
+    /// Guarded by `condition`.
+    private var storageExhaustedLatch = false
+
+    var storageExhausted: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return storageExhaustedLatch
+    }
+
+    func noteStorageExhausted() {
+        condition.lock()
+        let first = !storageExhaustedLatch
+        storageExhaustedLatch = true
+        condition.unlock()
+        if first {
+            EngineLog.emit("[SegmentCache] the segment volume is out of space at \(sessionDir.path)",
+                           category: .session)
+        }
+    }
+
+    /// A write that failed because the volume is full: `NSFileWriteOutOfSpaceError` from Foundation,
+    /// `ENOSPC` from POSIX, or either one underneath a wrapping error.
+    static func isOutOfSpace(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteOutOfSpaceError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOSPC) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error { return isOutOfSpace(underlying) }
+        return false
+    }
+
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
          baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
@@ -141,6 +173,7 @@ final class SegmentCache: @unchecked Sendable {
         } catch {
             EngineLog.emit("[SegmentCache] session dir create failed at \(sessionDir.path): \(error)",
                            category: .session)
+            if Self.isOutOfSpace(error) { storageExhaustedLatch = true }
         }
 
         // Before the sweep, so a sibling constructed in the same breath cannot read this session
@@ -269,6 +302,7 @@ final class SegmentCache: @unchecked Sendable {
             } else {
                 EngineLog.emit("[SegmentCache] write failed seg-\(index): \(error)",
                                category: .session)
+                if Self.isOutOfSpace(error) { noteStorageExhausted() }
                 writeOK = false
             }
         }

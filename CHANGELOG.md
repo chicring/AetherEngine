@@ -13,6 +13,11 @@ the public-API contract.
 ### Added
 
 - **`LoadOptions.progressiveSegmentDelivery` serves VOD loopback segments while they are written.** Off by default. The muxer flushes a fragment about every 0.5 s instead of holding up to 8 s, the segment cache tracks the segment being written, and the loopback server sends each fragment as it lands over a chunked response, so AVPlayer shows and starts on a segment's first fragments instead of waiting for its cut. A segment the producer abandons ends its connection without the final chunk, and each chunk sent counts as fetch activity for the #65 wedge watchdog, which otherwise reads a long transfer as AVPlayer no longer fetching. `aetherctl play --progressive-segments` drives it. Measured on a Mac over a 6 Mbit/s origin with 1080p HEVC at 2.7 Mbit/s: first frame 0.9 s instead of 2.2 s, playing 1.7 s instead of 2.3 s, one rebuffer instead of three to four in the first 30 s, and seeks outside the buffer landing in 0.56 s / 1.27 s instead of 1.20 s / 2.25 s.
+- **`PlaybackErrorKind.storageExhausted`.** The volume holding the loopback segment cache filled up and the session could not write its segments.
+
+### Fixed
+
+- **A full segment volume is reported as one, not as a source that cannot be muxed.** When the temporary directory's volume ran out of space, the session directory, the segments or the muxer's staging files could not be written, every muxer revive failed the same way, and the give-up arm surfaced `vodSourceFailed` ("Source audio cannot be muxed"), or `audioBridgeProducedNoOutput` on a bridged track. Both send a host's fallback ladder the wrong way for a file that plays once space is freed. The segment cache now latches an out-of-space write from any of the three, and the give-up arm surfaces `.storageExhausted` ahead of the audio verdicts. Measured on a device with 197 MB free: a 4K60 title failed to start with the muxer message.
 
 ## [7.31.2] - 2026-10-08
 

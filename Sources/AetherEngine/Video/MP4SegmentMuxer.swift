@@ -286,6 +286,7 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
+        onStorageExhausted: (@Sendable () -> Void)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -318,12 +319,19 @@ final class MP4SegmentMuxer {
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
         self.currentStagingPath = firstPath
-        let firstFd = try Self.openPosix(path: firstPath)
+        let firstFd: Int32
+        do {
+            firstFd = try Self.openPosix(path: firstPath)
+        } catch {
+            if Self.isOutOfSpace(error) { onStorageExhausted?() }
+            throw error
+        }
         self.fd = firstFd
 
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
         self.splitter = FragmentSplitter(
@@ -344,6 +352,7 @@ final class MP4SegmentMuxer {
                     if n < 0 {
                         let err = errno
                         if err == EINTR { continue }
+                        if err == ENOSPC { counter.onStorageExhausted?() }
                         counter.writeFailed = true
                         return
                     }
@@ -907,6 +916,7 @@ final class MP4SegmentMuxer {
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
         } catch {
+            if Self.isOutOfSpace(error) { byteCounter.onStorageExhausted?() }
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
             EngineLog.emit(
                 "[MP4SegmentMuxer] open next staging file seg-\(nextIdx) FAILED: \(error)",
@@ -981,6 +991,11 @@ final class MP4SegmentMuxer {
             throw MuxerError.openStagingFileFailed(errno: errno)
         }
         return fd
+    }
+
+    private static func isOutOfSpace(_ error: Error) -> Bool {
+        if case MuxerError.openStagingFileFailed(let code) = error { return code == ENOSPC }
+        return false
     }
 
     // MARK: - Internal cleanup
@@ -1229,6 +1244,8 @@ private final class ByteCounter {
     var fd: Int32 = -1
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
+    /// Reports a staging write that hit a full volume to the session's cache.
+    var onStorageExhausted: (@Sendable () -> Void)?
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

@@ -2168,6 +2168,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
+                onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
