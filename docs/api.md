@@ -682,8 +682,14 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | --- | --- |
 | `$isLive` | Mirrors `LoadOptions.isLive` for the session. |
 | `$isSequentialOrigin` | True while a VOD session is served as a sequential origin, declared (`LoadOptions.sequentialOrigin`) or found by the reader (the origin ignores `Range`, or refused the ranged open twice and served a plain GET, AE#693). The session plays from the start, so a `startPosition` given to `load()` was not honoured, and a seek lands only inside what `$residentRanges` already holds. A host that needs the position reopens the source or tells the user. Set during `load()`, cleared on stop. |
-| `seekToLiveEdge()` | `async`. |
+| `seekToLiveEdge(offsetSeconds:)` | `async`. Lands `offsetSeconds` behind the usable edge (default 0, negative or nonfinite read as 0), clamped to retained media. Choosing a safety margin is the host's call. On a live-only session it drives the native item to its own seekable end minus the offset. |
+| `currentItemLiveEdgeTime` | The native item's usable live edge on the display axis, nil before the item has a range and on the software route. While AVPlayer's range mirror lags behind retained history, only already-played contiguous resident media is admitted, never prefetched media. |
+| `liveTargetDurationSeconds` | The TARGETDURATION the engine's own live playlist is serving; nil on remote HLS live, the software path and before the first playlist build. |
+| `setNativeLiveDVRLimits(_:availableCapacityBytes:)` | Renews the native loopback session's DVR allowance without a reload or a second source: a `LiveDVRLimits` (`windowSeconds`, `maximumBytes`, `minimumFreeBytes`, `capacityValidUntil` on the `systemUptime` clock) plus the caller's capacity sample. Cache eviction, playlist sizing and producer admission share it. A missing, invalid or expired sample withdraws the optional history (`seekableLiveRange` goes nil) and a timer reclaims it even while playback is parked; renewal needs a fresh sample and deadline. The engine's own per-volume budget still applies on top. False on a software, remote or unready session. |
+| `nativeLiveDVRMandatoryBytes` | The finite pinned playback payload that may exceed that allowance. Excludes init and subtitle data, muxer staging, AVPlayer's buffers, filesystem overhead and recordings. |
+| `setSoftwareLiveDVRLimits(_:availableCapacityBytes:)`, `softwareLiveDVRBytes` | The same lease for the software live spool, which needs `LoadOptions.softwareDVRRetention`. Expiry withdraws seekable history and prunes at the next append, so it is not an immediate physical reclaim while no packets arrive. A feeder whose cursor was evicted re-anchors through its normal seek before pumping again; a newer seek, pause, stop or source change wins over that recovery. `softwareLiveDVRBytes` is the retained packet payload. |
 | `liveSourceReset` | The retune contract above. |
+| Timestamp resets | On the native loopback path `currentTime`, the seekable range, item placement and seek targets keep the session's initial timeline shift when the origin resets its timestamps, so the display time stays continuous. `clock.sourceTime` stays the presented frame's source PTS for cue matching, so the two intentionally differ after a reset. |
 | `liveResumeClamped`, `LiveResumeClamp` | A resume that found the playhead outside the window and moved it; see above. |
 | `liveScrubThumbnail(atSessionSeconds:maxWidth:)` | Still on the live session axis, decoded from what the session already holds. A native session reads its DVR segment cache; a software session reads its DVR packet ring (#544), so a tuner channel the box decodes in software has a scrub preview too. |
 | `$playlistShiftSeconds` | Seconds the producer subtracted from source PTS. Published values already fold it back; exposed for hosts pairing their own samples against AVPlayer's raw clock. |
@@ -1076,6 +1082,9 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. The window is a ceiling: the disk budget (a quarter of the free space, at most 2 GiB) bounds what is actually kept, so a long window on a high-bitrate channel or a small volume holds less than it asks for. With several engines running, each one's quarter is taken from the free space the others have not already claimed, so a tile added on a tight volume holds less history than the first one (AE#687). |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP plus headroom for one 1.5 x longer (AE#670) so an IPTV join costs seconds instead of a full holdback. |
+| `liveStartupGraceSeconds` | nil | `.fastZap` only: the extra wait after an eligible finalized window before the first serve. nil takes the observed segment duration clamped to 0.5 to 2 s, 0 serves as soon as the minimum media exists, invalid values fall back to nil. Bounded by the existing manifest deadline; a shorter grace can rebuffer early on an irregular source. |
+| `liveStartupSingleSegmentMinimumSeconds` | nil | `.fastZap` only: lets ONE finalized segment at least this long start the session, instead of waiting for a second one, which on a long-GOP source is another whole GOP. nil keeps the two-segment minimum. Neither startup option changes segment cuts, TARGETDURATION, HOLD-BACK, `.standard` joins or the remote HLS bypass, and explicit holdback floors and cancellation still win. A shallow first playlist can rebuffer if the next segment is late; that tradeoff is the host's. `Scripts/test-long-gop-startup.sh` exercises it against paced long-GOP MPEG-TS on macOS AVPlayer. |
+| `softwareDVRRetention` | nil | Opts the software live spool into `SoftwareDVRRetentionOptions` (`startupMaximumBytes`, `playbackCushionBytes`, `playbackCushionSeconds`) and so into `setSoftwareLiveDVRLimits`. nil keeps the default spool. |
 | `liveStartupGraceSeconds` | nil | Optional extra grace after eligible finalized media on `.fastZap` loopback live joins. Zero admits immediately once the minimum is ready; nil or invalid values preserve the automatic policy. |
 | `liveStartupSingleSegmentMinimumSeconds` | nil | Optional minimum duration for a single finalized segment to qualify for `.fastZap` admission. Nil, nonpositive or nonfinite values preserve the two-segment minimum. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
@@ -1143,6 +1152,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `PlaybackErrorInfo` | `kind`, `underlyingDomain`, `underlyingCode`, `message`. Published as `$errorInfo` beside a `.error` state. |
 | `PlaybackErrorKind` | The stable token inside it: `.sourceOpenFailed`, `.sourceRefused` (the origin answered an HTTP status other than a rate limit instead of media; `underlyingCode` is the status), `.customSourceProbeFailed`, `.liveSourceUnavailable`, `.hlsPlaylistOnRawLivePath`, `.dolbyVisionRequiresHardware`, `.demuxedAudioLiveUnsupported`, `.nativeItemFailed`, `.noPlayableTrackWithinBudget`, `.masterPlaylistRejected`, `.vodSourceFailed`, `.sourceRateLimited`, `.softwarePipelineFailed`, `.audioSessionFailed`, `.reloadFailed`, `.liveReloadNeverReady`, `.audioTrackSwitchFailed`, `.audioBridgeProducedNoOutput`, `.sourceCertificateRejected` (the transport was refused over certificate trust; `underlyingCode` is the `NSURLErrorDomain` code, AE#495). `.sourceRateLimited` is the one to branch on separately: the source is being metered, not lost, so the same request is expected to work later and a handoff to a second player will meet the same refusal (AE#377). `.audioBridgeProducedNoOutput` is the other: a source whose audio has to be transcoded into fMP4 (MP3, MP2, DTS, TrueHD, Vorbis, PCM) produced no encoded audio at all, so the mp4 muxer could not build the sample entry it derives from a written packet (AE#396). It used to arrive as `.vodSourceFailed`, which reads as a dead source and ends a fallback ladder; the source is neither gone nor unreadable here, and a second player that decodes the track itself plays the file, so this is a DEMOTE, not a stop. A string-backed struct rather than an enum, so a kind added in a minor release cannot break a host's switch; raw values are API and do not change. |
 | `DisplayCapabilities`, `StartupProgress`, `SeekEvent`, `PresentationAxisMap`, `NativeVideoFrameTime`, `SoftwareVideoFrameTime`, `SoftwarePiPSource`, `SystemCaptionRequest`, `AetherEngineError`, `HLSIngestError` | Covered in their sections above. |
+| `LiveDVRLimits`, `SoftwareDVRRetentionOptions` | The live DVR lease and the software spool's opt-in bounds; covered in Live and DVR. |
 | `ScrubFrame` | `image`, `actualSeconds`, `refined`, `validRange`. Returned by `scrubPreviewFrame`. |
 | `BoundedStillFrame` | `image`, `actualSeconds`. nil `actualSeconds` means the decoded frame carried no PTS, so the caller labels the requested time rather than claiming a measured one. |
 | `FontAttachment` | Attached font files for authored ASS rendering: `filename`, `mimeType`, `data`. |
@@ -1157,66 +1167,3 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
-
-### Choosing bounded live startup admission
-
-A long-GOP source cannot finalize a segment until the next keyframe arrives.
-`liveStartupSingleSegmentMinimumSeconds` allows a sufficiently long, complete first
-segment to enter the bounded `.fastZap` path without waiting another entire GOP.
-`liveStartupGraceSeconds` controls the extra grace after that eligibility check.
-It is bounded by the existing manifest deadline. Neither option changes segment
-cuts, `TARGETDURATION`, `HOLD-BACK`, standard joins or remote HLS bypass. Explicit
-holdback floors and cancellation still take precedence. A shallower initial
-playlist can rebuffer if the next segment arrives late; the host chooses this
-latency/resilience tradeoff and validates its sources.
-
-The upstream first-serve latch remains unchanged. The optional real-media script
-`Scripts/test-long-gop-startup.sh` creates paced H.264/AAC MPEG-TS fixtures with
-long GOPs and exercises macOS AVPlayer startup, rewind and continued playback.
-Set `FFMPEG_BIN` to an FFmpeg executable when it is not on PATH.
-
-
-### Continuous live display time and return offsets
-
-Native loopback `clock.currentTime`, seek ranges, item placement and seek targets
-retain the session's initial timeline shift when an origin resets its timestamps.
-`clock.sourceTime` remains the presented frame's source PTS for subtitle cues;
-these clocks can intentionally differ after a reset. Live subtitle backfill uses
-elapsed session time while source-cue pruning follows the source clock.
-
-`seekToLiveEdge(offsetSeconds:)` accepts a caller-selected distance behind the usable
-edge and clamps to retained media. Its default is zero; negative/nonfinite offsets
-are treated as zero. `liveTargetDurationSeconds` exposes the measured served HLS
-target duration, and `currentItemLiveEdgeTime` exposes the native item's usable
-edge on the display axis. Both are optional when unavailable. Choosing a safety
-margin remains the host's responsibility. An old item-range mirror may admit only
-already-played contiguous resident history, never a prefetched future frontier.
-A delayed resume clamp cannot override a newer seek or load.
-
-### Opt-in live retention leases
-
-`LiveDVRLimits` supplies `windowSeconds`, `maximumBytes`, `minimumFreeBytes` and
-`capacityValidUntil`, an absolute system-uptime deadline for the caller's available
-capacity sample. Missing, invalid or expired measurements withdraw optional
-history; renewal needs a new sample and deadline. The engine keeps its existing
-per-volume allocation safeguards in addition to the caller's allowance.
-
-`setNativeLiveDVRLimits(_:availableCapacityBytes:)` updates the ready native
-loopback session without reloading or opening another source. Cache eviction,
-playlist sizing and producer admission share a synchronized snapshot. A timer
-reclaims expired optional history even when playback and production are parked.
-`nativeLiveDVRMandatoryBytes` reports the finite pinned playback payload that may
-exceed the optional allowance. It excludes init/subtitle data, muxer staging,
-AVPlayer buffers, filesystem overhead and recordings.
-
-`LoadOptions.softwareDVRRetention` opts into `SoftwareDVRRetentionOptions` with
-caller-selected `startupMaximumBytes`, `playbackCushionBytes` and
-`playbackCushionSeconds`. Nil preserves default spool behavior.
-`setSoftwareLiveDVRLimits(_:availableCapacityBytes:)` renews an opted-in live spool
-without replacing the source or decoder. `softwareLiveDVRBytes` reports retained
-packet payload. Expiry withdraws seekable history and prunes at the next append;
-it does not promise immediate physical reclamation while no packets arrive.
-Oversized GOPs are skipped until a retained keyframe fits; failed unlinks stop
-further strict writes. A feeder whose cursor has been evicted reanchors through
-its normal seek/flush path before pumping new audio or video. A newer user seek,
-pause, stop or source replacement wins over queued recovery.
