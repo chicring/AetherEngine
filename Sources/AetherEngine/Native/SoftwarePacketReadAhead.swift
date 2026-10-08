@@ -41,6 +41,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private var reportedProducerQoS: qos_class_t = QOS_CLASS_USER_INITIATED
     /// Consumer threads currently parked in `read()`. Producer-visible, under `condition`.
     private var waitingConsumers = 0
+    /// True while the producer sits in its park wait, under `condition`. A reader on another thread
+    /// only gets the lock while the producer is inside `wait()`, so a true read PROVES the park; a
+    /// counter that stopped moving for a while only suggests it, and a loaded machine breaks that.
+    private var producerParked = false
+    var producerParkedForTesting: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return producerParked
+    }
     private var consumerWaitEvents: UInt64 = 0
     private var consumerBlockedSeconds: Double = 0
     private var lastStarvationLog: DispatchTime?
@@ -424,8 +432,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         while true {
             condition.lock()
             while !closed && !resetPending && (sourceRepositioning || ended || failure != nil || shouldParkLocked()) {
+                producerParked = true
                 condition.wait()
             }
+            producerParked = false
             if closed { condition.unlock(); return }
             let token = sourceEpoch
             let reset = resetPending

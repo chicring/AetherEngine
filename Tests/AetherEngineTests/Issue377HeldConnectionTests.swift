@@ -354,7 +354,7 @@ struct Issue377HeldConnectionTests {
 /// fills, which is why #220's defect survived every local test it had). Each test that asserts a
 /// held count carries the pushed count next to it, because a harness in which the known shape looks
 /// the same as the new one decides nothing.
-@Suite("#377 held connection in the reader")
+@Suite("#377 held connection in the reader", .offCooperativePool)
 struct Issue377HeldReaderTests {
 
     /// Ranges the DATA path asked for, with the open-time speculative tail fetch excluded: it

@@ -24,7 +24,7 @@ extension AetherEngine {
         // Segment table and tfdt use continuous output time, including across source PTS rebases.
         let outputSeconds = seconds - liveSessionShiftSeconds
         let gen = loadGeneration
-        let source = await Task.detached(priority: .userInitiated) { [session] in
+        let source = await BlockingWork.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: outputSeconds)
         }.value
         guard let source else { return nil }

@@ -204,7 +204,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         finished = false
         failed = false
         producerStartIndex = startIndex
-        producer = Task.detached(priority: .userInitiated) { [self] in
+        producer = BlockingWork.detached(priority: .userInitiated) { [self] in
             await produce(
                 resolved: resolved,
                 startIndex: startIndex,
@@ -294,7 +294,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         let currentGeneration = generation
         let preResolved = resolved
         producerStartIndex = 0
-        producer = Task.detached(priority: .userInitiated) { [self] in
+        producer = BlockingWork.detached(priority: .userInitiated) { [self] in
             do {
                 let media: ResolvedMedia
                 if let preResolved {

@@ -271,6 +271,23 @@ struct TrackMenuButton: UIViewRepresentable {
 
 SwiftUI diffing can re-run `updateUIView` as often as it likes; the guard means an open menu only rebuilds on a real item change. Credit to [@ohjey](https://github.com/ohjey) for isolating the mechanism and the pattern (AetherEngine#29).
 
+## Blocking work and the cooperative pool
+
+Engine code that blocks its thread (a demuxer open or packet read, a FIFO write under
+backpressure, a `close()` that joins a pump, a `waitForFinish`) never runs on the Swift
+cooperative pool. That pool has one thread per core and does not grow, so each blocked job takes
+a core's worth of async work out of the whole process, the host app's included. A detached engine
+task is therefore created through `BlockingWork.detached` (`BlockingWork.swift`), never
+`Task.detached`: the task prefers `BlockingExecutor`, which runs its jobs on GCD's global queues,
+and GCD adds a thread when one blocks. The task otherwise behaves as before (it awaits, hops to
+the main actor, is cancelled). `BlockingWorkTests` pins both halves, and a test fails the build
+of any `Task.detached` that comes back into `Sources/AetherEngine`.
+
+The trigger was CI: on a 3-core runner the suite parked all three pool threads for half a minute
+at a time, until a 120 s time limit fired at 151 s because its watchdog is a task on the same
+pool. `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` narrows the pool to one thread and reproduces that
+on any Mac; the full suite has to pass under it.
+
 ## Subtitle recognition scheduling
 
 Bitmap subtitle OCR awaits each image's recognition on a dedicated utility thread.
