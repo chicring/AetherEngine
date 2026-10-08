@@ -152,6 +152,9 @@ final class MP4SegmentMuxer {
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
     private var currentStagingPath: URL
+    /// The current segment's staging file. Only appended to, then renamed as it stands on adoption,
+    /// which is what lets progressive delivery read it while it is written.
+    var stagingURL: URL { currentStagingPath }
     private var fd: Int32 = -1
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var pb: UnsafeMutablePointer<AVIOContext>?

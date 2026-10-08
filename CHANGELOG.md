@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`LoadOptions.progressiveSegmentDelivery` serves VOD loopback segments while they are written.** Off by default. The muxer flushes a fragment about every 0.5 s instead of holding up to 8 s, the segment cache tracks the segment being written, and the loopback server sends each fragment as it lands over a chunked response, so AVPlayer shows and starts on a segment's first fragments instead of waiting for its cut. A segment the producer abandons ends its connection without the final chunk, and each chunk sent counts as fetch activity for the #65 wedge watchdog, which otherwise reads a long transfer as AVPlayer no longer fetching. `aetherctl play --progressive-segments` drives it. Measured on a Mac over a 6 Mbit/s origin with 1080p HEVC at 2.7 Mbit/s: first frame 0.9 s instead of 2.2 s, playing 1.7 s instead of 2.3 s, one rebuffer instead of three to four in the first 30 s, and seeks outside the buffer landing in 0.56 s / 1.27 s instead of 1.20 s / 2.25 s.
 
 ## [7.31.2] - 2026-10-08
 
