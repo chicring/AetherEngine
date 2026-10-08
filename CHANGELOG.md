@@ -14,6 +14,7 @@ the public-API contract.
 
 - Opt-in `LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` let hosts tune fast live admission for long-GOP sources without changing segment cuts or advertised holdback. Defaults preserve the existing minimum media and grace policies.
 - Native live display/seek time remains continuous through source timestamp resets. A stale item-range mirror may use already-played resident history, so early starts do not hide available rewind; return to live accepts a caller-selected offset. Queued resume clamps yield to newer seeks.
+- Opt-in live DVR retention leases let callers renew time and disk allowances without reopening playback. Native and software paths retain finite playback cushions; software eviction recovery reanchors decoders and clocks before feeding retained packets.
 
 ### Fixed
 

@@ -1192,3 +1192,31 @@ edge on the display axis. Both are optional when unavailable. Choosing a safety
 margin remains the host's responsibility. An old item-range mirror may admit only
 already-played contiguous resident history, never a prefetched future frontier.
 A delayed resume clamp cannot override a newer seek or load.
+
+### Opt-in live retention leases
+
+`LiveDVRLimits` supplies `windowSeconds`, `maximumBytes`, `minimumFreeBytes` and
+`capacityValidUntil`, an absolute system-uptime deadline for the caller's available
+capacity sample. Missing, invalid or expired measurements withdraw optional
+history; renewal needs a new sample and deadline. The engine keeps its existing
+per-volume allocation safeguards in addition to the caller's allowance.
+
+`setNativeLiveDVRLimits(_:availableCapacityBytes:)` updates the ready native
+loopback session without reloading or opening another source. Cache eviction,
+playlist sizing and producer admission share a synchronized snapshot. A timer
+reclaims expired optional history even when playback and production are parked.
+`nativeLiveDVRMandatoryBytes` reports the finite pinned playback payload that may
+exceed the optional allowance. It excludes init/subtitle data, muxer staging,
+AVPlayer buffers, filesystem overhead and recordings.
+
+`LoadOptions.softwareDVRRetention` opts into `SoftwareDVRRetentionOptions` with
+caller-selected `startupMaximumBytes`, `playbackCushionBytes` and
+`playbackCushionSeconds`. Nil preserves default spool behavior.
+`setSoftwareLiveDVRLimits(_:availableCapacityBytes:)` renews an opted-in live spool
+without replacing the source or decoder. `softwareLiveDVRBytes` reports retained
+packet payload. Expiry withdraws seekable history and prunes at the next append;
+it does not promise immediate physical reclamation while no packets arrive.
+Oversized GOPs are skipped until a retained keyframe fits; failed unlinks stop
+further strict writes. A feeder whose cursor has been evicted reanchors through
+its normal seek/flush path before pumping new audio or video. A newer user seek,
+pause, stop or source replacement wins over queued recovery.

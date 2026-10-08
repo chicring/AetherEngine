@@ -502,7 +502,8 @@ extension AetherEngine {
         guard isLive, videoRoute != .software, nativeItemSeekableEnd > 0 else { return nil }
         let edge = nativeItemSeekableEnd + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
         guard edge.isFinite else { return nil }
-        if loadedOptions.dvrWindowSeconds != nil,
+        // The effective allowance, which a lease renewal or expiry moves (#714), not the load option.
+        if liveWindow?.windowSeconds != nil,
            let fallback = Self.nativePlayedResidentEdge(reportedEdge: edge, playedTime: currentTime,
                 publishedEdge: liveWindow?.edgeTime ?? currentTime,
                 residentRange: residentLiveRangeSessionSeconds()) {
@@ -525,14 +526,54 @@ extension AetherEngine {
         return min(max(max(playedTime, publishedEdge), resident.lowerBound), resident.upperBound)
     }
 
+    /// Update native HLS retention without load/reload, source requests, or a second player.
+    /// Supply a fresh temporary-volume capacity and its monotonic expiry deadline.
+    /// False for software/remote/unready sessions. Their conservative load options are untouched.
+    @discardableResult
+    public func setNativeLiveDVRLimits(_ limits: LiveDVRLimits, availableCapacityBytes: Int64?) -> Bool {
+        guard isLive, isSessionReady, videoRoute == .loopback, let session = nativeVideoSession,
+              session.setNativeLiveDVRLimits(limits, availableCapacityBytes: availableCapacityBytes) else { return false }
+        // Capacity lease renewal alone must not add clock publications to the existing tick rate.
+        if liveWindow?.windowSeconds != session.nativeLiveDVRWindow?.windowSeconds {
+            publishLiveWindow(edgeSessionTime: liveWindow?.edgeTime ?? currentTime)
+        }
+        return true
+    }
+
+    /// Bound the software packet spool without stopping its source, decoders or clock.
+    /// Requires LoadOptions.softwareDVRRetention. Expiry withdraws optional history
+    /// and falls back to the caller-selected playback cushion.
+    @discardableResult
+    public func setSoftwareLiveDVRLimits(_ limits: LiveDVRLimits, availableCapacityBytes: Int64?) -> Bool {
+        guard isLive, isSessionReady, videoRoute == .software, let host = softwareHost else { return false }
+        return host.setLiveDVRLimits(limits, availableBytes: availableCapacityBytes)
+    }
+    public var softwareLiveDVRBytes: Int64? { softwareHost?.liveDVRBytes.map(Int64.init) }
+
+    /// Finite pinned playback payload that may exceed the optional retention allowance.
+    /// Does not include muxer staging, init/subtitle data, AVPlayer buffers, or recording output.
+    public var nativeLiveDVRMandatoryBytes: Int64? {
+        guard isLive, videoRoute == .loopback, let session = nativeVideoSession else { return nil }
+        return Int64(session.nativeLiveDVRMandatoryBytes)
+    }
+
     /// Publish the live timeline after reconciling actual resident history.
     func publishLiveWindow(edgeSessionTime: Double) {
         guard var w = liveWindow else { return }
-        var residentFloor = videoRoute == .software ? softwareHost?.dvrResidentFloorSessionSeconds : residentLiveFloorSessionSeconds()
+        if videoRoute == .loopback, let limits = nativeVideoSession?.nativeLiveDVRWindow {
+            w.setWindowSeconds(limits.windowSeconds)
+        } else if videoRoute == .software {
+            // The software spool owns both actual retained history and capacity expiry.
+            // A route transition never transfers expanded native retention into it.
+            w.setWindowSeconds(softwareHost?.liveDVRWindowSeconds)
+        }
+        // Resident media bounds the allowance on both playback routes.
+        var residentFloor = videoRoute == .software ? softwareHost?.liveDVRResidentFloor : residentLiveFloorSessionSeconds()
         // An empty/delayed AVPlayer seekableTimeRanges mirror yields only the item's zero
         // (plus its axis offset). It must not pin a ready native DVR window at that zero
         // while its real cache and played clock advance. Admit only already-played,
         // contiguous resident media; never promote the producer's prefetched frontier.
+        // `w.windowSeconds` is the effective (renewed or expired) allowance set just above.
         var reportedEdge = edgeSessionTime
         if videoRoute == .loopback, w.windowSeconds != nil,
            let floor = residentFloor, floor.isFinite, reportedEdge <= floor,

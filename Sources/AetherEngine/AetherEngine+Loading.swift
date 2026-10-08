@@ -2034,6 +2034,7 @@ extension AetherEngine {
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
+        let dvrRetention = loadedOptions.softwareDVRRetention
         try await Task.detached(priority: .userInitiated) {
             [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
@@ -2050,6 +2051,7 @@ extension AetherEngine {
                 audioSourceStreamIndex: audioSourceStreamIndex,
                 isLive: isLive,
                 dvrWindowSeconds: dvrWindowSeconds,
+                dvrRetention: dvrRetention,
                 forwardBufferSegments: forwardBufferSegments
             )
         }.value

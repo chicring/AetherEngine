@@ -5655,8 +5655,9 @@ public final class AetherEngine: ObservableObject {
                                      residentRange: origin == .liveRejoin || videoRoute == .loopback
                                         ? residentLiveRangeSessionSeconds() : nil,
                                      itemAxisOffset: liveItemAxisOffsetSeconds,
+                                     // The effective allowance after a lease renewal or expiry (#714).
                                      nativePlayedTime: videoRoute == .loopback
-                                        && loadedOptions.dvrWindowSeconds != nil
+                                        && $0.windowSeconds != nil
                                             ? currentTime : nil)
               }
             : nil
