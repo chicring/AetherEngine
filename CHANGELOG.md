@@ -13,6 +13,7 @@ the public-API contract.
 ### Fixed
 
 - **A software resume on a long-GOP source starts where it was asked to (#724).** `load(url:startPosition:)` repositions to the keyframe before the target, so the first decoded audio arrives up to a whole GOP early, and the software host moved its clock back onto that sample: a 17.3 s resume on a 10 s GOP published 9.98 s and played audio under a picture that could not present until 17.3. `SWClockAnchorPolicy` now re-anchors only on a sample AHEAD of the anchor (the mid-stream join it exists for, #107); one behind it is preroll and the anchor stands. A paused resume also kept its position until `play()`: the 4 Hz publisher wrote the still unarmed synchronizer (0) over the anchor. Reported with a synthetic fixture and repeated measurements by @alsoeoe.
+- **A software resume on a source whose timestamps do not start at zero lands on its target.** The resume position is a session-axis value like any seek, but `load()` handed it to the demuxer unconverted, because the session zero only existed once the first sample had arrived: a 17.3 s resume on a source starting at 600 s landed on the first packet (600.0) and published 17.3 over content from the head. The host now carries the source's origin into the resume before the reposition (`SWClockAnchorPolicy.resumeSessionZero`), so the first picture is 617.29 and the position matches the native path's.
 
 ## [7.32.1] - 2026-10-08
 

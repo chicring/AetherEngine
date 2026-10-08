@@ -89,6 +89,29 @@ struct SWClockAnchorPolicyTests {
         #expect(r.sessionZeroSeconds == 0)
     }
 
+    // MARK: - Session zero for a resume on an offset-origin source
+
+    @Test("a resume on a source whose timestamps start at 600 s carries the origin as session zero")
+    func resumeOnOffsetOrigin() {
+        // Measured on `-output_ts_offset 600`: a 17.3 s resume landed on the source's first
+        // packet (600.0) while publishing 18.2, because the target reached the demuxer unconverted.
+        #expect(SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: 599.979) == 599.979)
+    }
+
+    @Test("an origin inside the tolerance stays a zero-based source, as on a cold start")
+    func resumeOnNearZeroOrigin() {
+        for origin in [0, 0.021, 1.4, 2.0] {
+            #expect(SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: origin) == 0)
+        }
+    }
+
+    @Test("an unknown or negative origin is no session zero")
+    func resumeOnUnknownOrigin() {
+        for origin in [Double.nan, .infinity, -5] {
+            #expect(SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: origin) == 0)
+        }
+    }
+
     // MARK: - Carrying a seek target back to the source axis
 
     @Test("a zero-based source seeks on the axis it already uses")

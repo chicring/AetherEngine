@@ -38,6 +38,20 @@ enum SWClockAnchorPolicy {
                           sessionZeroSeconds: max(0, firstSampleSeconds - initialSeconds))
     }
 
+    /// The session zero a resume establishes before any sample arrives (AE#724).
+    ///
+    /// `load(startPosition:)` is a session-axis position like any seek, but on a cold start the
+    /// session zero only exists once `resolve` has seen the first sample. A resume has to cross
+    /// the axes before that, or its target reaches the demuxer unconverted: on a source whose
+    /// timestamps start at 600 s, 17.3 is a position before the first packet, the read lands on
+    /// the head, and the clock publishes 17.3 over content from 0. The origin counts on the same
+    /// terms as on a cold start, so a source starting within the tolerance stays zero-based.
+    static func resumeSessionZero(sourceOriginSeconds: Double,
+                                  toleranceSeconds: Double = SWClockAnchorPolicy.toleranceSeconds) -> Double {
+        guard sourceOriginSeconds.isFinite, sourceOriginSeconds > toleranceSeconds else { return 0 }
+        return sourceOriginSeconds
+    }
+
     /// Converts a session-axis position into the source axis.
     ///
     /// The host publishes positions session-relative (`raw - sessionZero`), but the
