@@ -10,7 +10,9 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Blocking engine work no longer occupies the Swift cooperative pool.** Every detached engine task (demuxer opens and packet reads, the live ingest's FIFO writes under backpressure, the native subtitle readers, `stop()`'s wait for the pump, recording finish, probe closes) ran on the cooperative pool, which has one thread per core and never grows, so each blocked job took a core's worth of async work out of the whole process, the host app's included. They now go through `BlockingWork.detached`, whose `BlockingExecutor` runs jobs on GCD's global queues, which add a thread when one blocks; a test refuses any new `Task.detached` in the engine sources. Found through CI: on the 3-core runner the suite parked every pool thread for half a minute at a time, so a different set of unrelated tests timed out each run (nine 120 s limits fired together at 151 s, their watchdog being a pool task too). Tests that block on purpose run under a new `.offCooperativePool` trait. With the pool free the suite runs in about 13 s instead of 72, and that exposed tests that had leaned on the old pace: three read a transient state against a finite bound, two measured process-wide memory beside parallel suites, one took 150 ms of quiet for a parked producer (`SoftwarePacketReadAhead` now says so itself), and five suites that each clear the process-wide prewarm store now run serialized against each other. `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` (a one-thread pool) reproduces the CI failure on any Mac: 26 issues across 470 s before, and CI now runs the suite that way as well.
 
 ## [7.31.1] - 2026-10-08
 
