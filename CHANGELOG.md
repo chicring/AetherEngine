@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.32.3] - 2026-10-08
+
 ### Fixed
 
 - **The delivery-gap watchdog no longer cuts the open's first byte short.** `open()` waits for its first byte within `SourceOpenPolicy.firstByteTimeout` (and the retry within `sizeProbeTimeout`), but the #309 watchdog ended that same request once `connStallTimeout` had passed without data, and the retry the same way, so the open failed with `noResponse` at the stall threshold. With the defaults (stall 20 s, first byte 15 s) the open's budget ran out first, so this only reached a host that sets a longer first-byte budget than 20 s, for an origin that is slow to answer. The generation the open is waiting on is now left to the open's budget; every later generation, including one that never sees a first byte, is still ended at the threshold.
