@@ -403,6 +403,9 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private var listenFd: Int32 = -1
     private var shouldStop = false
+    /// Bumped by every start and stop, so an accept loop from an earlier start exits even when a
+    /// later start has cleared `shouldStop` again.
+    private var listenGeneration: UInt64 = 0
     private var clientFds = Set<Int32>()
 
     /// Audit SUB-107: whether `pathToken` is registered with the log redactor. The token is the
@@ -508,6 +511,9 @@ final class HLSLocalServer: @unchecked Sendable {
     /// Audit NET-13: one line per failed accept, when the process is out of descriptors, is a busy
     /// loop that floods the host's log ring. Failures back off and their line is rate limited.
     private static let acceptFailureBackoffMicroseconds: useconds_t = 100_000
+    /// How long the accept loop waits for a connection before it checks for a stop again. Also the
+    /// longest a stopped server keeps its port.
+    static let acceptPollMilliseconds: Int32 = 100
     private var acceptFailureLog = LogThrottle(interval: 5)
     private var refusalLog = LogThrottle(interval: 5)
     /// Audit NET-111: every line a connection that never presented the token can cause shares this, so
@@ -621,6 +627,8 @@ final class HLSLocalServer: @unchecked Sendable {
         listenFd = fd
         port = assignedPort
         shouldStop = false
+        listenGeneration &+= 1
+        let generation = listenGeneration
         if !tokenRegistered {
             tokenRegistered = LogRedaction.register(pathToken)
         }
@@ -629,7 +637,10 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
                        category: .hlsServer)
 
-        let accepter = Thread { [weak self] in self?.acceptLoop() }
+        let accepter = Thread { [weak self] in
+            guard let self else { close(fd); return }
+            self.acceptLoop(listenFd: fd, generation: generation)
+        }
         accepter.name = "com.aetherengine.hls.accept"
         accepter.qualityOfService = .userInitiated
         accepter.start()
@@ -638,15 +649,20 @@ final class HLSLocalServer: @unchecked Sendable {
     func stop() {
         stateLock.lock()
         shouldStop = true
-        let fdToClose = listenFd
         listenFd = -1
+        listenGeneration &+= 1
         let closingPort = port
         port = 0
         loggedMasterPlaylist = false
         loggedReducedMasterPlaylist = false
         loggedMediaPlaylist = false
         mediaPlaylistBuildCount = 0
-        let clients = clientFds
+        // Under the lock: a handler removes its fd here before it closes it, so a number still in the
+        // set is still that handler's. Shut down outside the lock, the handler could close in between
+        // and the number go to another socket in the process, whose connection this then ended
+        // (an origin read with no response, a body cut short).
+        for fd in clientFds { shutdown(fd, SHUT_RDWR) }
+        let clientCount = clientFds.count
         clientFds.removeAll()
         let unregisterToken = tokenRegistered
         tokenRegistered = false
@@ -657,29 +673,31 @@ final class HLSLocalServer: @unchecked Sendable {
         // AE#597: the one line that says a listener went away. Without it a log cannot tell a
         // server that was released from one that outlived its session on a port of its own.
         EngineLog.emit(
-            "[HLSLocalServer] stop: port \(closingPort) released, \(clients.count) connection(s) "
+            "[HLSLocalServer] stop: port \(closingPort) released, \(clientCount) connection(s) "
             + "shut down", category: .hlsServer)
-
-        // shutdown() BEFORE close() on the listen fd: close releases the fd number while the accept loop may have captured it; a new session could recycle that number and the dying loop would accept on the new session's socket. shutdown() wakes the blocked accept without releasing the number.
-        if fdToClose >= 0 {
-            shutdown(fdToClose, SHUT_RDWR)
-            close(fdToClose)
-        }
-        // shutdown() (NOT close) client fds: close would release the fd number while the handler still owns it; a channel-zap reuses that number immediately on the process-wide singleton engine, so the handler's late send()/deferred close() would hit the new session's descriptor.
-        for fd in clients {
-            shutdown(fd, SHUT_RDWR)
-        }
+        // The listen fd is not closed here: the accept loop owns it and closes it on its way out.
+        // Closing it from this thread freed the number while that loop could still call accept on
+        // it, and the next socket in the process to get the number lost a connection to it.
+        // shutdown() does not wake a blocked accept on Darwin, so the loop polls instead.
     }
 
     // MARK: - Accept loop
 
-    private func acceptLoop() {
+    private func acceptLoop(listenFd fd: Int32, generation: UInt64) {
+        defer { close(fd) }
         while true {
             stateLock.lock()
-            let stopping = shouldStop
-            let fd = listenFd
+            let current = !shouldStop && listenGeneration == generation
             stateLock.unlock()
-            if stopping || fd < 0 { return }
+            if !current { return }
+
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, Self.acceptPollMilliseconds)
+            if ready == 0 { continue }
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return
+            }
 
             var clientAddr = sockaddr_in()
             var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -690,7 +708,6 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             if clientFd < 0 {
                 let err = errno
-                // EBADF means listenFd was closed by stop(); exit cleanly.
                 if err == EBADF || err == EINVAL {
                     return
                 }

@@ -371,6 +371,9 @@ final class MP4SegmentMuxer {
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "segment.m4s")
         guard allocRet == 0, let ctx = ctxOut else {
             close(firstFd)
+            // deinit runs for a throwing init once every stored property is set, and would close
+            // this number a second time, by then possibly another socket's or file's.
+            self.fd = -1
             try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.allocFailed(code: allocRet)
         }
@@ -381,6 +384,7 @@ final class MP4SegmentMuxer {
             avformat_free_context(ctx)
             self.formatContext = nil
             close(firstFd)
+            self.fd = -1
             try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.avioAllocFailed
         }

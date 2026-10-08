@@ -11,7 +11,7 @@ struct LostSourceReadErrorTests {
     /// never completes. The reader can resolve no size and runs the forward-only streaming path.
     private final class LengthlessResettingOrigin: @unchecked Sendable {
         let port: UInt16
-        private let listenFD: Int32
+        private let listener: LoopbackListener
         private let bodyBytes: Int
         private let lock = NSLock()
         private var stopped = false
@@ -23,46 +23,20 @@ struct LostSourceReadErrorTests {
 
         init?(bodyBytes: Int) {
             self.bodyBytes = bodyBytes
-            let fd = socket(AF_INET, SOCK_STREAM, 0)
-            guard fd >= 0 else { return nil }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = 0
-            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-            let bound = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
+            guard let listener = LoopbackListener(backlog: 16) else { return nil }
+            self.listener = listener
+            port = listener.port
+            listener.start { [self] fd in
+                Thread.detachNewThread { [self] in serve(fd) }
+                return true
             }
-            guard bound == 0, listen(fd, 16) == 0 else { Darwin.close(fd); return nil }
-            var name = sockaddr_in()
-            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-            _ = withUnsafeMutablePointer(to: &name) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
-            }
-            listenFD = fd
-            port = UInt16(bigEndian: name.sin_port)
-            Thread.detachNewThread { [self] in acceptLoop() }
         }
 
         func stop() {
             lock.lock()
             stopped = true
             lock.unlock()
-            shutdown(listenFD, SHUT_RDWR)
-            Darwin.close(listenFD)
-        }
-
-        private func acceptLoop() {
-            while true {
-                let fd = accept(listenFD, nil, nil)
-                guard fd >= 0 else { return }
-                var one: Int32 = 1
-                setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-                Thread.detachNewThread { [self] in serve(fd) }
-            }
+            listener.stop()
         }
 
         private func serve(_ fd: Int32) {

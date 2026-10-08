@@ -23,7 +23,7 @@ struct Issue177IngestPrefetchTests {
     /// captures the concurrency high-water mark.
     private final class LoopbackHLSOrigin: @unchecked Sendable {
         let port: UInt16
-        private let listenFD: Int32
+        private let listener: LoopbackListener
         private let firstPlaylist: Data
         private let finalPlaylist: Data
         private let segments: [Data]
@@ -32,7 +32,6 @@ struct Issue177IngestPrefetchTests {
         private var _playlistRequests = 0
         private var _inFlight = 0
         private var _highWater = 0
-        private var _stopped = false
 
         var concurrencyHighWater: Int {
             lock.lock(); defer { lock.unlock() }
@@ -63,71 +62,23 @@ struct Issue177IngestPrefetchTests {
             firstPlaylist = playlist(count: initialWindow, endList: false)
             finalPlaylist = playlist(count: segments.count, endList: true)
 
-            let fd = socket(AF_INET, SOCK_STREAM, 0)
-            guard fd >= 0 else { return nil }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = 0
-            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-            let bindResult = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            guard let listener = LoopbackListener(backlog: 16) else { return nil }
+            self.listener = listener
+            port = listener.port
+            // The listener sets SO_NOSIGPIPE, or a hung-up peer takes the whole test process with
+            // it: serve() parks in the scripted delay before it writes the body, and a cancelled or
+            // drained fetch closes in exactly that window.
+            listener.start { [weak self] conn in
+                guard let self else { close(conn); return false }
+                Thread.detachNewThread { [weak self] in
+                    self?.serve(conn)
                 }
-            }
-            guard bindResult == 0, listen(fd, 16) == 0 else {
-                close(fd)
-                return nil
-            }
-            var bound = sockaddr_in()
-            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let nameResult = withUnsafeMutablePointer(to: &bound) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    getsockname(fd, $0, &len)
-                }
-            }
-            guard nameResult == 0 else {
-                close(fd)
-                return nil
-            }
-            listenFD = fd
-            port = UInt16(bigEndian: bound.sin_port)
-
-            Thread.detachNewThread { [weak self] in
-                self?.acceptLoop()
+                return true
             }
         }
 
         func stop() {
-            lock.lock()
-            _stopped = true
-            lock.unlock()
-            close(listenFD)
-        }
-
-        private var stopped: Bool {
-            lock.lock(); defer { lock.unlock() }
-            return _stopped
-        }
-
-        private func acceptLoop() {
-            while !stopped {
-                let conn = accept(listenFD, nil, nil)
-                guard conn >= 0 else { return }
-                // SO_NOSIGPIPE, or a hung-up peer takes the whole test process with it. serve()
-                // parks in the scripted delay before it writes the body, and a cancelled or drained
-                // fetch closes in exactly that window: the write then raises SIGPIPE, whose default
-                // action kills the process. That death leaves no crash report and no failing test,
-                // only a truncated event stream and `swift test` exit 1, so it reads as a random
-                // CI ghost rather than as this socket.
-                var noSigPipe: Int32 = 1
-                setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
-                           socklen_t(MemoryLayout<Int32>.size))
-                Thread.detachNewThread { [weak self] in
-                    self?.serve(conn)
-                }
-            }
+            listener.stop()
         }
 
         private func serve(_ conn: Int32) {
