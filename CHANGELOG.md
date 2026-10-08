@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.32.1] - 2026-10-08
+
 ### Fixed
 
 - **Stopping the loopback server no longer ends a connection it does not own.** `HLSLocalServer.stop()` shut its client connections down after releasing the lock their handlers close under, so a handler could close in between, the process could hand that descriptor number to another socket, and the shutdown ended that socket instead: a source request answered with nothing, or a body cut short. On the process-wide engine that is the next session after a channel zap. The listener had the same race: `stop()` closed it while the accept loop could still call `accept` on the number. Client connections are now shut down under the lock, and the accept loop owns the listener, polls it, and closes it on its way out (`shutdown` does not wake a blocked `accept` on Darwin). `MP4SegmentMuxer`'s init no longer closes its first staging file twice when it throws. The test origins had the listener race eight times over and now share one `LoopbackListener`; it showed up on CI as a different loopback test failing each time (#309's open with no response, a bounded fetch losing its connection, a relayed 429 charged twice).
