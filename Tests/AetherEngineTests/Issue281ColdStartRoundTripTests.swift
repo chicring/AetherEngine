@@ -9,7 +9,7 @@ import Foundation
 ///
 /// These tests work in byte offsets rather than through a real container, so they pin the reader's
 /// behaviour rather than one fixture's box layout.
-@Suite("Cold-start round trips (#281)")
+@Suite("Cold-start round trips (#281)", .offCooperativePool)
 struct Issue281ColdStartRoundTripTests {
 
     private let fileSize: Int64 = 512 * 1024 * 1024
@@ -117,9 +117,11 @@ struct Issue281ColdStartRoundTripTests {
     /// reconnect, not an open that hangs on a speculative request nothing depends on.
     @Test("a fetch that is not going to land does not hold the read")
     func tailWaitIsBounded() async throws {
+        // The suffix stall has to outlast any pause the test itself can be handed: at 3 s, a test
+        // task resumed late found the fetch landed and no fallback left to observe.
         let stalling = ThrottledOriginServer(
             totalSize: fileSize,
-            firstByteDelayUs: { isSuffix in isSuffix ? 3_000_000 : 0 })
+            firstByteDelayUs: { isSuffix in isSuffix ? 60_000_000 : 0 })
         let server = try #require(stalling)
         defer { server.stop() }
         let reader = makeReader(server)
@@ -290,8 +292,11 @@ struct Issue281ColdStartRoundTripTests {
         #expect(server.requests.contains(where: { $0.range?.contains("bytes=-") == true }),
                 "the tail prefetch never went out, so this proves nothing")
         // Some bytes may be in flight before the cancel lands; what must not happen is the body
-        // being taken. Anything near bodyOnOffer means the response was accepted.
-        #expect(server.bodyBytesWritten < 4 * 1024 * 1024,
+        // being taken. Anything near bodyOnOffer means the response was accepted. The count is what
+        // the server's write() handed to the kernel, and the loopback socket buffers take a few MB
+        // of one write without the client reading a byte (exactly 4 MB, measured), so the bound
+        // sits between that and the offer rather than at the buffer size.
+        #expect(server.bodyBytesWritten < bodyOnOffer / 2,
                 "the 200 body was being downloaded: \(server.bodyBytesWritten) bytes written")
     }
 

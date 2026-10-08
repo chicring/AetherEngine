@@ -8,6 +8,7 @@ import Foundation
 /// stale index against the coalescer's newer target, and a re-request for the index a restart
 /// JUST targeted must wait for the fresh producer instead of tearing it down (device: three
 /// back-to-back restarts at the same index, one dropped frame each).
+@Suite(.offCooperativePool)
 struct SegmentFetchWaitTests {
 
     private final class Recorder: @unchecked Sendable {

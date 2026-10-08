@@ -8,7 +8,7 @@ import Testing
 
 // Serialized: the tests share MockRangeURLProtocol's static byte store keyed by URL; running them
 // in parallel would let one test's fixture bytes answer another's request.
-@Suite("HTTPDiscIOReader (#64 remote disc images)", .serialized)
+@Suite("HTTPDiscIOReader (#64 remote disc images)", .serialized, .offCooperativePool)
 struct HTTPDiscIOReaderTests {
 
     // MARK: - Pure helpers

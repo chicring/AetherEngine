@@ -1256,7 +1256,7 @@ extension AetherEngine {
         session.initialStartSeconds = startPosition
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
-        var playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
+        var playbackURL = try await BlockingWork.detached(priority: .userInitiated) { [session] in
             try session.start()
         }.value
         // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP so
@@ -2035,7 +2035,7 @@ extension AetherEngine {
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
         let dvrRetention = loadedOptions.softwareDVRRetention
-        try await Task.detached(priority: .userInitiated) {
+        try await BlockingWork.detached(priority: .userInitiated) {
             [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
@@ -2114,7 +2114,7 @@ extension AetherEngine {
             self?.hop(for: generation) { [weak self] in self?.setReaderNetworkPhase(phase) }   // audit Vcore-101
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
-        try await Task.detached(priority: .userInitiated) {
+        try await BlockingWork.detached(priority: .userInitiated) {
             [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
@@ -2405,7 +2405,7 @@ extension AetherEngine {
             do {
                 let isLiveReload = loadedOptions.isLive
                 let discCacheKey = url.absoluteString
-                customPreopened = try await Task.detached(priority: .userInitiated) {
+                customPreopened = try await BlockingWork.detached(priority: .userInitiated) {
                     let d = Demuxer()
                     // isLive preserved: a live custom source must not trigger SEEK_END on reopen.
                     // selectTitleID rebuilds the disc concat stream for the chosen title (#67).
@@ -2428,7 +2428,7 @@ extension AetherEngine {
             if loadGeneration != gen {
                 customPreopened?.markClosed()
                 if let d = customPreopened {
-                    Task.detached { d.close() }
+                    BlockingWork.detached { d.close() }
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after reader reopen; unwinding", category: .engine)
                 return nil
@@ -2439,7 +2439,7 @@ extension AetherEngine {
             // survives the reload (#67). Non-disc URL sources keep customPreopened nil and reopen by URL.
             let headers = loadedOptions.httpHeaders
             do {
-                customPreopened = try await Task.detached(priority: .userInitiated) {
+                customPreopened = try await BlockingWork.detached(priority: .userInitiated) {
                     let d = Demuxer()
                     try d.open(url: url, extraHeaders: headers, profile: reloadProfile, selectTitleID: titleToReopen)
                     return d
@@ -2458,7 +2458,7 @@ extension AetherEngine {
             if loadGeneration != gen {
                 customPreopened?.markClosed()
                 if let d = customPreopened {
-                    Task.detached { d.close() }
+                    BlockingWork.detached { d.close() }
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after disc URL reopen; unwinding", category: .engine)
                 return nil

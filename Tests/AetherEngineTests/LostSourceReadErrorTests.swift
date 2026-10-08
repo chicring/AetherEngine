@@ -4,7 +4,7 @@ import Foundation
 
 /// A source that is lost mid-read reports a read error, never end-of-file: the consumer treats EOF
 /// as "played to the end" and never retries it (audit DMX-6, DMX-10).
-@Suite("Lost source reads report EIO")
+@Suite("Lost source reads report EIO", .offCooperativePool)
 struct LostSourceReadErrorTests {
 
     /// Answers every request with a length-less 200 and every GET with `bodyBytes` of a body that

@@ -276,6 +276,9 @@ struct SourceOpenRecoveryTests {
         } catch {
             #expect(error as? AVIOReaderError == .requestTimeout)
         }
+        // The retry can still be on its way to the origin's parser when load() gives up, so the
+        // count is read once it has arrived rather than at that instant.
+        try await waitFor { origin.requests.count >= 2 }
         #expect(origin.requests.count == 2)
         #expect(engine.errorInfo?.kind == .sourceOpenFailed)
         #expect(engine.errorInfo?.underlyingDomain == NSURLErrorDomain)

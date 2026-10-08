@@ -9,7 +9,7 @@ import Foundation
 /// place, which is what makes the exit's honest `.exhausted` survive long enough to be read.
 ///
 /// `.serialized`: these tests mutate the process-wide backoff-scale test hook.
-@Suite("Source-stall visibility (#410)", .serialized)
+@Suite("Source-stall visibility (#410)", .serialized, .offCooperativePool)
 struct Issue410SourceStallVisibilityTests {
 
     /// The refusal these tests stage arms the request-rate pacer's wall-clock quiet ladder, which

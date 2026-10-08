@@ -419,7 +419,7 @@ extension HLSVideoEngine {
             "[HLSVideoEngine] live pump exited (reason=\(reason)); starting reopen",
             category: .session
         )
-        Task.detached(priority: .userInitiated) { [weak self] in
+        BlockingWork.detached(priority: .userInitiated) { [weak self] in
             await self?.performLiveReopen(failedProducer: prod)
         }
     }
@@ -519,7 +519,7 @@ extension HLSVideoEngine {
             category: .session
         )
         let sessionEpoch = sessionEpochSnapshot()
-        Task.detached(priority: .userInitiated) { [weak self, weak deadProducer] in
+        BlockingWork.detached(priority: .userInitiated) { [weak self, weak deadProducer] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let self else { return }
             self.fireMeteredRevive(at: idx, deadProducer: deadProducer, sessionEpoch: sessionEpoch)
@@ -657,7 +657,7 @@ extension HLSVideoEngine {
                 + "audio moov prime (audio stream-copy preserved)",
                 category: .session
             )
-            Task.detached(priority: .userInitiated) { [weak self] in
+            BlockingWork.detached(priority: .userInitiated) { [weak self] in
                 self?.rebuildLiveProducerInPlace(failed: prod)
             }
             return
@@ -766,7 +766,7 @@ extension HLSVideoEngine {
             category: .session
         )
         // handlePumpFinished runs on the dying pump thread; hop off it like the reopen path does.
-        Task.detached(priority: .userInitiated) { [weak self] in
+        BlockingWork.detached(priority: .userInitiated) { [weak self] in
             self?.rebuildLiveProducerInPlace(failed: prod)
         }
     }
@@ -952,7 +952,7 @@ extension HLSVideoEngine {
     ) {
         let fetchesBefore = provider?.mediaFetchCount ?? 0
         let epoch = sessionEpochSnapshot()
-        Task.detached(priority: .userInitiated) { [weak self] in
+        BlockingWork.detached(priority: .userInitiated) { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.consumerReengageGraceSeconds * 1_000_000_000))
             guard let self, self.isSessionEpochCurrent(epoch) else { return }
             guard (self.provider?.mediaFetchCount ?? 0) == fetchesBefore,

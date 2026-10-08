@@ -8,6 +8,7 @@ import Foundation
 /// request accumulated -12889 strikes toward failedToPlayToEndTime. A serve
 /// that cannot deliver promptly must now emit response headers early
 /// (Transfer-Encoding: chunked) and stream the body when the segment lands.
+@Suite(.offCooperativePool)
 struct Issue93SlowSegmentServeTests {
 
     private final class Counter: @unchecked Sendable {

@@ -260,7 +260,7 @@ struct SubtitlePumpTapTests {
 
 // MARK: - Tap overlay markup handling (Sodalite#32 Phase 2)
 
-@Suite("ASS markup strip for the WebVTT rendition")
+@Suite("ASS markup strip for the WebVTT rendition", .offCooperativePool)
 struct ASSMarkupStripTests {
 
     @Test("A raw ASS event line strips to plain text")

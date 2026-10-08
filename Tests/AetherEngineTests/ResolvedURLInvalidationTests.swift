@@ -9,7 +9,7 @@ import Foundation
 /// through the source URL for a fresh redirect.
 ///
 /// `.serialized`: the rate-limit case mutates the process-wide backoff-scale test hook.
-@Suite("Resolved-URL invalidation on hard server errors", .serialized)
+@Suite("Resolved-URL invalidation on hard server errors", .serialized, .offCooperativePool)
 struct ResolvedURLInvalidationTests {
 
     /// These tests drive real 429 and 509 answers, and each one arms the request-rate pacer's

@@ -496,6 +496,11 @@ police, so a controlled probe does not run it. An untagged 10-bit HEVC source wh
 Dolby Vision record therefore comes back without one from `probe(url:limits:)` while `probe(url:)`
 synthesizes it. Probe that class of source without limits, or treat the absence as unconfirmed.
 
+`probe` blocks its thread until the native call returns. A detached task is no background thread
+(it runs on the Swift cooperative pool, one thread per core), so a host that probes several
+sources at once is better served by a GCD queue or a `TaskExecutor` of its own; the engine's own
+detached work goes through one (see Architecture, "Blocking work and the cooperative pool").
+
 ```swift
 let cancellation = ProbeCancellation()
 let worker = Task.detached {

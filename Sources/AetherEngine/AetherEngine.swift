@@ -355,7 +355,7 @@ public final class AetherEngine: ObservableObject {
         session: HLSVideoEngine?, itemSeconds: Double
     ) async -> Double {
         guard let session else { return itemSeconds }
-        return await Task.detached(priority: .userInitiated) {
+        return await BlockingWork.detached(priority: .userInitiated) {
             session.preparedSeekLanding(itemSeconds: itemSeconds)
         }.value
     }
@@ -3760,7 +3760,7 @@ public final class AetherEngine: ObservableObject {
         //
         // Issue #114: the declaration runs off the main thread. See `audioSessionCategoryTask`.
         #if os(iOS) || os(tvOS)
-        audioSessionCategoryTask = Task.detached(priority: .userInitiated) {
+        audioSessionCategoryTask = BlockingWork.detached(priority: .userInitiated) {
             let session = AVAudioSession.sharedInstance()
             do {
                 try session.setCategory(.playback, mode: .moviePlayback, policy: AetherEngine.audioSessionRouteSharingPolicy)
@@ -4367,8 +4367,9 @@ public final class AetherEngine: ObservableObject {
         do {
             // Detach avformat_open_input + find_stream_info off @MainActor (~6 s on a slow CDN).
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
-            // despite the async signature; Task.detached.value introduces a real background hop.
-            try await Task.detached(priority: .userInitiated) { [probe, source, options] in
+            // despite the async signature; a detached task's value introduces a real background hop,
+            // and BlockingWork keeps that hop off the cooperative pool while the open blocks.
+            try await BlockingWork.detached(priority: .userInitiated) { [probe, source, options] in
                 // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
                 // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
                 let probeProfile = DemuxerOpenProfile.playback.withProbeBudget(
@@ -4418,7 +4419,7 @@ public final class AetherEngine: ObservableObject {
                        colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                        colorMatrix: stream.pointee.codecpar.pointee.color_space) {
                     let auditHeaders = options.httpHeaders
-                    detectedDVRPUProfile = await Task.detached(priority: .userInitiated) {
+                    detectedDVRPUProfile = await BlockingWork.detached(priority: .userInitiated) {
                         DolbyVisionRecordAudit.rpuProfileOfSource(url: auditURL, extraHeaders: auditHeaders)
                     }.value
                     correctedDVProfile = DolbyVisionRecordAudit.correctedProfile(
@@ -4482,7 +4483,7 @@ public final class AetherEngine: ObservableObject {
         if loadGeneration != gen {
             probe.markClosed()
             if probeOpened {
-                Task.detached { [probe] in probe.close() }
+                BlockingWork.detached { [probe] in probe.close() }
             }
             try checkLoadCurrent(gen)
         }
@@ -4780,7 +4781,7 @@ public final class AetherEngine: ObservableObject {
                 if loadGeneration != gen {
                     probe.markClosed()
                     if probeOpened {
-                        Task.detached { [probe] in probe.close() }
+                        BlockingWork.detached { [probe] in probe.close() }
                     }
                     try checkLoadCurrent(gen)
                 }
@@ -4845,7 +4846,7 @@ public final class AetherEngine: ObservableObject {
             if loadGeneration != gen {
                 probe.markClosed()
                 if probeOpened {
-                    Task.detached { [probe] in probe.close() }
+                    BlockingWork.detached { [probe] in probe.close() }
                 }
                 try checkLoadCurrent(gen)
             }
@@ -4980,14 +4981,14 @@ public final class AetherEngine: ObservableObject {
                fieldOrder: detectedFieldOrder,
                spsIndicatesInterlaced: spsIndicatesInterlaced) {
             let videoIdx = probe.videoStreamIndex
-            let verdict = await Task.detached(priority: .userInitiated) { [probe] in
+            let verdict = await BlockingWork.detached(priority: .userInitiated) { [probe] in
                 let verdict = InterlaceProbe.run(demuxer: probe, streamIndex: videoIdx)
                 probe.seek(to: 0)  // sample consumed packets; the session reuses this demuxer
                 return verdict
             }.value
             if loadGeneration != gen {
                 probe.markClosed()
-                Task.detached { [probe] in probe.close() }
+                BlockingWork.detached { [probe] in probe.close() }
                 try checkLoadCurrent(gen)
             }
             if InterlaceProbe.refutesDeclaredInterlace(verdict) {
@@ -5139,7 +5140,7 @@ public final class AetherEngine: ObservableObject {
                dvBlCompatID: dvConfig.blCompatID,
                presentsDolbyVisionBaseLayer: presentsDolbyVisionBaseLayer) {
             probe.markClosed()
-            Task.detached { [probe] in probe.close() }
+            BlockingWork.detached { [probe] in probe.close() }
             let profileLabel = detectedCodecID == AV_CODEC_ID_AV1 ? "10.0" : "5"
             EngineLog.emit(
                 "[AetherEngine] DV Profile \(profileLabel) routed to the software path; IPT-PQ-c2 has "
@@ -5156,7 +5157,7 @@ public final class AetherEngine: ObservableObject {
            (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil,
            probe.audioStreamIndex < 0 {
             probe.markClosed()
-            Task.detached { [probe] in probe.close() }
+            BlockingWork.detached { [probe] in probe.close() }
             EngineLog.emit(
                 "[AetherEngine] demuxed-audio live source routed to the software path "
                 + "(codec=\(detectedCodecID.rawValue)); side-audio merge is native-only, failing fast",
@@ -6248,7 +6249,7 @@ public final class AetherEngine: ObservableObject {
     /// (old.stop + waitForFinish up to 5s) and is designed to run off-main, so dispatch it detached.
     private func reanchorProducerToPlaylistTime(_ seconds: Double) {
         guard let session = nativeVideoSession else { return }
-        Task.detached {
+        BlockingWork.detached {
             let idx = session.segmentIndexForPlaylistTime(seconds)
             // Authoritative re-anchor: deadline recovery must win the coalescer over any stale
             // in-flight scrub target.

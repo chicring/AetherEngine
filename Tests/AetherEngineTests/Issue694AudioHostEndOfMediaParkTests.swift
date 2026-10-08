@@ -5,7 +5,7 @@ import Foundation
 /// #694: the audio-only host reported end of media while its synchronizer kept rate 1, so
 /// `currentTime` walked past `duration` without bound. AE#374 closed the same defect on the software
 /// host; this pins it on the audio-only one, end to end against a real decode.
-@Suite("Audio host parks its clock at end of media (#694)")
+@Suite("Audio host parks its clock at end of media (#694)", .offCooperativePool)
 struct Issue694AudioHostEndOfMediaParkTests {
 
     @MainActor

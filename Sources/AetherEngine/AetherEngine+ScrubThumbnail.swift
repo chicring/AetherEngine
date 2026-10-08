@@ -37,7 +37,7 @@ extension AetherEngine {
         let output = live ? seconds - liveShift
             : sourceTarget - session.firstKeyframeSeconds
         let planOrigin = session.firstKeyframeSeconds - origin
-        let source = await Task.detached(priority: .utility) { [session] in
+        let source = await BlockingWork.detached(priority: .utility) { [session] in
             session.scrubThumbnailSource(atSeconds: output)
         }.value
         guard let source, let carried = source.carriedOffset,
@@ -62,7 +62,7 @@ extension AetherEngine {
         guard let frame = await extractor.residentPreview(rawTarget: live ? output : sourceTarget - carried,
                     refined: refined, maxWidth: maxWidth, isCancelled: isCancelled),
               gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
-        let stillOwned = await Task.detached(priority: .utility) { [session] in
+        let stillOwned = await BlockingWork.detached(priority: .utility) { [session] in
             guard let current = session.scrubThumbnailSource(atSeconds: output) else { return false }
             return current.identity == source.identity && current.carriedOffset == source.carriedOffset
         }.value
@@ -109,7 +109,7 @@ extension AetherEngine {
             return loadGeneration == gen ? image : nil
         }
         let gen = loadGeneration
-        let source = await Task.detached(priority: .userInitiated) { [session] in
+        let source = await BlockingWork.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: seconds)
         }.value
         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices
