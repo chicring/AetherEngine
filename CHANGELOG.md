@@ -26,7 +26,14 @@ the public-API contract.
   stream copy as well as on the probe, so a JOC source that fell back to the audio bridge claims
   only the channels it still has, and the count is read from the codec parameters the muxer was
   given rather than the source's. `CODECS` and the `EXT-X-STREAM-INF` line are byte-identical
-  before and after.
+  before and after. (PR #727, thanks to @kdorepos.)
+- **An untagged Atmos track gets its `CHANNELS="16/JOC"` too.** The rendition, and with it `CHANNELS`,
+  was only written for audio with a resolvable language (AE#458), so an `und` or untagged JOC track,
+  Dolby's own test signals among them, still reached the master without a word about objects. A
+  stream-copied JOC track now gets a rendition without `LANGUAGE` (`NAME="Dolby Atmos"`), which forces
+  the master on an SDR source the way a language does. AVFoundation lists it as one option named
+  "Unknown" where it built no audible group before. An untagged track that is not object audio is
+  unchanged. The AE#458 audible readback line reports such a session as `served=untagged`. (AE#726)
 
 ### Tests and CI
 

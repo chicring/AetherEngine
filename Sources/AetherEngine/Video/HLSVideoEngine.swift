@@ -2169,7 +2169,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
             frameRateKnown: frameRate != nil,
             videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
-            hasAudioRendition: servedAudioLanguage != nil,
+            hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
             hasIFrameRendition: iFrameCandidate == .served)
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL

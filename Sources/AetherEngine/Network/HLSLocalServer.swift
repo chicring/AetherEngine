@@ -87,7 +87,9 @@ protocol HLSSegmentProvider: AnyObject {
     /// AE#458: the muxed audio track's language (ISO 639-2/T) and display NAME for the master's
     /// EXT-X-MEDIA:TYPE=AUDIO tag. Nil leaves the master without an audio group, which is what an
     /// untagged source gets. A muxed rendition carries no URI: the audio is inside the variant.
-    var masterAudioRendition: (language: String, name: String)? { get }
+    /// AE#726: `language` is nil for an untagged E-AC-3 JOC track, which still gets a rendition because
+    /// its CHANNELS is the only place the master can declare object audio.
+    var masterAudioRendition: (language: String?, name: String)? { get }
 
     /// CHANNELS for that same EXT-X-MEDIA tag, nil to omit it. Apple's HLS Authoring Spec makes the
     /// attribute REQUIRED on an audio rendition, and Dolby's DD+ delivery kit makes it the ONLY
@@ -180,7 +182,7 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
-    var masterAudioRendition: (language: String, name: String)? { nil }
+    var masterAudioRendition: (language: String?, name: String)? { nil }
     var masterAudioChannels: String? { nil }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
@@ -1746,10 +1748,9 @@ final class HLSLocalServer: @unchecked Sendable {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
         if let audio = audioRendition {
-            var audioAttrs = [
-                "TYPE=AUDIO", "GROUP-ID=\"aud\"", "NAME=\"\(audio.name)\"",
-                "LANGUAGE=\"\(audio.language)\"", "DEFAULT=YES", "AUTOSELECT=YES",
-            ]
+            var audioAttrs = ["TYPE=AUDIO", "GROUP-ID=\"aud\"", "NAME=\"\(audio.name)\""]
+            if let language = audio.language { audioAttrs.append("LANGUAGE=\"\(language)\"") }
+            audioAttrs.append(contentsOf: ["DEFAULT=YES", "AUTOSELECT=YES"])
             // CHANNELS is where object audio is declared to AVFoundation. The CODECS string stays
             // `ec-3` (#34: never `ec+3`), and the per-segment `dec3` box is below the playlist layer,
             // so this tag is the only place the master can say the rendition is Atmos. Dolby's DD+

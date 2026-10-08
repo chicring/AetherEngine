@@ -2948,11 +2948,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#458: NAME is required and must be unique in the group, and with one muxed track it always is.
     /// AVKit labels the option from LANGUAGE, not from NAME, so this only has to be human-readable;
     /// the localized language name is what the subtitle renditions already use.
-    var masterAudioRendition: (language: String, name: String)? {
-        guard let audioLanguage else { return nil }
-        let name = Locale.current.localizedString(forIdentifier: audioLanguage) ?? audioLanguage
-        return (language: audioLanguage, name: name)
+    /// AE#726: an untagged track gets no rendition, except a stream-copied E-AC-3 JOC one. Its CHANNELS is
+    /// the only place the master can say "object audio", and without the tag AVFoundation renders the bed.
+    var masterAudioRendition: (language: String?, name: String)? {
+        if let audioLanguage {
+            let name = Locale.current.localizedString(forIdentifier: audioLanguage) ?? audioLanguage
+            return (language: audioLanguage, name: name)
+        }
+        return audioIsAtmosStreamCopy ? (language: nil, name: Self.untaggedAtmosRenditionName) : nil
     }
+
+    static let untaggedAtmosRenditionName = "Dolby Atmos"
 
     /// Apple HLS Authoring Spec 2.13 ("CHANNELS ... MUST be present") plus Dolby's DD+ Online
     /// Delivery Kit: the value is the count of decodable objects, a slash, then `JOC`. 16 is the
@@ -2962,7 +2968,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// A stream that is not object audio gets its plain served channel count, which is equally
     /// required and equally absent before this.
     var masterAudioChannels: String? {
-        guard audioLanguage != nil else { return nil }   // no rendition tag, nothing to attribute
+        guard masterAudioRendition != nil else { return nil }   // no rendition tag, nothing to attribute
         if audioIsAtmosStreamCopy { return Self.atmosChannelsAttribute }
         guard let n = audioChannelCount, n > 0 else { return nil }
         return String(n)
