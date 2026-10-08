@@ -10,7 +10,13 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The delivery-gap watchdog no longer cuts the open's first byte short.** `open()` waits for its first byte within `SourceOpenPolicy.firstByteTimeout` (and the retry within `sizeProbeTimeout`), but the #309 watchdog ended that same request once `connStallTimeout` had passed without data, and the retry the same way, so the open failed with `noResponse` at the stall threshold. With the defaults (stall 20 s, first byte 15 s) the open's budget ran out first, so this only reached a host that sets a longer first-byte budget than 20 s, for an origin that is slow to answer. The generation the open is waiting on is now left to the open's budget; every later generation, including one that never sees a first byte, is still ended at the threshold.
+
+### Tests and CI
+
+- Two CI flakes on `main` traced to their timing assumptions, both reproduced on demand. #309's detection test opened with a 0.6 s stall threshold, so a first byte slower than that on a loaded runner failed the open (the watchdog fix above; measured 0.4 s opened, 0.8 s failed), and it gave positive events it needed fixed deadlines (10 s, 5 s), which a loaded runner spent. Those waits now follow the suite's rule: a step that has to happen gets no deadline, the test's `.timeLimit` catches a hang. #377's idle-refill test slept a fixed 8 s for a paused budget that only starts once the window is full, so a slow fill kept the connection alive (`asks == [0]`, reproduced with a 2.5 MB/s origin); it now waits for the end itself, and reads `asks[1]` only behind `#require`, since the trap took the whole test process and every buffered result with it.
 
 ## [7.32.2] - 2026-10-08
 

@@ -929,6 +929,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var staleGenDroppedBytes: Int64 = 0
     private var connStartedAt = DispatchTime.now()
     private var connFirstDataSeen = false
+    /// The generation `awaitFirstPersistentData` is waiting on, while it waits. Its first byte is
+    /// governed by the open policy's budget, not by the delivery-gap watchdog.
+    private var openAwaitedGeneration: Int?
     // Consecutive unproductive reconnects (demux-thread-only).
     private var unproductiveReconnects = 0
     private var bytesAtLastReconnect: Int64 = 0
@@ -1433,9 +1436,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let started = DispatchTime.now()
         let budget = timeout ?? (isLive ? 15 : sourceOpenPolicy.firstByteTimeout)
         let deadline = Date(timeIntervalSinceNow: budget)
+        openAwaitedGeneration = connGeneration
         while window.isEmpty && !connEnded && !isClosed {
             if !winCond.wait(until: deadline) { break }
         }
+        openAwaitedGeneration = nil
         let gotData = !window.isEmpty
         let result = gotData ? "data" : (isClosed ? "cancelled" : (connEnded ? "ended" : "timeout"))
         let generation = connGeneration
@@ -3380,6 +3385,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // (delivered range, high-water end, transport error), or no transfer is installed.
         guard generation == connGeneration, !connEnded, let transfer = activeTransfer else {
             winCond.unlock()
+            return
+        }
+        // The open is waiting on this generation's first byte with a budget of its own
+        // (`SourceOpenPolicy`), which a host sets longer than the stall threshold for an origin that
+        // is slow to answer. Ending it here cut both open attempts at the threshold instead.
+        if openAwaitedGeneration == generation, !connFirstDataSeen {
+            winCond.unlock()
+            armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
             return
         }
         let gap = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)

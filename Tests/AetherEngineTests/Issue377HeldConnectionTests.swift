@@ -506,7 +506,8 @@ struct Issue377HeldReaderTests {
                 "a stretch with no read outstanding is not a gap; drawing again must not cost a request: \(asks)")
     }
 
-    @Test("consumption after an idle end refills at the frontier without going backwards")
+    @Test("consumption after an idle end refills at the frontier without going backwards",
+          .timeLimit(.minutes(2)))
     func refillAfterIdleEnd() async throws {
         let totalSize: Int64 = 256 * 1024 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: totalSize))
@@ -520,7 +521,10 @@ struct Issue377HeldReaderTests {
         reader.heldPausedBudgetSeconds = 3
         try reader.open()
 
-        try await Task.sleep(for: .seconds(8))   // past the paused budget
+        // The paused budget runs from the moment the window is full, and filling it is the origin's
+        // pace: on a loaded runner that alone outlasted a fixed 8 s sleep, the connection was never
+        // ended, and the drain below rode it (`[0]`). Wait for the end itself.
+        try await waitFor { !reader.hasLiveConnectionForTesting }
         let afterIdle = dataRanges(server, totalSize: totalSize)
         #expect(afterIdle.count == 1)
 
@@ -530,8 +534,10 @@ struct Issue377HeldReaderTests {
                 "the reader did not resume after the pause ended")
 
         let asks = dataRanges(server, totalSize: totalSize)
-        #expect(asks.count == 2,
-                "resuming should cost exactly one re-request at the frontier, got \(asks)")
+        // `#require`, not `#expect`: `asks[1]` below traps on a shorter list, and a trap takes the
+        // whole test process down with every result still buffered in it.
+        try #require(asks.count == 2,
+                     "resuming should cost exactly one re-request at the frontier, got \(asks)")
         #expect(asks == asks.sorted(), "a refill went backwards past the frontier: \(asks)")
         #expect(asks[1] > 0, "the refill asked from byte 0 again instead of at the frontier")
     }
