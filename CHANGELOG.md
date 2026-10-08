@@ -10,15 +10,21 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.31.0] - 2026-10-08
+
 ### Added
 
-- Opt-in `LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` let hosts tune fast live admission for long-GOP sources without changing segment cuts or advertised holdback. Defaults preserve the existing minimum media and grace policies.
-- Native live display/seek time remains continuous through source timestamp resets. A stale item-range mirror may use already-played resident history, so early starts do not hide available rewind; return to live accepts a caller-selected offset. Queued resume clamps yield to newer seeks.
-- Opt-in live DVR retention leases let callers renew time and disk allowances without reopening playback. Native and software paths retain finite playback cushions; software eviction recovery reanchors decoders and clocks before feeding retained packets.
+- **`LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` tune a `.fastZap` start on long-GOP sources (#712).** A long GOP cannot finalize a segment before the next keyframe, so the two-segment minimum cost a second whole GOP; a host can now let one long enough segment start the session and choose the grace after it. Both default to nil, which keeps today's policy, and neither touches segment cuts, TARGETDURATION or HOLD-BACK. Contributed by yucelokan.
+- **Live rewind history is published as soon as it is played, and stays on one timeline (#712).** AVPlayer's seekable-range mirror can lag the cache for seconds after a fast join, which advertised no history while the picture already played; already-played contiguous resident media now counts, prefetched media never does. On the native loopback path display time and seek targets keep the session's shift through a source timestamp reset (`clock.sourceTime` still follows the frame's PTS for cues). `seekToLiveEdge(offsetSeconds:)` returns to a caller-chosen distance behind the edge, `currentItemLiveEdgeTime` and `liveTargetDurationSeconds` are public, and a resume clamp queued by an earlier `play()` yields to a newer seek. Contributed by yucelokan.
+- **Live DVR retention leases (#714).** `setNativeLiveDVRLimits(_:availableCapacityBytes:)` and, with the new `LoadOptions.softwareDVRRetention`, `setSoftwareLiveDVRLimits(_:availableCapacityBytes:)` renew a time and disk allowance (`LiveDVRLimits`) on a running session without a reload or a second source. An expired lease withdraws the optional history and the playback cushion stays; `nativeLiveDVRMandatoryBytes` and `softwareLiveDVRBytes` report what is held. Measured against a public HLS channel: a 15 s lease set at t=10 withdrew the range at t=25 and playback stayed at the edge with about 27 MB pinned. Contributed by yucelokan.
+- **`LoadOptions.sourceOpenPolicy`, `isSourceSeekable` and `canSeek` (#713).** See Fixed. Contributed by yucelokan.
 
 ### Fixed
 
-- HTTP VOD opening retries an unanswered data request without misclassifying seekability. Caller-selected opening budgets and scoped size discovery keep single-request origins serial and cancel losing metadata probes before playback. VOD exposes measured seekability, ignores unsupported saved positions and reports actual native seek completion.
+- **An HTTP VOD source that does not answer its first request is retried, not demoted to forward-only (#713).** An unanswered open retries once with an open-ended Range within `SourceOpenPolicy` budgets (15 s first byte, 25 s recovery) and keeps that connection for playback; two unanswered requests fail as `.sourceOpenFailed` instead of repeating the whole open. Size discovery runs as one bounded operation, serial on single-request origins, and joins its losing probes before playback. A forward-only VOD ignores a saved start position and rejects seeks with `SeekEvent.Rejection.sourceNotSeekable`, and a native seek reports a landing only when AVPlayer completed within 0.75 s of the target. Checked against a 25 GB 4K mkv from a Jellyfin server: opens in 58 ms, a 7,700 s jump, a paused seek and a 10-seek burst all land exactly, the same as 7.30.0. Contributed by yucelokan.
+- **The #713 recovery tests drive their timing steps from a thread.** On a starved CI runner the async poll missed the window and one test hung into its time limit. Test-only.
 
 ## [7.30.0] - 2026-10-08
 
