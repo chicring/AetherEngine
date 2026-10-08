@@ -19,7 +19,7 @@ import Foundation
 /// A source the host warmed with `AetherEngine.prewarm` (#551) is read out of those bytes first
 /// (#647): the warm has already stated the size and proven range support, so the reader neither
 /// probes nor refetches the head, and its first request starts at the warm frontier.
-final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
+final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
@@ -45,6 +45,15 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     /// must be able to set it from another thread while a read is in flight.
     private let cancelLock = NSLock()
     private var cancelled = false
+    /// This reader's own share of `lifetimeFetchedBytes`: every response body `fetchWithRetry`
+    /// received, a rejected or retried one included, since it crossed the link either way.
+    private let transferLock = NSLock()
+    private var transferredBytes: Int64 = 0
+
+    var sourceBytesFetched: Int64 {
+        transferLock.lock(); defer { transferLock.unlock() }
+        return transferredBytes
+    }
 
     /// Probes total size and range support with one (retried) `bytes=0-0` request, unless
     /// `prewarmed` has already stated both. Returns nil if the source is unreachable or answers `200`
@@ -285,9 +294,12 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         while true {
             cancelLock.lock(); let stop = cancelled; cancelLock.unlock()
             if stop { return nil }
-            if let r = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
-                                     timeout: requestTimeout, offset: offset, length: length),
-               r.status == 206, !r.body.isEmpty,
+            let response = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
+                                         timeout: requestTimeout, offset: offset, length: length)
+            if let response, !response.body.isEmpty {
+                transferLock.lock(); transferredBytes &+= Int64(response.body.count); transferLock.unlock()
+            }
+            if let r = response, r.status == 206, !r.body.isEmpty,
                let contentRange = r.contentRange,
                Self.parseContentRangeStart(contentRange) == offset {
                 return r.body.count > length ? r.body.prefix(length) : r.body
