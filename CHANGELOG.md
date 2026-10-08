@@ -10,6 +10,11 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `LoadOptions.liveStartupGraceSeconds` and `liveStartupSingleSegmentMinimumSeconds` let hosts tune fast live admission for long-GOP sources without changing segment cuts or advertised holdback. Defaults preserve the existing minimum media and grace policies.
+- Native live display/seek time remains continuous through source timestamp resets. A stale item-range mirror may use already-played resident history, so early starts do not hide available rewind; return to live accepts a caller-selected offset. Queued resume clamps yield to newer seeks.
+
 ### Fixed
 
 - HTTP VOD opening retries an unanswered data request without misclassifying seekability. Caller-selected opening budgets and scoped size discovery keep single-request origins serial and cancel losing metadata probes before playback. VOD exposes measured seekability, ignores unsupported saved positions and reports actual native seek completion.

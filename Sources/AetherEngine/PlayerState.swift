@@ -563,6 +563,23 @@ public struct LoadOptions: Sendable, Equatable {
     /// live, sequential-only sources and disposable frame probes retain their own policies.
     public var sourceOpenPolicy: SourceOpenPolicy = .init()
 
+    /// Extra wait after an eligible finalized window for `.fastZap` loopback live joins.
+    /// Nil uses the observed segment duration clamped to 0.5...2 seconds. Zero serves immediately
+    /// once the minimum media exists. Invalid or negative values use the automatic policy.
+    /// A shorter grace can increase early rebuffering on irregular sources. This does not change
+    /// TARGETDURATION, HOLD-BACK, or `.standard` joins. The minimum is two segments unless
+    /// `liveStartupSingleSegmentMinimumSeconds` explicitly permits a sufficiently long first one.
+    public var liveStartupGraceSeconds: Double? = nil
+
+    /// Opt-in minimum media duration for starting a `.fastZap` loopback live session with one
+    /// finalized segment. Nil retains the two-segment minimum. A finite, positive value allows a
+    /// single segment at least that long to enter the same bounded-start grace; shorter segments
+    /// still need a second segment. This avoids waiting for another full GOP on long-GOP sources.
+    /// It does not change segment boundaries, TARGETDURATION, HOLD-BACK or `.standard` joins.
+    /// A shallow initial playlist can rebuffer if the next segment arrives late. Hosts choose
+    /// this latency/resilience tradeoff; invalid values preserve the two-segment minimum.
+    public var liveStartupSingleSegmentMinimumSeconds: Double? = nil
+
     /// Cut AVPlayer's stall-avoidance wait short at the live join, once it is holding on media it has
     /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `false` (AE#440).
     ///
@@ -897,6 +914,8 @@ public struct LoadOptions: Sendable, Equatable {
         liveBlockingReload: Bool? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
         sourceOpenPolicy: SourceOpenPolicy = .init(),
+        liveStartupGraceSeconds: Double? = nil,
+        liveStartupSingleSegmentMinimumSeconds: Double? = nil,
         liveJoinStartsImmediately: Bool = true,
         clampsLiveResumeToWindow: Bool = true,
         nativeRemoteHLS: Bool = false,
@@ -943,6 +962,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.liveBlockingReload = liveBlockingReload
         self.liveJoinProfile = liveJoinProfile
         self.sourceOpenPolicy = sourceOpenPolicy
+        self.liveStartupGraceSeconds = liveStartupGraceSeconds
+        self.liveStartupSingleSegmentMinimumSeconds = liveStartupSingleSegmentMinimumSeconds
         self.liveJoinStartsImmediately = liveJoinStartsImmediately
         self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
         self.nativeRemoteHLS = nativeRemoteHLS

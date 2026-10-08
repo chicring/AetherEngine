@@ -30,10 +30,11 @@ extension AetherEngine {
         // the segment's bytes retain their own epoch normalization after restart.
         let origin = sourcePresentationOrigin
         let live = isLive
-        let liveAxis = presentationAxis
-        let liveShift = playlistShiftSeconds
+        // Live: the same stable session-to-output shift `liveScrubThumbnail` uses (#712), frozen
+        // here so the request and its result convert on one axis even if the shift moves meanwhile.
+        let liveShift = liveSessionShiftSeconds
         let sourceTarget = PresentationAxis.source(displayTime: seconds, origin: origin)
-        let output = live ? (liveAxis.itemSeconds(forSourceSeconds: seconds) ?? (seconds - liveShift))
+        let output = live ? seconds - liveShift
             : sourceTarget - session.firstKeyframeSeconds
         let planOrigin = session.firstKeyframeSeconds - origin
         let source = await Task.detached(priority: .utility) { [session] in
@@ -66,12 +67,10 @@ extension AetherEngine {
             return current.identity == source.identity && current.carriedOffset == source.carriedOffset
         }.value
         guard stillOwned, gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
-        guard let actual = live ? Optional(liveAxis.sourceSeconds(forItemSeconds: frame.actualSeconds)
-                                      ?? (frame.actualSeconds + liveShift))
+        guard let actual = live ? Optional(frame.actualSeconds + liveShift)
             : ScrubSegmentTime.displayTime(rawPTS: frame.actualSeconds, carriedOffset: carried, displayOrigin: origin)
         else { return nil }
-        let rangeStart = live ? (liveAxis.sourceSeconds(forItemSeconds: source.startSeconds)
-                                ?? (source.startSeconds + liveShift)) : source.startSeconds + planOrigin
+        let rangeStart = live ? source.startSeconds + liveShift : source.startSeconds + planOrigin
         return ScrubFrame(image: frame.image, actualSeconds: actual, refined: frame.refined,
                          validRange: rangeStart..<(rangeStart + source.durationSeconds))
     }

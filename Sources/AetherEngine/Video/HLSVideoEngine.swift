@@ -931,6 +931,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         dvrWindowSeconds: Double? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
         sourceOpenPolicy: SourceOpenPolicy = .init(),
+        liveStartupGraceSeconds: TimeInterval? = nil,
+        liveStartupSingleSegmentMinimumSeconds: TimeInterval? = nil,
         liveCutTargetSeconds: Double? = nil,
         blockingReloadOverride: Bool? = nil,
         liveCadenceObservation: (@Sendable () -> Double?)? = nil,
@@ -979,6 +981,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveJoinProfile = liveJoinProfile
+        self.liveStartupGraceSeconds = liveStartupGraceSeconds
+        self.liveStartupSingleSegmentMinimumSeconds = liveStartupSingleSegmentMinimumSeconds
         // An explicit cut target keeps precedence for direct callers. Otherwise resolve the profile.
         let resolvedLiveCutTarget = liveCutTargetSeconds
             ?? Self.liveCutTargetSeconds(for: liveJoinProfile)
@@ -1041,6 +1045,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// Controls whether the first live manifest may take the bounded shallow-window path.
     private let liveJoinProfile: LiveJoinProfile
+    private let liveStartupGraceSeconds: TimeInterval?
+    private let liveStartupSingleSegmentMinimumSeconds: TimeInterval?
 
     /// Live segment cut target for this session, resolved from the host's `LiveJoinProfile` (AE#195).
     /// Drives the producer's keyframe cut, `LiveWindowSizing`, and (via the served TARGETDURATION floor)
@@ -1975,6 +1981,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 retentionBudgetBytes: retentionBudgetBytes
             ),
             allowsBoundedDegradedStart: liveJoinProfile == .fastZap,
+            startupGraceSeconds: liveStartupGraceSeconds,
+            singleSegmentStartupMinimumSeconds: liveStartupSingleSegmentMinimumSeconds,
             boundedStartFloorsAtHoldback: LiveEdgePolicy.boundedStartFloorArmed,
             firstServeLatchCoversEngineCut: LiveEdgePolicy.firstServeLatchAllArmed,
             blockingReloadOverride: blockingReloadOverride,

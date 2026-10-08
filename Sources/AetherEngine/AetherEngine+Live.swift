@@ -8,8 +8,8 @@ extension AetherEngine {
     ///
     /// Two sessions can answer, and both read a buffer the session already holds rather than opening
     /// a second connection (a live source is forward-only, so a second demuxer could not seek it).
-    /// A native session decodes from its DVR segment cache after converting session time to raw
-    /// output via seam history. A software session has no such cache, so it decodes out of its own
+    /// A native session decodes from its DVR segment cache after converting stable session time to
+    /// raw output. A software session has no such cache, so it decodes out of its own
     /// packet ring (#544), which is the same buffer the scrubber seeks within. nil when neither is
     /// live, when the time is outside the resident window, or when the decode fails.
     public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
@@ -21,10 +21,8 @@ extension AetherEngine {
             // A zap between the request and the frame would hand the new channel the old one's picture.
             return loadGeneration == gen ? image : nil
         }
-        // seekableLiveRange is output-time + seam shift; segment table and tfdt live on raw output. Resolve newest seam (inverts $currentTime fold).
-        let outputSeconds: Double
-        outputSeconds = presentationAxis.itemSeconds(forSourceSeconds: seconds)
-            ?? (seconds - playlistShiftSeconds)
+        // Segment table and tfdt use continuous output time, including across source PTS rebases.
+        let outputSeconds = seconds - liveSessionShiftSeconds
         let gen = loadGeneration
         let source = await Task.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: outputSeconds)
@@ -58,7 +56,9 @@ extension AetherEngine {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self, let host else { return }
                 guard self.isLive else { continue }
-                self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
+                guard !self.liveItemPlacementPending else { continue }
+                self.publishLiveWindow(edgeSessionTime: host.seekableEnd
+                                       + self.liveSessionShiftSeconds + self.liveItemAxisOffsetSeconds)
             }
         }
     }
@@ -115,6 +115,8 @@ extension AetherEngine {
     /// floor plus a margin, or for live-only (no DVR) snap to the edge when far enough behind.
     func clampLiveResumeIfBehindWindow() {
         guard isLive, let w = liveWindow else { return }
+        let scheduledLoadGeneration = loadGeneration
+        let scheduledSeekGeneration = currentSeekGeneration
         let action = Self.liveResumeAction(
             clampsToWindow: loadedOptions.clampsLiveResumeToWindow,
             windowSeconds: w.windowSeconds,
@@ -136,24 +138,34 @@ extension AetherEngine {
                 )
             }
         case .edgeSnap:
-            EngineLog.emit(
-                "[AetherEngine] live resume clamp: behind=\(behind)s window=live-only -> edge snap",
-                category: .session
-            )
-            // The whole distance is skipped, and the resume is at the edge.
-            liveResumeClamped.send(LiveResumeClamp(skippedSeconds: w.behindLiveSeconds,
-                                                   behindLiveSeconds: 0))
-            Task { await self.seekToLiveEdge() }
+            Task {
+                guard loadGeneration == scheduledLoadGeneration,
+                      currentSeekGeneration == scheduledSeekGeneration else { return }
+                EngineLog.emit(
+                    "[AetherEngine] live resume clamp: behind=\(behind)s window=live-only -> edge snap",
+                    category: .session
+                )
+                // The whole distance is skipped, and the resume is at the edge.
+                liveResumeClamped.send(LiveResumeClamp(skippedSeconds: w.behindLiveSeconds,
+                                                       behindLiveSeconds: 0))
+                await self.seekToLiveEdge()
+            }
         case .seek(let t):
-            EngineLog.emit(
-                "[AetherEngine] live resume clamp: behind=\(behind)s window=\(window) "
-                + "-> seek \(String(format: "%.1f", t))",
-                category: .session
-            )
-            liveResumeClamped.send(LiveResumeClamp(
-                skippedSeconds: Swift.max(0, t - (w.edgeTime - w.behindLiveSeconds)),
-                behindLiveSeconds: Swift.max(0, w.edgeTime - t)))
-            Task { await self.seek(to: t) }
+            Task {
+                // An explicit Return to Live (or a newer scrub) owns the clock.
+                // A clamp decided by an earlier play() must not seek it backward.
+                guard loadGeneration == scheduledLoadGeneration,
+                      currentSeekGeneration == scheduledSeekGeneration else { return }
+                EngineLog.emit(
+                    "[AetherEngine] live resume clamp: behind=\(behind)s window=\(window) "
+                    + "-> seek \(String(format: "%.1f", t))",
+                    category: .session
+                )
+                liveResumeClamped.send(LiveResumeClamp(
+                    skippedSeconds: Swift.max(0, t - (w.edgeTime - w.behindLiveSeconds)),
+                    behindLiveSeconds: Swift.max(0, w.edgeTime - t)))
+                await self.seek(to: t)
+            }
         }
     }
 
@@ -161,13 +173,11 @@ extension AetherEngine {
     /// the live surfaces speak. nil on every path with no such cache to ask (software live), which
     /// leaves `seekableLiveRange` on window arithmetic exactly as before.
     ///
-    /// Same axis conversion as `liveScrubThumbnail`, inverted: the segment table and its `startSeconds`
-    /// live on raw output, `seekableLiveRange` is output plus the seam shift.
+    /// Same stable output-to-session conversion as `liveScrubThumbnail`, inverted.
     func residentLiveFloorSessionSeconds() -> Double? {
         guard let session = nativeVideoSession,
               let outputFloor = session.residentFloorOutputSeconds() else { return nil }
-        return presentationAxis.sourceSeconds(forItemSeconds: outputFloor)
-            ?? (outputFloor + playlistShiftSeconds)
+        return outputFloor + liveSessionShiftSeconds
     }
 
     /// AE#446 round 4: measure how far the current item's own timeline sits below the session's.
@@ -245,7 +255,7 @@ extension AetherEngine {
               let producerFloor = residentLiveFloorSessionSeconds() else { return }
         let offset = Self.liveItemAxisOffset(producerFloorSession: producerFloor,
                                              itemSeekableStart: host.seekableStart,
-                                             shift: playlistShiftSeconds)
+                                             shift: liveSessionShiftSeconds)
         guard offset.isFinite else { return }
         liveItemAxisOffsetGeneration = host.itemGeneration
         liveItemAxisOffsetSeconds = offset
@@ -347,7 +357,7 @@ extension AetherEngine {
         }
         let reconstructed = Self.liveItemAxisOffset(producerFloorSession: producerFloor,
                                                     itemSeekableStart: host.seekableStart,
-                                                    shift: playlistShiftSeconds)
+                                                    shift: liveSessionShiftSeconds)
         EngineLog.emit(
             "[AetherEngine] #446 the reconstruction this replaces would have said "
             + "\(String(format: "%.2f", reconstructed))s, \(String(format: "%.2f", reconstructed - stated))s "
@@ -451,7 +461,7 @@ extension AetherEngine {
         EngineLog.emit(
             "[AetherEngine] #446 placement audit: item clock \(String(format: "%.2f", nativeClockSeconds))s "
             + "in item range \(String(format: "%.2f", host.seekableStart))..\(String(format: "%.2f", host.seekableEnd))s, "
-            + "shift \(String(format: "%.2f", playlistShiftSeconds))s + item offset "
+            + "session shift \(String(format: "%.2f", liveSessionShiftSeconds))s + item offset "
             + "\(String(format: "%.2f", liveItemAxisOffsetSeconds))s -> session \(String(format: "%.2f", currentTime))s; "
             + "the producer holds "
             + (producer.map { "\(String(format: "%.2f", $0.lowerBound))..\(String(format: "%.2f", $0.upperBound))s" } ?? "nothing it can state"),
@@ -472,27 +482,70 @@ extension AetherEngine {
         guard let session = nativeVideoSession,
               let floorOutput = session.residentFloorOutputSeconds(),
               let ceilingOutput = session.residentCeilingOutputSeconds() else { return nil }
-        let floor = presentationAxis.sourceSeconds(forItemSeconds: floorOutput)
-            ?? (floorOutput + playlistShiftSeconds)
-        let ceiling = presentationAxis.sourceSeconds(forItemSeconds: ceilingOutput)
-            ?? (ceilingOutput + playlistShiftSeconds)
+        let floor = floorOutput + liveSessionShiftSeconds
+        let ceiling = ceilingOutput + liveSessionShiftSeconds
         guard ceiling >= floor else { return nil }
         return floor...ceiling
     }
 
     /// AE#442: the TARGETDURATION the live playlist is serving, nil on every path that serves none
     /// (remote HLS live, the software live path, and before the first playlist build).
-    var liveTargetDurationSeconds: Double? {
+    public var liveTargetDurationSeconds: Double? {
         nativeVideoSession?.sealedLiveTargetDurationSeconds().map(Double.init)
     }
 
-    /// Publish `liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`, `behindLiveSeconds`. Path-agnostic; no-op when no live window is active.
-    @MainActor
+    /// The current native item's usable live edge on the engine's display timeline.
+    /// Nil before the item has a range and on software routes. Uses the asynchronous
+    /// host mirror rather than AVPlayerItem's synchronous seekableTimeRanges getter.
+    /// If that mirror predates retained history, only already-played resident media is admitted.
+    public var currentItemLiveEdgeTime: Double? {
+        guard isLive, videoRoute != .software, nativeItemSeekableEnd > 0 else { return nil }
+        let edge = nativeItemSeekableEnd + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
+        guard edge.isFinite else { return nil }
+        if loadedOptions.dvrWindowSeconds != nil,
+           let fallback = Self.nativePlayedResidentEdge(reportedEdge: edge, playedTime: currentTime,
+                publishedEdge: liveWindow?.edgeTime ?? currentTime,
+                residentRange: residentLiveRangeSessionSeconds()) {
+            return fallback
+        }
+        return edge
+    }
+
+    /// The same session-axis fallback for publication and an actual native seek. A stale
+    /// item edge cannot disqualify already-played resident history, and a prefetched ceiling
+    /// cannot create history. Preserve the published played frontier across a backward seek.
+    nonisolated static func nativePlayedResidentEdge(
+        reportedEdge: Double, playedTime: Double, publishedEdge: Double,
+        residentRange: ClosedRange<Double>?
+    ) -> Double? {
+        guard let resident = residentRange,
+              resident.lowerBound.isFinite, resident.upperBound.isFinite,
+              reportedEdge.isFinite, reportedEdge <= resident.lowerBound,
+              playedTime.isFinite, publishedEdge.isFinite else { return nil }
+        return min(max(max(playedTime, publishedEdge), resident.lowerBound), resident.upperBound)
+    }
+
+    /// Publish the live timeline after reconciling actual resident history.
     func publishLiveWindow(edgeSessionTime: Double) {
         guard var w = liveWindow else { return }
-        w.noteEdge(edgeSessionTime)
+        var residentFloor = videoRoute == .software ? softwareHost?.dvrResidentFloorSessionSeconds : residentLiveFloorSessionSeconds()
+        // An empty/delayed AVPlayer seekableTimeRanges mirror yields only the item's zero
+        // (plus its axis offset). It must not pin a ready native DVR window at that zero
+        // while its real cache and played clock advance. Admit only already-played,
+        // contiguous resident media; never promote the producer's prefetched frontier.
+        var reportedEdge = edgeSessionTime
+        if videoRoute == .loopback, w.windowSeconds != nil,
+           let floor = residentFloor, floor.isFinite, reportedEdge <= floor,
+           let resident = residentLiveRangeSessionSeconds(),
+           let fallback = Self.nativePlayedResidentEdge(
+                reportedEdge: reportedEdge, playedTime: currentTime,
+                publishedEdge: w.edgeTime, residentRange: resident) {
+            residentFloor = resident.lowerBound
+            reportedEdge = fallback
+        }
+        w.noteEdge(reportedEdge)
         w.notePlayhead(currentTime)
-        w.noteResidentFloor(residentLiveFloorSessionSeconds() ?? softwareHost?.dvrResidentFloorSessionSeconds)
+        w.noteResidentFloor(residentFloor)
         // Sodalite#104 round 4: the cadence the playlist declares, which outranks how the source
         // happened to deliver. nil on the paths that serve no playlist of ours.
         w.noteTargetDuration(liveTargetDurationSeconds)
@@ -574,7 +627,7 @@ extension AetherEngine {
                 "[AetherEngine] #524 the client is running thin: it holds "
                 + "\(String(format: "%.2f", ahead))s of fetched runway, playhead "
                 + "\(String(format: "%.2f", playhead))s against a seekable edge of "
-                + "\(String(format: "%.2f", edge))s (which already carries the holdback)",
+                + "\(String(format: "%.2f", edge))s",
                 category: .session
             )
         }
@@ -651,9 +704,8 @@ extension AetherEngine {
     ///   presenting the old one lands the seek BACKWARD by their difference (reported: 47 s of
     ///   re-watched content, 49.06 s of rebase).
     ///
-    /// So the edge comes from the item being seeked, and the session-to-item conversion is the
-    /// seam-aware one the rest of the engine already uses, which reads the shift that was in force for
-    /// THIS position rather than the newest one the producer has moved to.
+    /// The edge comes from the item being seeked. For loopback live, callers pass its stable
+    /// session axis: source PTS seams cannot invert a timestamp rollback unambiguously.
     nonisolated static func liveSeekLanding(
         requested: Double,
         window: LiveWindow,
@@ -662,11 +714,23 @@ extension AetherEngine {
         axis: PresentationAxisMap,
         origin: SeekOrigin = .host,
         residentRange: ClosedRange<Double>? = nil,
-        itemAxisOffset: Double = 0
+        itemAxisOffset: Double = 0,
+        nativePlayedTime: Double? = nil
     ) -> (sessionTarget: Double, clockTarget: Double) {
         // An item with no seekable range of its own yet has nothing to sample; the window's own edge
         // is then the only edge there is, and clamping against `shift` alone would collapse the range.
-        let edge = itemEnd > 0 ? itemEnd + shift + itemAxisOffset : window.edgeTime
+        let reportedEdge = itemEnd + shift + itemAxisOffset
+        let playedResidentEdge = nativePlayedTime.flatMap {
+            Self.nativePlayedResidentEdge(reportedEdge: reportedEdge, playedTime: $0,
+                                          publishedEdge: window.edgeTime, residentRange: residentRange)
+        }
+        // Positive but stale mirrors need the same fallback as publication. A valid positive
+        // item range still clamps against the item's own edge, preserving rejoin/axis semantics.
+        let edge = playedResidentEdge ?? (itemEnd > 0 ? reportedEdge : window.edgeTime)
+        var landingWindow = window
+        if playedResidentEdge != nil, let resident = residentRange {
+            landingWindow.noteResidentFloor(resident.lowerBound)
+        }
         // AE#446 round 4: a host scrub is bound by what the session ADVERTISES, and the engine's own
         // rejoin by what the producer HOLDS. They are different questions, and at the moment a rejoin
         // runs they have different answers: the advertised range is measured against an edge that is
@@ -677,13 +741,18 @@ extension AetherEngine {
         if origin == .liveRejoin, let resident = residentRange {
             sessionTarget = Swift.min(Swift.max(requested, resident.lowerBound), resident.upperBound)
         } else {
-            sessionTarget = window.clamp(requested, edge: edge)
+            sessionTarget = landingWindow.clamp(requested, edge: edge)
         }
         // AE#446 round 4: and then down onto the item's own axis, which for an item attached after
         // the window slid begins above the session's zero. See `measureLiveItemAxisOffset`.
-        let clockTarget = Swift.max(
+        let mappedClockTarget = Swift.max(
             0, (axis.itemSeconds(forSourceSeconds: sessionTarget) ?? (sessionTarget - shift))
                - itemAxisOffset)
+        // Floating-point axis inversion can put an edge seek a few picoseconds beyond the
+        // item's measured end. Keep host seeks within that end; stale-edge recovery and live
+        // rejoin deliberately use their resident bounds instead.
+        let clockTarget = origin == .host && itemEnd > 0 && playedResidentEdge == nil
+            ? Swift.min(mappedClockTarget, itemEnd) : mappedClockTarget
         return (sessionTarget, clockTarget)
     }
 
@@ -741,16 +810,19 @@ extension AetherEngine {
             requested: sessionTarget,
             window: window,
             itemEnd: host.seekableEnd,
-            shift: playlistShiftSeconds,
-            axis: presentationAxis,
+            shift: liveSessionShiftSeconds,
+            axis: liveSessionSeekAxis,
             origin: .liveRejoin,
             residentRange: residentLiveRangeSessionSeconds(),
             itemAxisOffset: liveItemAxisOffsetSeconds
         ).clockTarget
     }
 
-    /// Seek to the current live edge. No-op when not live.
-    public func seekToLiveEdge() async {
+    /// Seek behind the current live edge by a caller-selected offset, clamped to
+    /// retained media. Zero preserves the default edge-seek behavior. Negative or
+    /// nonfinite offsets are treated as zero; choosing a safety margin belongs to the host.
+    public func seekToLiveEdge(offsetSeconds: Double = 0) async {
+        let offset = offsetSeconds.isFinite ? Swift.max(0, offsetSeconds) : 0
         // Sodalite#104 round 3: both early exits discard a press the viewer made, so both say so, the
         // same way `seek(to:)` logs its refusals. Silence here reads exactly like a press that never
         // arrived.
@@ -759,20 +831,24 @@ extension AetherEngine {
                            category: .engine)
             return
         }
-        // Live-only (no DVR window): seek(to:) refuses; drive native host directly to seekableEnd as the recovery move after eviction.
+        // Live-only (no DVR window): seek(to:) refuses; drive the native host directly.
         guard w.windowSeconds != nil else {
             guard let host = nativeHost else {
                 EngineLog.emit("[AetherEngine] seekToLiveEdge() ignored: live-only session with no native item to snap",
                                category: .engine)
                 return
             }
-            let clockTarget = max(0, host.seekableEnd)
+            let edge = Swift.max(0, host.seekableEnd)
+            let floor = Swift.min(edge, Swift.max(0, host.seekableStart))
+            let clockTarget = Swift.max(floor, edge - offset)
             EngineLog.emit(
-                "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
+                "[AetherEngine] live-only edge seek: target=\(String(format: "%.1f", clockTarget)) "
+                + "edge=\(String(format: "%.1f", host.seekableEnd)) "
+                + "offset=\(String(format: "%.1f", offset))",
                 category: .engine
             )
             let loadGen = loadGeneration
-            let seekGen = currentSeekGeneration
+            let seekGen = advanceSeekGeneration()
             await host.seek(to: clockTarget)
             // Audit CORE-7: the native host survives a native-to-native zap, so this seek can finish
             // against the next channel's item, and a scrub started meanwhile owns the clock too.
@@ -782,10 +858,12 @@ extension AetherEngine {
                 return
             }
             nativeClockSeconds = clockTarget
-            clock.currentTime = clockTarget + playlistShiftSeconds
-            clock.sourceTime = currentTime
+            clock.currentTime = clockTarget + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
             return
         }
-        await seek(to: w.edgeTime)
+        let edge = Swift.min(w.edgeTime, currentItemLiveEdgeTime ?? w.edgeTime)
+        let floor = w.seekableRange(edge: edge)?.lowerBound ?? edge
+        let target = Swift.max(floor, edge - offset)
+        await seek(to: target)
     }
 }

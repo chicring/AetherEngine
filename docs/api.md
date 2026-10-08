@@ -1076,6 +1076,8 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only and `seek` is a no-op. The window is a ceiling: the disk budget (a quarter of the free space, at most 2 GiB) bounds what is actually kept, so a long window on a high-bitrate channel or a small volume holds less than it asks for. With several engines running, each one's quarter is taken from the free space the others have not already claimed, so a tile added on a tight volume holds less history than the first one (AE#687). |
 | `liveJoinProfile` | `.standard` | A `LiveJoinProfile`. `.fastZap` collapses TARGETDURATION to the source GOP plus headroom for one 1.5 x longer (AE#670) so an IPTV join costs seconds instead of a full holdback. |
+| `liveStartupGraceSeconds` | nil | Optional extra grace after eligible finalized media on `.fastZap` loopback live joins. Zero admits immediately once the minimum is ready; nil or invalid values preserve the automatic policy. |
+| `liveStartupSingleSegmentMinimumSeconds` | nil | Optional minimum duration for a single finalized segment to qualify for `.fastZap` admission. Nil, nonpositive or nonfinite values preserve the two-segment minimum. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself (edge snap on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it). `false` hands the whole decision to the host, which then also owns the eviction case. |
 | `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, over a buffer that is non-empty and at least 1.5 s deep, on an item that has reached `readyToPlay` (AE#684). The join tail no host can otherwise reach; default since 6.55.0 on a device A/B, see the live-join section. |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto derives eligibility from observed upstream cadence, which is what keeps a bursty relay off a `-15410` loop. |
@@ -1155,3 +1157,38 @@ Public for the CLI, the test suite, or a diagnostic overlay, and outside the sha
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.
 - **`HLSLiveIngestReader`'s internals** (`terminalError`, `upstreamTargetDuration`, `observedLiveCadenceSeconds`, `closedLiveCadenceSeconds`, `upstreamSegmentDurationSeconds`, `companionAudioReader`): fixture and diagnostic reads. The last two are the closed evidence the served TARGETDURATION is sealed from (AE#447); `upstreamTargetDuration` is the upstream's own claim, reported in the seal line and derived from nowhere.
 - **`SubtitleChannel`**: the primary / secondary selector on the engine's internal subtitle routing. No public signature takes one; a host picks the channel by calling the primary or the secondary method.
+
+### Choosing bounded live startup admission
+
+A long-GOP source cannot finalize a segment until the next keyframe arrives.
+`liveStartupSingleSegmentMinimumSeconds` allows a sufficiently long, complete first
+segment to enter the bounded `.fastZap` path without waiting another entire GOP.
+`liveStartupGraceSeconds` controls the extra grace after that eligibility check.
+It is bounded by the existing manifest deadline. Neither option changes segment
+cuts, `TARGETDURATION`, `HOLD-BACK`, standard joins or remote HLS bypass. Explicit
+holdback floors and cancellation still take precedence. A shallower initial
+playlist can rebuffer if the next segment arrives late; the host chooses this
+latency/resilience tradeoff and validates its sources.
+
+The upstream first-serve latch remains unchanged. The optional real-media script
+`Scripts/test-long-gop-startup.sh` creates paced H.264/AAC MPEG-TS fixtures with
+long GOPs and exercises macOS AVPlayer startup, rewind and continued playback.
+Set `FFMPEG_BIN` to an FFmpeg executable when it is not on PATH.
+
+
+### Continuous live display time and return offsets
+
+Native loopback `clock.currentTime`, seek ranges, item placement and seek targets
+retain the session's initial timeline shift when an origin resets its timestamps.
+`clock.sourceTime` remains the presented frame's source PTS for subtitle cues;
+these clocks can intentionally differ after a reset. Live subtitle backfill uses
+elapsed session time while source-cue pruning follows the source clock.
+
+`seekToLiveEdge(offsetSeconds:)` accepts a caller-selected distance behind the usable
+edge and clamps to retained media. Its default is zero; negative/nonfinite offsets
+are treated as zero. `liveTargetDurationSeconds` exposes the measured served HLS
+target duration, and `currentItemLiveEdgeTime` exposes the native item's usable
+edge on the display axis. Both are optional when unavailable. Choosing a safety
+margin remains the host's responsibility. An old item-range mirror may admit only
+already-played contiguous resident history, never a prefetched future frontier.
+A delayed resume clamp cannot override a newer seek or load.
