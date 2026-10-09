@@ -34,6 +34,16 @@ the public-API contract.
   the master on an SDR source the way a language does. AVFoundation lists it as one option named
   "Unknown" where it built no audible group before. An untagged track that is not object audio is
   unchanged. The AE#458 audible readback line reports such a session as `served=untagged`. (AE#726)
+- **A Blu-ray style Atmos track is described as Atmos in the init segment.** For a Dolby Digital
+  Plus track whose height channels and objects live in a dependent substream (an AC-3 core followed
+  by an E-AC-3 dependent frame), FFmpeg's mp4 muxer wrote a `dec3` box that described a bare 5.1
+  bed: `chan_loc` 0 and no ETSI TS 103 420 JOC extension, so tvOS decoded the core and an Atmos
+  receiver reported multichannel PCM. Fixed in the muxer itself through FFmpegBuild 3.7.0, which
+  backports upstream `f10fdd6310` for `chan_loc` and keeps `complexity_index_type_a` from the
+  dependent substream; the box for the reported source goes from `14 00 0C 0F 02 00` to
+  `14 00 0C 0F 02 40 01 10`. A track whose objects sit in the independent substream is unchanged.
+  `docs/formats.md` no longer claims AVPlayer recognises JOC from `numDepSub` / `depChanLoc`.
+  (AE#728, diagnosis and measurements by @kdorepos in PR #729.)
 
 ### Tests and CI
 
