@@ -12,6 +12,20 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.33.2] - 2026-10-09
+
+### Fixed
+
+- **A speed set while paused no longer starts playback.** `setRate(_:)` with a non-zero rate went
+  straight to the transport host, and on the native paths that is `avPlayer.rate = x`, which plays.
+  `state` was never touched, so the engine kept reporting `.paused` over a running picture and a
+  host's play/pause button offered the wrong action. While the session is paused the rate now only
+  becomes the rate the next `play()` starts at (`desiredRate` plus the host's resume rate, the #436
+  machinery), and the session stays paused. Measured in AetherPlayer on the native route: before,
+  two frames 1.5 s apart differed after a speed step on a paused session; after, the transport log
+  shows no rate write until the resume, which comes back at the new speed. A host that relied on
+  `setRate` to resume has to call `play()`. (#730)
+
 ## [7.33.1] - 2026-10-09
 
 ### Fixed
