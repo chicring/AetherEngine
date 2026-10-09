@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.33.0] - 2026-10-09
+
 ### Fixed
 
 - **A stream-copied Dolby Atmos track is declared as object audio in the master playlist.** The
