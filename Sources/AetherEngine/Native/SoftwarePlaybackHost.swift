@@ -350,7 +350,7 @@ final class SoftwarePlaybackHost {
     /// It reads the SOURCE axis, the same axis as `SoftwareVideoFrameTime.presentation` and as the
     /// subtitle cues, so an overlay paced against it needs no conversion.
     var presentationTimebase: CMTimebase? {
-        audioOutput?.synchronizer.timebase
+        audioOutput?.sourceTimebase
     }
 
     /// #311: forwarded to the renderer, which is where a frame is actually handed over. Set through
@@ -1051,7 +1051,9 @@ final class SoftwarePlaybackHost {
         self.splitDisplaySetSubtitleStreamIndices = dem.splitDisplaySetSubtitleStreamIndices()
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
-        self.audioOutput = AudioOutput()
+        let audioOutput = AudioOutput()
+        self.audioOutput = audioOutput
+        renderer.setTimeline(audioOutput.timeline)   // AE#395
         self.audioOutput?.volume = volume
         self.audioOutput?.setPresentationOffset(seconds: audioDelaySeconds)   // AE#464
         // AE#395: the route this session plays into, the counterpart of the native host's line. Without
