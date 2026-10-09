@@ -12,6 +12,22 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.33.1] - 2026-10-09
+
+### Fixed
+
+- **A software session no longer goes silent on an AirPlay receiver past 44739 s of source clock.**
+  The software host stamped its audio and video buffers, and anchored its synchronizer, on the source
+  PTS, and a live channel carries a broadcast clock there. A Belkin AirPlay 2 receiver fed from tvOS
+  27.0 played nothing once those stamps passed 2^31 samples of 48 kHz: the same capture offset to
+  start at 0 and 40002 s played, at 50002 s and its original 59670 s it was silent, with the renderer
+  rendering and the clock at 1.00 throughout. `RendererTimeline` now latches an origin at the
+  session's first stamp and moves only what the renderers and the synchronizer see; the clock the
+  host reads, the playhead, subtitles, frame times and `softwarePresentationTimebase` stay on the
+  source axis. A source that starts within three hours of zero keeps origin 0 and the stamps it had.
+  A later one starts its renderers at 10800 s, which leaves about 9.4 hours of forward play and three
+  hours of seeking back before the stamps leave the safe range. (#395)
+
 ## [7.33.0] - 2026-10-09
 
 ### Fixed
