@@ -102,8 +102,8 @@ final class AudioPlaybackHost {
     /// True between pause() and next play() so play() resumes the synchronizer rate (mirrors SoftwarePlaybackHost.pausedByHost).
     private var pausedByHost: Bool = false
 
-    /// AE#374 parity: end of media parks the clock exactly once (mirrors SoftwarePlaybackHost.didParkClockAtEnd).
-    /// Cleared by seek(), which is the rewind path `AetherEngine.play()` takes at the end.
+    /// #694: latched when end of media parks the clock (AE#374 on this host). Keeps `play()` from
+    /// restarting a clock the source stopped; a seek clears it.
     private var didParkClockAtEnd = false
 
     /// Shared clock-armed latch (mirrors SoftwarePlaybackHost._clockArmed): demux loop arms once on first decoded
@@ -215,8 +215,7 @@ final class AudioPlaybackHost {
             hostPaused: pausedByHost,
             clockArmed: clockArmed && demuxLoopStarted,
             synchronizerRate: audioOutput?.rate ?? 0,
-            // This host has no rebuffer that stops the clock; the end-of-media
-            // park is the source running out, which play() answers with a rewind.
+            // This host has no rebuffer that stops the clock.
             rebuffering: false,
             parkedAtEndOfMedia: didParkClockAtEnd
         ) {
@@ -283,10 +282,11 @@ final class AudioPlaybackHost {
             return
         }
         lastRate = newRate
-        // A paused transport takes only the remembered speed: writing the synchronizer rate
-        // restarts the clock while isPlaying stays false — the session keeps reporting paused
-        // while audio plays behind its back. `clockArmed` keeps the write off a synchronizer that
-        // has not anchored yet (#107); the arm-time correction applies lastRate when it does.
+        // `clockArmed` keeps the write off a synchronizer that has not anchored yet (#107); the
+        // arm-time correction applies lastRate when it does. `isPlaying` keeps a non-zero rate off
+        // a paused session: this host publishes no transport status back to the engine, so the
+        // engine's #730 paused gate cannot see a host-side pause — writing the rate here would
+        // restart the clock while isPlaying still says paused.
         if clockArmed && isPlaying {
             audioOutput?.setRate(newRate)
         }
@@ -310,7 +310,7 @@ final class AudioPlaybackHost {
         // and it invalidates in-flight packets from the moment the seek starts rather than after it.
         bumpSeekGeneration()
         let generation = seekGeneration
-        // The seek is the rewind path out of the end-of-media park (#374 parity); a reposition
+        // The seek is the rewind path out of the end-of-media park; a reposition
         // re-anchors the clock below, so both latches retire here (mirrors SoftwarePlaybackHost).
         didReachEnd = false
         didParkClockAtEnd = false
@@ -420,20 +420,10 @@ final class AudioPlaybackHost {
                 self?.failure = PlaybackErrorInfo(kind: .audioSessionFailed, message: msg)
             }
         }
-        // The loop calls this with the generation it just verified, like SoftwarePlaybackHost's
-        // onEndForGeneration: the Task re-checks because a seek can land between that verification
-        // and this task running, and a stale EOF must not re-park a freshly positioned clock.
-        let onEnd: @Sendable (UInt64) -> Void = { [weak self] generation in
+        let onEnd: @Sendable (UInt64, Double) -> Void = { [weak self] generation, lastEnqueuedEnd in
             Task { @MainActor [weak self] in
                 guard let self, self.seekGeneration == generation, !self.stopRequested else { return }
-                // AE#374 parity (SoftwarePlaybackHost.parkClockAtEndOfMedia): park the master
-                // clock on the last sample. The synchronizer otherwise keeps its rate and
-                // `currentTime` walks past `duration` without bound. No tail deferral here:
-                // this closure already fires after the drain wait, so the queued media is
-                // played out. pausedByHost stays clear -- the viewer did not pause this.
-                self.didParkClockAtEnd = true
-                self.audioOutput?.pause()
-                self.rate = 0
+                self.parkClockAtEndOfMedia(lastEnqueuedEnd: lastEnqueuedEnd)
                 self.didReachEnd = true
                 self.isPlaying = false
             }
@@ -477,7 +467,7 @@ final class AudioPlaybackHost {
         onClockAnchored: @Sendable (Double) -> Void,
         seekGeneration: @Sendable () -> UInt64,
         onError: @Sendable (String) -> Void,
-        onEnd: @Sendable (UInt64) -> Void
+        onEnd: @Sendable (UInt64, Double) -> Void
     ) {
         // Clock-armed latch is SHARED with the host: anchor the clock exactly once on the first decoded packet.
         // seekClock is NOT idempotent (re-sets rate+time), so per-packet calls would snap the clock back ~47x/sec
@@ -582,7 +572,7 @@ final class AudioPlaybackHost {
                 }
                 if seekedAway { return true }
                 if seekGeneration() != seenSeekGeneration { return true }
-                onEnd(seenSeekGeneration)
+                onEnd(seenSeekGeneration, lastEnqueuedEnd)
                 return false
             }
 
@@ -647,6 +637,39 @@ final class AudioPlaybackHost {
             }
             if !keepGoing { break }
         }
+    }
+
+    /// #694: stop the master clock on the last sample instead of letting it free-run past the end
+    /// (AE#374 on the software host). The playthrough wait in the demux loop releases up to 0.25 s
+    /// before the last enqueued sample, so the park is deferred by what is still queued: parking stops
+    /// the renderer too and an immediate park would cut that tail. Either way the clock stops on the
+    /// last sample, not where it stands when the park runs.
+    private func parkClockAtEndOfMedia(lastEnqueuedEnd: Double) {
+        guard !didParkClockAtEnd else { return }
+        didParkClockAtEnd = true
+        guard clockArmed, let aOut = audioOutput else { return }
+        let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(
+            clockSeconds: aOut.currentTimeSeconds,
+            lastAudioPts: lastEnqueuedEnd
+        )
+        guard tail > 0 else { return parkClockNow(notAfter: lastEnqueuedEnd) }
+        let generation = seekGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
+            guard let self, self.seekGeneration == generation, self.didParkClockAtEnd else { return }
+            self.parkClockNow(notAfter: lastEnqueuedEnd)
+        }
+    }
+
+    private func parkClockNow(notAfter latest: Double) {
+        guard !stopRequested, let aOut = audioOutput else { return }
+        aOut.pause(notAfter: latest)
+        rate = 0
+        EngineLog.emit(
+            "[AudioHost] end of media: clock parked at "
+            + "\(String(format: "%.3f", aOut.currentTimeSeconds))s",
+            category: .swPlayback
+        )
     }
 
     // MARK: - Time updates

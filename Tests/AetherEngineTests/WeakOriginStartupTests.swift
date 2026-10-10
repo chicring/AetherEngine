@@ -161,29 +161,38 @@ struct WeakOriginStartupTests {
 
     // MARK: - T2: blackholes put the reader-level clock past connStallTimeout
 
-    /// H2. The first 5 requests are blackholes (~5.2 s each = ~26 s of reader silence); from
-    /// request 6 on the origin answers with a healthy 3 s TTFB. A per-generation clock would
-    /// give each recovery attempt its full 5.2 s; the reader-level `secondsSinceNetworkDelivery()`
-    /// is already past `connStallTimeout`, so the stall branch retires each new generation at the
-    /// first ~1 s poll — inside its own 3 s TTFB.
+    /// H2. The first DATA request is blackholed, then ~5 refill requests are blackholed (~5.2 s
+    /// each ≈ 26 s of read-loop silence); the origin recovers with a healthy 3 s TTFB. Upstream
+    /// 7.32+ times the open's first byte out on `SourceOpenPolicy.firstByteTimeout`, not the stall
+    /// watchdog — a tight open budget here pushes the reader into the read loop fast so the
+    /// silence under test is the READ phase's, not the open's.
     @Test("T2 staleReaderGap: recovery after a silent stretch", .timeLimit(.minutes(3)))
     func staleReaderGap() async throws {
         let tap = LogTap()
         defer { tap.restore() }
+        let firstDataRequest = Box(true)
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize, throttleUs: 0,
             firstByteDelayUs: { _ in 3_000_000 },
-            respond: { idx, _, _ in idx < 5 ? .blackhole : .serve206 })
+            respondEx: { idx, _, _, _, isSuffix in
+                if isSuffix { return nil }
+                // Request 1: healthy open (3 s TTFB). Requests 2-6: blackholed refills.
+                if firstDataRequest.claimOnce() { return .serve206 }
+                return idx <= 6 ? .blackhole : .serve206
+            })
         let server = try #require(serverMaybe)
         defer { server.stop() }
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
-                                label: "weaknet")
+                                label: "weaknet",
+                                sourceOpenPolicy: .init(firstByteTimeout: 6, sizeProbeTimeout: 8))
         defer { reader.markClosed(); reader.close() }
 
         let t0 = Date()
         var opened = true
         do { try reader.open() } catch { opened = false }
-        let got = opened ? Self.read(reader, bytes: Self.oneMB, deadline: 60) : 0
+        // The read loop's witness-delay cutoff (~5.2 s per silent generation) bounds each of the
+        // 5 blackholed refills; 90 s covers the worst case with margin.
+        let got = opened ? Self.read(reader, bytes: Self.oneMB, deadline: 90) : 0
         let elapsed = Date().timeIntervalSince(t0)
         let requests = server.requestLog.count
 
@@ -231,7 +240,11 @@ struct WeakOriginStartupTests {
         print("WEAKNET T3 elapsed=\(String(format: "%.1f", elapsed)) requests=\(requests) "
               + "outcome=\(got >= Self.oneMB ? "ok" : "fail")")
         #expect(got == Self.oneMB, "read \(got / 1024)KB of 1MB in \(elapsed)s, \(requests) requests")
-        #expect(elapsed <= 7, "the blackhole-then-healthy read took \(elapsed)s")
+        // Upstream 7.32+ judges an open's first byte by SourceOpenPolicy.firstByteTimeout (15 s
+        // default), not the stall watchdog — the blackholed connection holds the whole open budget
+        // before the retry fires. The witness-delay cutoff only applies after the connection has
+        // entered the read loop.
+        #expect(elapsed <= 20, "the blackhole-then-healthy read took \(elapsed)s")
     }
 
     // MARK: - T2b: mid-stream silence ages the reader clock past connStallTimeout

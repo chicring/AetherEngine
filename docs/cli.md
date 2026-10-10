@@ -33,13 +33,13 @@ Twenty-one subcommands plus the bare-URL `serve` alias.
 
 Opens the demuxer, prints the codec / resolution / frame rate of the video track, the audio track list (codec, channels, language, Atmos flag), the subtitle track list, the parsed container metadata (`MediaMetadata`: title / artist / album / albumArtist + embedded cover art presence), then exits. No HLS server is started.
 
-`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent".
+`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent". `--detect-hdr-vivid` adds the HDR Vivid (CUVA) check to the same packet pass and prints `HDR Vivid: CUVA metadata seen`; `format:` stays `hlg` / `hdr10`, since Vivid rides that base (#699).
 
 ```bash
 swift run aetherctl probe --detect-hdr10plus /path/to/hdr10plus.mkv
 ```
 
-`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one.
+`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one. With `--vivid` it builds an HEVC/HLG fixture carrying a CUVA HDR Vivid SEI instead, verified the same way against ffprobe's `CUVA` side data (the fixture in `HDRVividProbeTests`).
 
 ## serve
 
@@ -286,6 +286,12 @@ point is that there is no second ask to refuse. Two shapes are worth running del
 they are the two the flag has to survive: a long uninterrupted read, and a PAUSE, which must end the
 connection after five seconds and cost exactly one re-request at the frontier when playback resumes.
 
+`--progressive-segments` sets `LoadOptions.progressiveSegmentDelivery`: each VOD segment is served
+while it is written. Run it against a throttled origin and compare the `FIRSTFRAME` and first
+`PHASE playing` times with and without the flag; the session log shows `serving while it is written`
+for every segment that went out that way. On a local or fast source the segments are cut before
+AVPlayer asks and the two runs look the same.
+
 `--max-concurrent-requests N` sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most requests the reader may have open against the origin at once, across every path it fetches on. `1` also switches off the speculative parallel paths, which is the shape of a connection-metered CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with and without the flag.
 
 `--assert-dv` sets `LoadOptions.panelPresentsDolbyVision` (AE#493), the host's assertion that its display presents Dolby Vision. macOS has no per-mode display capability API, so a Mac run plays a Dolby Vision source as its HDR10 base layer (`effective-format=hdr10`) until the host says otherwise; the flag moves that label and the tvOS criteria request. It does not change the packaging of a Profile 5 / 8.1 / 8.4 source (those carry their `dvcC` and `SUPPLEMENTAL-CODECS` on every display since 6.72.0 / 6.73.0), while Profile 7 and AV1 Dolby Vision are still gated on it. A wrong claim costs one in-place media-playlist fallback, not the item.
@@ -416,6 +422,17 @@ paragraph read it as an improvement from 0.0230 and 0.0411 to 0.0162, which is t
 round 11 documents on both sides of that thread.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
+
+A run with `--start-position` and nothing else that repositions (no `--seek-every`, no host calls besides `play`, no audio switch) is also judged on where the resume LANDS: a clock that reads more than a second behind the anchor in the first three ticks exits 2 with `VERDICT: resume clock fell behind its anchor`. That is AE#724, and the plain clock-advances check could not see it, because the session it broke kept advancing, only from the wrong place. A resume on a long-GOP source repositions to the keyframe before its target, so its first decoded audio sample arrives up to a GOP early, and the software host used to move its clock back onto that sample. Ten-second GOPs reproduce it, two-second ones never do:
+
+```bash
+ffmpeg -f lavfi -i testsrc2=size=320x180:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -t 30 -c:v libx264 -preset ultrafast -g 240 -keyint_min 240 -sc_threshold 0 -c:a aac gop240.mp4
+aetherctl play --sw --start-position 17.3 --seconds 5 file://$PWD/gop240.mp4
+aetherctl play --sw --paused --host-calls play --start-position 17.3 --seconds 5 file://$PWD/gop240.mp4
+```
+
+Before the fix both read `clock re-anchored to first sample: anchor=9.984s (load anchor 17.300s ...)` and `cur=10.8` at the first tick; after it `cur=18.2` and no re-anchor. `--paused` alone (no `play`) is not judged, but its ticks are the observable for the second half of the same report: a paused resume read `cur=0.00` until play, because the host published its still unarmed synchronizer over the anchor, and now reads `cur=17.30`.
 
 `--malloc-census` turns on the large-allocation census (`AetherEngine.setLargeAllocationCensusEnabled`) for the run, for tracing a footprint that grows where the segment budget says it should not. Besides the 30 s sample it arms a jump trigger, which exists because the 30 s memprobe cannot catch a failure that completes inside one sample (every kill on #220 was that shape): a counter polled at `--census-hz N` runs the zone walk once it climbs `--census-threshold-mb N` above its running high-water. Both flags are inert without `--malloc-census`.
 
@@ -781,9 +798,9 @@ No run stalled in either arm. The extra segment on 6,4 is the short one, and the
 
 **Whether a join is spent is a fact, not arithmetic.** The seal may only be taken short once the join has nothing more to give, and "cut content plus one segment reaches the summed EXTINF" is not that fact: `--dur 6.3` over 6 s of media never adds up, and a first version built on the sum sealed the full value there and took the bounded start (2.23 s to first picture against 0.20 s). The reader states it instead: the whole join batch is committed, its FIFO is empty, and the cutter is parked waiting for the next delivery. Three runs per arm on each inflated shape with three segments listed: served at once in all six (0.000 to 0.034 s of hold), TD 5 on 6 s media and TD 9 on 10 s. Two more shapes belong to the same fact. A demuxed audio rendition (run the origin twice, video-only and audio-only segments behind a master) makes the cutter park on the AUDIO reader when the audio ends a little before the video, so the fact is stated for the cutter and not for the video reader: both join batches committed and either reader dry. Read off the video reader alone it never became true, 2.2 s to first picture under `.fastZap` and 10.4 s under `.standard`; now 0.18 to 0.21 s in all six cells (6 s and 10 s `.fastZap`, 10 s `.standard`, audio aligned and 0.2 s short, three runs each), as on 7.25.1. And a join slower than the `.fastZap` grace (`play --max-concurrent-requests 1` behind `--rate-kbps 4000`) is served by the bounded start before it is spent, seals the full 6 or 10 over a window under its holdback and draws a `-16832` warning at the start: first picture 5.05 to 6.08 s against 7.05 to 8.26 s on 7.25.1, which still pays the second grace there, and no `-12888` against 1 to 3.
 
-**The gate held the second playlist request too.** AVPlayer opens with two `/media.m3u8` requests, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace (`GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s). On an ingest the gate now opens for good once a manifest has gone out. On a source the engine cuts itself it does not: that second grace is the "+2.07 s at the picture" of the AE#594 table above, and removing it there also leaves the session up to 2 s closer to the producing edge, which is that issue's open question. The raw-TS control (`live --fast-zap --realtime --preroll 0`, two seeds, two runs per arm) reads the same in both arms: first manifest at 3.84 to 3.96 s, `init.mp4` at 6.11 to 6.33 s, first picture at 6.20 to 6.58 s, playhead 6.3 to 6.8 s behind the wall clock. The AE#594 table stands as printed.
+**The gate held the second playlist request too.** AVPlayer opens with two `/media.m3u8` requests, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace (`GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s). On an ingest the gate now opens for good once a manifest has gone out. On a source the engine cuts itself it did not until 7.28.2 (next paragraph): that second grace is the "+2.07 s at the picture" of the AE#594 table above, and removing it there also leaves the session up to 2 s closer to the producing edge, which is that issue's open question. The raw-TS control (`live --fast-zap --realtime --preroll 0`, two seeds, two runs per arm) reads the same in both arms: first manifest at 3.84 to 3.96 s, `init.mp4` at 6.11 to 6.33 s, first picture at 6.20 to 6.58 s, playhead 6.3 to 6.8 s behind the wall clock. The AE#594 table stands as printed.
 
-**AE#686 measures that second grace behind an arm.** `AETHER_FIRST_SERVE_LATCH_ALL=1` applies the same latch to a source the engine cuts itself. It is a measurement arm like `AETHER_BOUNDED_START_FLOOR`, read once per process and off by default, because what it may cost (a session closer to the producing edge for its whole life) needs a device that seeks to edge-minus-holdback, which this harness does not. Both arms now print how long AVPlayer's second plain request waited, once per session:
+**AE#686 applies the same latch to a source the engine cuts itself, by default since 7.28.2.** It started as a measurement arm (`AETHER_FIRST_SERVE_LATCH_ALL=1`, 7.26.3), because what it may cost (a session closer to the producing edge for its whole life) needs a device that seeks to edge-minus-holdback, which this harness does not. The reporter's Apple TV A/B answered that: on 1080p59.94 raw TS with 1.001 s segments, every bounded start reached its picture 1.003 to 1.039 s sooner with the latch, the session sat 0.5 to 1.5 s nearer the edge after 60 s, and 18 latched launches logged no stall, `-16832` or `-12888`. A rebuild from a backlog served a full cushion in both arms, so the latch had nothing to skip there. `AETHER_FIRST_SERVE_LATCH_ALL=0` restores the old gate, read once per process. Both arms print how long AVPlayer's second plain request waited, once per session:
 
 ```
 [HLSVideoEngine] repeat live manifest request held 2.003s, fastZap bounded start after 2.000s grace
@@ -799,7 +816,7 @@ No run stalled in either arm. The extra segment on 6,4 is the short one, and the
 | 1080p59.94, 1 s GOP | off | 1.22 to 1.23 s, 3 segments | 1.011 s | 2.43 s | 3.2 s | 38.30 to 38.40 s | 0 |
 | 1080p59.94, 1 s GOP | on | 1.24 s, 3 segments | 0.000 s | 1.41 to 1.44 s | 1.1 s | 39.19 to 39.30 s | 0 |
 
-The arm removes exactly the grace, and the session ends that much closer to the edge. Whether that costs a stall is the device half.
+The latch removes exactly the grace, and the session ends that much closer to the edge; on the device that cost no stall.
 
 The full matrix (6 s and 10 s segments, 3, 4 and 8 listed, both profiles, three runs per arm) is in `api.md` under the live join; `.standard` drops `--fast-zap` from the `play` line.
 

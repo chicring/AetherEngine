@@ -72,6 +72,10 @@ final class MP4SegmentMuxer {
         /// has numOfArrays=0 (in-band parameter sets) and the engine rebuilt a proper hvcC with
         /// VPS/SPS/PPS arrays; the mp4 muxer writes extradata directly into the hvcC/avcC box.
         let extradataOverride: [UInt8]?
+        /// The video samples are Annex B while `extradataOverride` is a length-prefixed record: the
+        /// muxer converts each sample itself and keeps its in-band parameter sets, which movenc's own
+        /// `hvc1` conversion would drop. See `AnnexBSampleConverter`.
+        let convertsAnnexBSamples: Bool
         /// The session's framing verdict for this track (audit BIT-104); nil gives the muxer its own.
         let nalFramingLatch: NALFramingLatch?
 
@@ -82,6 +86,7 @@ final class MP4SegmentMuxer {
             doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
+            convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
@@ -90,6 +95,7 @@ final class MP4SegmentMuxer {
             self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
+            self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
         }
     }
@@ -146,6 +152,9 @@ final class MP4SegmentMuxer {
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
     private var currentStagingPath: URL
+    /// The current segment's staging file. Only appended to, then renamed as it stands on adoption,
+    /// which is what lets progressive delivery read it while it is written.
+    var stagingURL: URL { currentStagingPath }
     private var fd: Int32 = -1
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var pb: UnsafeMutablePointer<AVIOContext>?
@@ -171,6 +180,8 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    /// Latched from `VideoConfig.convertsAnnexBSamples`.
+    private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
     /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
     /// be measured against. Read once from the environment, never set in a shipped configuration.
@@ -243,11 +254,6 @@ final class MP4SegmentMuxer {
     /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
     private var fragmentWindowFirstVideoDts: Int64 = Int64.min
 
-    /// progressive VOD serve: publishes each flushed fragment boundary so the server can stream the
-    /// staging file while this muxer is still writing it. nil = legacy behaviour (live, or the
-    /// feature switched off); nothing is published then.
-    private let progressiveBoard: ProgressiveSegmentBoard?
-
     /// AE#684: the sound handed to the segment being cut, first and last packet, in
     /// `muxerAudioTimeBase`. A segment opens on a video keyframe and carries whatever audio the
     /// source interleaved up to there, so where its sound begins against its picture is a property
@@ -280,17 +286,17 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
-        progressiveBoard: ProgressiveSegmentBoard? = nil,
+        onStorageExhausted: (@Sendable () -> Void)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
         self.audioDelaySeconds = audioDelaySeconds
-        self.progressiveBoard = progressiveBoard
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
+        self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -313,20 +319,19 @@ final class MP4SegmentMuxer {
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
         self.currentStagingPath = firstPath
-        let firstFd = try Self.openPosix(path: firstPath)
+        let firstFd: Int32
+        do {
+            firstFd = try Self.openPosix(path: firstPath)
+        } catch {
+            if Self.isOutOfSpace(error) { onStorageExhausted?() }
+            throw error
+        }
         self.fd = firstFd
-
-        // progressive VOD serve: register the staging file at 0 bytes immediately. iOS AVPlayer
-        // asks for init.mp4 and the first media segment in PARALLEL at startup/resume, before the
-        // first keep-packet would ever trigger a flush; a 0-byte entry is invisible to readers
-        // (they only act on committed > 0) but lets a request for this segment park on the board
-        // instead of falling into the whole-segment blocking serve. Init failures below run deinit,
-        // which abandons the entry.
-        progressiveBoard?.commit(index: initialSegmentIndex, path: firstPath, bytes: 0)
 
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
         self.splitter = FragmentSplitter(
@@ -347,6 +352,7 @@ final class MP4SegmentMuxer {
                     if n < 0 {
                         let err = errno
                         if err == EINTR { continue }
+                        if err == ENOSPC { counter.onStorageExhausted?() }
                         counter.writeFailed = true
                         return
                     }
@@ -365,6 +371,9 @@ final class MP4SegmentMuxer {
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "segment.m4s")
         guard allocRet == 0, let ctx = ctxOut else {
             close(firstFd)
+            // deinit runs for a throwing init once every stored property is set, and would close
+            // this number a second time, by then possibly another socket's or file's.
+            self.fd = -1
             try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.allocFailed(code: allocRet)
         }
@@ -375,6 +384,7 @@ final class MP4SegmentMuxer {
             avformat_free_context(ctx)
             self.formatContext = nil
             close(firstFd)
+            self.fd = -1
             try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.avioAllocFailed
         }
@@ -648,6 +658,12 @@ final class MP4SegmentMuxer {
 
         let streamIndex = packet.pointee.stream_index
 
+        // Before the AE#561 sanitizer, which walks the sample as the length-prefixed chain the
+        // record declares. A packet with no start code is written as it came.
+        if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
+        }
+
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
         // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a
         // moof+mdat into the current staging file before the buffered span grows without bound. Tracked
@@ -754,20 +770,6 @@ final class MP4SegmentMuxer {
         if !moovFlushed {
             moovFlushed = true
             _ = av_write_frame(ctx, nil)
-        }
-        // progressive VOD serve: publish the fragment boundary just emitted. avio_flush first so the
-        // tail of the AVIO buffer has passed through FragmentSplitter onto the fd; committed bytes
-        // must be a whole number of boxes on disk. Never publish while moov is unflushed: AE#222's
-        // prime can still ftruncate the staging file, so earlier bytes are not stable.
-        if moovFlushed, let pb {
-            avio_flush(pb)
-            if byteCounter.writeFailed {
-                progressiveBoard?.abandon(index: currentSegmentIndex, path: currentStagingPath)
-            } else {
-                progressiveBoard?.commit(index: currentSegmentIndex,
-                                         path: currentStagingPath,
-                                         bytes: byteCounter.bytesWrittenCurrentSegment)
-            }
         }
     }
 
@@ -904,8 +906,6 @@ final class MP4SegmentMuxer {
         byteCounter.bytesWrittenCurrentSegment = 0
 
         if completedFailed || completedBytes == 0 {
-            // progressive VOD serve: this staging file is gone; any parked serve must fall back.
-            progressiveBoard?.abandon(index: currentSegmentIndex, path: completedPath)
             try? FileManager.default.removeItem(at: completedPath)
             return .failed
         }
@@ -919,11 +919,8 @@ final class MP4SegmentMuxer {
             self.currentStagingPath = nextPath
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
-            // progressive VOD serve: register the fresh staging file at 0 bytes (moov is already
-            // flushed by now) so a request for the next segment takes the progressive path
-            // immediately instead of blocking on the full segment.
-            progressiveBoard?.commit(index: nextIdx, path: nextPath, bytes: 0)
         } catch {
+            if Self.isOutOfSpace(error) { byteCounter.onStorageExhausted?() }
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
             EngineLog.emit(
                 "[MP4SegmentMuxer] open next staging file seg-\(nextIdx) FAILED: \(error)",
@@ -947,7 +944,6 @@ final class MP4SegmentMuxer {
         guard let ctx = formatContext, headerWritten,
               !(audioNeedsParsedPacketForMoov && !audioPacketWritten && !moovFlushed) else {
             if fd >= 0 { close(fd); fd = -1 }
-            progressiveBoard?.abandon(index: currentSegmentIndex, path: currentStagingPath)
             try? FileManager.default.removeItem(at: currentStagingPath)
             return nil
         }
@@ -966,7 +962,6 @@ final class MP4SegmentMuxer {
         }
 
         if finalFailed || finalBytes == 0 {
-            progressiveBoard?.abandon(index: currentSegmentIndex, path: finalPath)
             try? FileManager.default.removeItem(at: finalPath)
             return nil
         }
@@ -1002,6 +997,11 @@ final class MP4SegmentMuxer {
         return fd
     }
 
+    private static func isOutOfSpace(_ error: Error) -> Bool {
+        if case MuxerError.openStagingFileFailed(let code) = error { return code == ENOSPC }
+        return false
+    }
+
     // MARK: - Internal cleanup
 
     /// avio_context_free does NOT free pb->buffer (separate av_malloc alloc); drop it explicitly first.
@@ -1029,9 +1029,6 @@ final class MP4SegmentMuxer {
         if fd >= 0 {
             close(fd)
         }
-        // progressive VOD serve: a muxer torn down without a successful adopt leaves its staging
-        // file unpublished; terminal entries already set (completed) are not overwritten.
-        progressiveBoard?.abandon(index: currentSegmentIndex, path: currentStagingPath)
         cleanup()
     }
 
@@ -1251,6 +1248,8 @@ private final class ByteCounter {
     var fd: Int32 = -1
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
+    /// Reports a staging write that hit a full volume to the session's cache.
+    var onStorageExhausted: (@Sendable () -> Void)?
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

@@ -88,6 +88,9 @@ struct SeekReanchorLeadTests {
                                     declaredDurationSeconds: sequential ? 80 : nil)
         engine.segmentPlan = segments(20)
         engine.provider = makeProvider(cache: cache, initialRestartIndex: 0)
+        // The re-anchor lead only fires on a seekable source; a session built without start()
+        // defaults to non-seekable, which the isSourceSeekable guard would reject.
+        engine.markSourceSeekableForTesting(true)
         return engine
     }
 

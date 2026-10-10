@@ -20,7 +20,7 @@ struct CancellableLoadTests {
         private var arrivals = 0
         private var releasedByEngine = false
 
-        init(fallback: TimeInterval = 60) { self.fallback = fallback }
+        init(fallback: TimeInterval = 120) { self.fallback = fallback }
 
         var entered: Bool { condition.withLock { arrivals > 0 } }
         var wasReleasedByEngine: Bool { condition.withLock { releasedByEngine } }
@@ -62,14 +62,20 @@ struct CancellableLoadTests {
         return (task, box)
     }
 
-    /// Cancels after the load has been held a moment, and reports whether it ended within `budget`.
-    private static func cancelAndTime(_ task: Task<Void, Never>, _ box: OutcomeBox,
-                                      budget: Duration = .milliseconds(1500)) async throws -> Duration {
+    /// How long a cancelled load may take to end. What it guards is the wait it replaced: a silent
+    /// origin is only given up on by a timeout, the shortest at open being the 5 s HEAD probe and
+    /// the ingest's 10 s request timeout, so any ceiling below 5 s tells "the cancel ended it" from
+    /// "a timeout ended it". 1.5 s was a guess at the quiet-machine time and a loaded runner took 2 s.
+    static let ceiling: Duration = .seconds(4)
+
+    /// Cancels after the load has been held a moment and reports how long it took to end. The wait
+    /// has no bound of its own, so a slow end reports its real duration instead of the poll's.
+    private static func cancelAndTime(_ task: Task<Void, Never>, _ box: OutcomeBox) async throws -> Duration {
         try await Task.sleep(for: .milliseconds(200))
         let clock = ContinuousClock()
         let cancelledAt = clock.now
         task.cancel()
-        _ = try await waitFor(upTo: budget) { box.outcome != nil }
+        try await waitFor { box.outcome != nil }
         return clock.now - cancelledAt
     }
 
@@ -85,7 +91,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(task, box)
         #expect(box.outcome == .cancelled, "ended \(String(describing: box.outcome)) after \(elapsed)")
-        #expect(elapsed < .milliseconds(1500))
+        #expect(elapsed < Self.ceiling)
         #expect(reader.wasReleasedByEngine)
         await task.value
         #expect(engine.state == .idle)
@@ -105,7 +111,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(task, box)
         #expect(box.outcome == .cancelled, "ended \(String(describing: box.outcome)) after \(elapsed)")
-        #expect(elapsed < .milliseconds(1500))
+        #expect(elapsed < Self.ceiling)
         origin.stop()
         await task.value
         #expect(engine.state == .idle)
@@ -126,7 +132,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(task, box)
         #expect(box.outcome == .cancelled, "ended \(String(describing: box.outcome)) after \(elapsed)")
-        #expect(elapsed < .milliseconds(1500))
+        #expect(elapsed < Self.ceiling)
         origin.stop()
         await task.value
         #expect(engine.state == .idle)
@@ -147,7 +153,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(task, box)
         #expect(box.outcome == .cancelled, "ended \(String(describing: box.outcome)) after \(elapsed)")
-        #expect(elapsed < .milliseconds(1500))
+        #expect(elapsed < Self.ceiling)
         origin.stop()
         await task.value
         #expect(engine.state == .idle)
@@ -339,7 +345,7 @@ struct CancellableLoadTests {
             defer { condition.unlock() }
             let epoch = cancels
             arrivals += 1
-            let deadline = Date().addingTimeInterval(10)
+            let deadline = Date().addingTimeInterval(120)
             while !closed, cancels == epoch, condition.wait(until: deadline) {}
             return -1
         }
@@ -365,7 +371,7 @@ struct CancellableLoadTests {
             engine.claimSoftwarePathTakeover()
             engine.stopInternal(resetDisplayCriteria: false, keepCustomReader: true)
             let gen = engine.loadGeneration
-            await Task.detached {
+            await BlockingWork.detached {
                 var byte: UInt8 = 0
                 _ = reader.read(&byte, size: 1)
             }.value
@@ -377,7 +383,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(hostLoad, hostBox)
         #expect(hostBox.outcome == .cancelled, "ended \(String(describing: hostBox.outcome)) after \(elapsed)")
-        #expect(elapsed < .milliseconds(1500))
+        #expect(elapsed < Self.ceiling)
         #expect(reader.isClosed)
         await #expect(throws: CancellationError.self) { try await rebuild.value }
         await hostLoad.value
@@ -409,7 +415,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(hostLoad, hostBox)
         #expect(hostBox.outcome == .cancelled, "ended \(String(describing: hostBox.outcome)) after \(elapsed)")
-        #expect(elapsed < .milliseconds(1500))
+        #expect(elapsed < Self.ceiling)
         await #expect(throws: CancellationError.self) { try await rebuild.value }
         origin.stop()
         await hostLoad.value
@@ -437,7 +443,7 @@ struct CancellableLoadTests {
             if armed, position == 0 {
                 parkedAtHead += 1
                 let parked = parkedAtHead
-                let deadline = Date().addingTimeInterval(10)
+                let deadline = Date().addingTimeInterval(120)
                 while armed, parkedAtHead == parked, condition.wait(until: deadline) {}
                 return -1
             }

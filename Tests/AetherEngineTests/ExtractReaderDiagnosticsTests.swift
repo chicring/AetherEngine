@@ -166,16 +166,23 @@ final class ExtractReaderDiagnosticsTests: XCTestCase {
         defer { origin.stop() }
         let sourceURL = URL(string: "http://127.0.0.1:\(origin.port)/movie.bin")!
 
-        // Learn a concurrency ceiling of 1 for this origin, then hold the one slot, so every
-        // request the reader makes proceeds ungranted after its slot wait.
+        // Learn a concurrency ceiling of 1 for this origin. Upstream 7.32+ runs open()'s size
+        // probes with requireGranted (no slot → cancel, no "proceeding uncounted"), so the
+        // un-granted log lives on the post-open extract read path (syncRequest). Open first with
+        // the slot free, then hold the slot and drive a read that must log its un-granted fetch.
         budget.noteRefusal(for: sourceURL, status: 503)
+        let reader = makeReader(port: origin.port)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
         let holder = budget.acquire(for: sourceURL, label: "test holder", timeout: 1)
         XCTAssertEqual(holder?.granted, true, "the test could not take the origin's only slot")
         defer { budget.release(holder) }
 
-        let reader = makeReader(port: origin.port)
-        defer { reader.markClosed(); reader.close() }
-        try reader.open()
+        // The open read already buffered the first chunk; seek past it so the read actually fetches.
+        _ = reader.seek(offset: 1 * 1024 * 1024, whence: SEEK_SET)
+        var buf = [UInt8](repeating: 0, count: 64 * 1024)
+        _ = buf.withUnsafeMutableBufferPointer { reader.read(into: $0.baseAddress!, size: Int32($0.count)) }
 
         XCTAssertFalse(tap.extractMatching("origin slot wait timed out").isEmpty,
                        "an extract fetch proceeding without a slot must be logged: \(tap.extractLines())")

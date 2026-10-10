@@ -27,6 +27,7 @@ private final class Recorder: @unchecked Sendable {
     var waits: Int { lock.lock(); defer { lock.unlock() }; return _waits }
 }
 
+@Suite(.offCooperativePool)
 struct IFrameRenditionTests {
     private func make(_ rec: Recorder, count: Int = 5) -> (IFrameRendition, URL) {
         let dir = FileManager.default.temporaryDirectory
@@ -172,7 +173,7 @@ struct IFrameRenditionTests {
         #expect(secondDone.wait(timeout: .now() + 0.4) == .timedOut)
         release.signal()
         requestDone.wait(); firstDone.wait()
-        #expect(secondDone.wait(timeout: .now() + 10) == .success)
+        #expect(secondDone.wait(timeout: .now() + 120) == .success)
     }
 
     @Test("while source reads are held, a request is answered from the cache or not at all")

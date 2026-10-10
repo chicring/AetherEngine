@@ -66,7 +66,7 @@ func printUsage() {
     aetherctl: standalone AetherEngine repro harness
 
     Usage:
-      aetherctl probe [--detect-hdr10plus] [--detect-atmos] <url>
+      aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
@@ -692,6 +692,9 @@ if first == "play" {
     // drain cycle. This is the knob for an origin that refuses new requests in windows: run it
     // against one and count the ranges in its own log, or read `conn start ... held` here.
     let heldConnection = takeFlag("--held-connection", from: &rest)
+    // LoadOptions.progressiveSegmentDelivery: serve each VOD segment while it is written. Pair it
+    // with a throttled origin to see the startup difference; on a fast source nothing changes.
+    let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -902,6 +905,7 @@ if first == "play" {
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  heldConnection: heldConnection,
+                 progressiveSegments: progressiveSegments,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
@@ -927,6 +931,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // instead of only through a host. Each costs reads past find_stream_info; the bare `probe` does neither.
     var probeDetail: ProbeDetail = []
     if takeFlag("--detect-hdr10plus", from: &rest) { probeDetail.insert(.hdr10Plus) }
+    if takeFlag("--detect-hdr-vivid", from: &rest) { probeDetail.insert(.hdrVivid) }
     if takeFlag("--detect-atmos", from: &rest) { probeDetail.insert(.atmos) }
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)

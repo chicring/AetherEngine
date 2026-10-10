@@ -116,7 +116,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
                     rateSwitches: [RateSwitchRequest] = [],
                     pausedMount: Bool = false,
                     optionCorrection: LoadOptionCorrectionRequest? = nil,
-                    sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, declaredDuration: Double? = nil,
+                    sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, declaredDuration: Double? = nil,
                     httpHeaders: [String: String] = [:],
                     deinterlaceFieldRate: DeinterlaceFieldRate = .field,
                     assertDolbyVision: Bool = false,
@@ -143,7 +143,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, rateSwitches: rateSwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, rateSwitches: rateSwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, progressiveSegments: progressiveSegments, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -464,7 +464,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], rateSwitches: [RateSwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], rateSwitches: [RateSwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -582,6 +582,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         heldSourceConnection: heldConnection,
         declaredDurationSeconds: declaredDuration,
         externalSubtitles: sidecars,
+        progressiveSegmentDelivery: progressiveSegments,
         // AE#464 round 2: the reporter's mount. A host that drives transport itself loads with
         // autoplay off and calls play() next to its own load; a rebuild the ENGINE raises has no
         // such caller, which is what made a mid-play nudge settle paused and stay there.
@@ -965,8 +966,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // Sodalite#104: where the playhead stood when the pause-and-hold drill parked it, so the run can
     // say whether it moved.
     var pauseHoldPlayhead: Double?
+    // AE#724: a resume whose clock settles behind the anchor it was loaded at. Only judged on a run
+    // nothing else repositions, so a drill's own seek cannot read as one.
+    let resumeAnchor: Double? = (startPosition ?? 0) > 0 && !live && seekEvery == nil
+        && hostCalls.allSatisfy { $0 == "play" } && (!pausedMount || hostCalls == ["play"])
+        && audioSwitch == nil ? startPosition : nil
+    var resumeLowest: Double?
     for tick in 1...ticks {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
+        if resumeAnchor != nil, tick <= 3 {
+            resumeLowest = min(resumeLowest ?? .infinity, engine.currentTime)
+        }
         var line = String(format: "  t=%02d state=%@ phase=%@ cur=%.2f src=%.2f buf=%.2f dur=%.1f",
                           tick,
                           String(describing: engine.state),
@@ -1513,6 +1523,11 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             print("VERDICT: #292 drill inconclusive; widen the reposition window (--throttle-kbps, remote source)")
             return 5
         }
+    }
+    if let resumeAnchor, let resumeLowest, resumeLowest < resumeAnchor - 1.0 {
+        print(String(format: "VERDICT: resume clock fell behind its anchor (loaded at %.2fs, read %.2fs); "
+                     + "the first sample re-anchored the session backwards", resumeAnchor, resumeLowest))
+        return 2
     }
     if finalTime <= 3.0 {
         if let audioSwitch {

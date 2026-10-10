@@ -50,6 +50,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// which is only correct while the two agree; on a source where they do not, every walker
         /// downstream (A53 captions, the DV P7 RPU rewrite) reads the packet at the wrong offsets.
         let nalFramingOverride: VideoNALFraming?
+        /// Forwarded to `MP4SegmentMuxer.VideoConfig.convertsAnnexBSamples`. The packets stay Annex B
+        /// up to the muxer, so `nalFramingOverride` keeps describing them.
+        let convertsAnnexBSamples: Bool
         /// The session's BIT-1 framing verdict, handed to every muxer this producer builds for the
         /// program's own track (audit BIT-104).
         let nalFramingLatch: NALFramingLatch?
@@ -63,6 +66,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
             nalFramingOverride: VideoNALFraming? = nil,
+            convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
@@ -73,6 +77,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
             self.nalFramingOverride = nalFramingOverride
+            self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
         }
     }
@@ -425,6 +430,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var lastVideoSourceDts: Int64 = Int64.min
     private var lastAudioSourceDts: Int64 = Int64.min
 
+    /// Pump-thread-only packet history for exact overlap after a live source reconnect.
+    private var liveReplayGuard = LivePacketReplayGuard()
+    private var replayPending: [ReplayBufferedPacket] = []
+    private var replayReady: [ReplayBufferedPacket] = []
+    private var replayReadyIndex = 0
+    private var replayPendingBytes = 0
+    private var replayDeferredError: Error?
+    private static let maximumReplayPendingBytes = 96 * 1_024 * 1_024
+    private static let maximumReplayPendingPackets = 10_000
+
     /// AE#432: last GENUINE source dts per stream and the frame stride learned from it. A repaired
     /// timestamp says nothing about the source's cadence, so it is deliberately not fed back here.
     private var lastGenuineVideoSourceDts: Int64 = Int64.min
@@ -709,11 +724,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// program boundary or a renumbered clock, not a cadence.
     static let maxSynthesizedStrideSeconds: Double = 1.0
 
-    /// progressive VOD serve: VOD muxers flush a fragment ~every second of buffered video instead of
-    /// holding the AE#195 8 s floor, because the fragment granularity is the delivery step size the
-    /// server streams to AVPlayer while the segment is still being produced.
-    static let progressiveFragmentSeconds: Double = 1.0
-
     /// How far a repaired timestamp advances when the source carried neither dts nor pts.
     ///
     /// It used to advance one tick, which satisfies the muxer's monotonic invariant and nothing
@@ -806,6 +816,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// AE#464: the host's audio offset this producer's muxers write. Fixed for the producer's life;
     /// a new value arrives as a new producer (see `MP4SegmentMuxer.audioDelaySeconds`).
     private let audioDelaySeconds: Double
+    /// `LoadOptions.progressiveSegmentDelivery`: register each VOD segment with the cache as it is
+    /// opened, and flush fragments every `progressiveFragmentSeconds` so the loopback server has
+    /// something to send while the segment is still being cut.
+    private let servesSegmentsProgressively: Bool
+    /// The fragment cadence inside a progressively delivered segment. Measured with `aetherctl play`
+    /// on a Mac over a 6 Mbit/s origin (1080p HEVC at 2.7 Mbit/s, 3-9 s GOPs): playing after 1.9 s at
+    /// 1 s fragments and 1.7 s at 0.5 s, against 2.3 s without progressive delivery. Each fragment
+    /// costs a moof of a few hundred bytes.
+    static let progressiveFragmentSeconds: Double = 0.5
 
     /// #65 stall diag: only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
     /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
@@ -1176,6 +1195,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         firstSeenAudioSourceDts = Int64.min
         lastVideoSourceDts = Int64.min
         lastAudioSourceDts = Int64.min
+        liveReplayGuard.reset()
         freeMergeLookaheads()
         packetCounterLock.lock()
         _lastPregateDroppedKeyframePts = Int64.min
@@ -1474,9 +1494,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioMoovPrimeKnownUnobtainable: Bool = false,
         audioDelaySeconds: Double = 0,
+        servesSegmentsProgressively: Bool = false,
         epoch: UInt64 = 0
     ) throws {
         self.epoch = epoch
+        self.servesSegmentsProgressively = servesSegmentsProgressively
         self.audioDelaySeconds = audioDelaySeconds
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.audioMoovPrimeKnownUnobtainable = audioMoovPrimeKnownUnobtainable
@@ -1960,7 +1982,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     private func awaitLiveWindowHeadroom(head: Int) -> Bool {
-        if cache.count < liveResidentCap() { return true }
+        // Compute a possibly-expired cap before reconciling its retained history. This is the
+        // same expiry handler as the cache timer, so delayed timer delivery cannot wedge this park.
+        if cache.reconcileExpiredNativeLiveDVRRetention(headroomCap: liveResidentCap()) { return true }
         // #240: a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
@@ -1978,7 +2002,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // from the observed cadence and segment size, so it moves while a park holds, and a park
             // that outlived its own reason would keep the origin undrained for nothing.
             let cap = liveResidentCap()
-            if cache.count < cap {
+            if cache.reconcileExpiredNativeLiveDVRRetention(headroomCap: cap) {
                 EngineLog.emit(
                     "[HLSSegmentProducer] live headroom released head=\(head) after=\(parked)s "
                     + "resident=\(cache.count)",
@@ -2150,6 +2174,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
             colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
             extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride,
+            convertsAnnexBSamples: isAdCreative ? false : videoConfig.convertsAnnexBSamples,
             nalFramingLatch: isAdCreative ? nil : videoConfig.nalFramingLatch
         )
         let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in
@@ -2169,20 +2194,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
                 // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
                 // must not shrink the cap below typical TS A/V interleave skew.
-                // progressive VOD serve: on VOD the fragment granularity IS the delivery step size,
-                // so the bound drops to 1 s to hand AVPlayer a publishable fragment ~every second;
-                // live keeps the AE#195 8 s floor.
-                maxBufferedFragmentSeconds: (isLive || !VideoSegmentProvider.progressiveVODServe)
-                    ? max(8.0, 2 * targetSegmentDurationSeconds)
-                    : Self.progressiveFragmentSeconds,
+                maxBufferedFragmentSeconds: servesProgressively
+                    ? Self.progressiveFragmentSeconds : max(8.0, 2 * targetSegmentDurationSeconds),
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
-                // progressive VOD serve: VOD muxers publish flushed fragment boundaries; live and
-                // the kill switch keep nil (= no publishing, exact legacy behaviour).
-                progressiveBoard: (isLive || !VideoSegmentProvider.progressiveVODServe)
-                    ? nil : cache.progressive,
+                onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
@@ -2206,6 +2224,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // outgoing muxer's totals have to be folded before the reference goes.
             self.installMuxer(muxer)
             self.currentMuxerSegmentIndex = initialSegmentIndex
+            self.noteSegmentInProgress(initialSegmentIndex, muxer: muxer)
             return muxer
         } catch {
             EngineLog.emit(
@@ -2470,6 +2489,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return nil
         case .failed:
             // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal.
+            abandonSegmentInProgress(currentMuxerSegmentIndex)
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut FAILED; "
                 + "muxer is wedged, ending pump",
@@ -2498,6 +2518,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
         }
         currentMuxerSegmentIndex = newIdx
+        noteSegmentInProgress(newIdx, muxer: muxer)
         if isLive {
             // Live is source-paced: the pump only runs ahead of real time while draining the join
             // backlog, and the sliding window (notePlaylistBuild -> evictBelow) bounds resident
@@ -2640,6 +2661,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return .syncAt(offsetSeconds: offset)
     }
 
+    /// Progressive delivery is VOD only: live keeps its own window and blocking-reload contracts.
+    private var servesProgressively: Bool { !isLive && servesSegmentsProgressively }
+
+    private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
+        guard servesProgressively else { return }
+        cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
+    }
+
+    private func abandonSegmentInProgress(_ index: Int) {
+        guard servesProgressively, index != .min else { return }
+        cache.abandonInProgress(index: index)
+    }
+
     private func finalizeSessionMuxerAndAdopt() {
         guard let muxer = currentMuxer else { return }
         let idx = currentMuxerSegmentIndex
@@ -2657,6 +2691,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 reportSequentialSegmentFinalized(index: idx, isFinal: true)
             }
         } else {
+            abandonSegmentInProgress(idx)
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(idx).m4s final finalize failed; not adopted",
                 category: .session
@@ -2671,6 +2706,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func discardSessionMuxer() {
         guard let muxer = currentMuxer else { return }
         let idx = currentMuxerSegmentIndex
+        // The partial segment is not adopted; a reader draining it is told before the file goes.
+        abandonSegmentInProgress(idx)
         if let result = muxer.finalize() {
             try? FileManager.default.removeItem(at: result.path)
             EngineLog.emit(
@@ -2778,11 +2815,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Pump-thread-only: has the first source read of this producer been timed yet (#93 latency)?
     private var pumpFirstReadLogged = false
 
+    private struct LiveReplaySample {
+        let signature: LivePacketReplayGuard.Signature
+        let seconds: Double
+        let timeBaseSeconds: Double
+    }
+
+    private struct ReplayBufferedPacket {
+        let packet: UnsafeMutablePointer<AVPacket>
+        let origin: PacketOrigin
+        let sample: LiveReplaySample?
+        let isDuplicate: Bool
+    }
+
     /// Returns next packet in global decode order. Single-demuxer fast path; dual-demuxer yields lower-DTS first.
     /// #93 restart latency: the FIRST read of a producer is timed (one line; info when it exceeded
     /// 1 s), because rrgomes' trace shows exactly that read waiting 19-46 s client-side while a
     /// fresh side reader overtakes it in 300 ms.
-    private func readNextSourcePacket() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
+    private func readNextSourcePacket() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin,
+                                                   replaySample: LiveReplaySample?)? {
         guard !pumpFirstReadLogged else { return try readNextSourcePacketMergedTapped() }
         pumpFirstReadLogged = true
         let t0 = DispatchTime.now()
@@ -2804,13 +2855,179 @@ final class HLSSegmentProducer: @unchecked Sendable {
     ///
     /// It is also upstream of `bridge.feed`, so the recording carries the source's own audio codec
     /// while playback listens to the bridged rendition.
-    private func readNextSourcePacketMergedTapped() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)? {
-        let read = try readNextSourcePacketMerged()
-        if let read {
+    private func readNextSourcePacketMergedTapped() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin,
+                                                               replaySample: LiveReplaySample?)? {
+        while true {
+            if !replayPending.isEmpty || !replayReady.isEmpty {
+                stateLock.lock()
+                let stopped = shouldStop
+                stateLock.unlock()
+                if stopped {
+                    freeReplayPackets()
+                    return nil
+                }
+            }
+            if replayReadyIndex < replayReady.count {
+                let ready = replayReady[replayReadyIndex]
+                replayReadyIndex += 1
+                if replayReadyIndex == replayReady.count {
+                    replayReady.removeAll(keepingCapacity: true)
+                    replayReadyIndex = 0
+                }
+                tapForRecording(ready.packet)
+                recordPlayedMedia(ready.packet, origin: ready.origin)
+                return (ready.packet, ready.origin, ready.sample)
+            }
+            if let replayDeferredError {
+                self.replayDeferredError = nil
+                throw replayDeferredError
+            }
+            let read: (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)?
+            do {
+                read = try readNextSourcePacketMerged()
+            } catch {
+                if !replayPending.isEmpty {
+                    replayDeferredError = error
+                    rollbackReplayCandidate(reason: "source read failed before overlap was confirmed")
+                    continue
+                }
+                throw error
+            }
+            guard let read else {
+                if !replayPending.isEmpty {
+                    rollbackReplayCandidate(reason: "source ended before overlap was confirmed")
+                    continue
+                }
+                return nil
+            }
+            let sample = liveReplaySample(packet: read.packet, origin: read.origin)
+            if let sample {
+                let decision = liveReplayGuard.inspect(
+                    sample.signature, sourceSeconds: sample.seconds,
+                    timeBaseSeconds: sample.timeBaseSeconds,
+                    videoFrontier: lastVideoSourceDts, audioFrontier: lastAudioSourceDts)
+                if case .some(.began) = decision.event {
+                    // No output is committed until both tracks agree that the entire overlap is
+                    // duplicate. If either track diverges, every buffered packet goes through the
+                    // ordinary rebase in its original order; no unverified frame is discarded.
+                    noCutWatchdog?.setReplayChecking(true, at: Date())
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] live source overlap candidate: exact packet match "
+                        + "after timestamp rollback; checking both tracks before output",
+                        category: .session)
+                }
+                if liveReplayGuard.isDroppingReplay || decision.event != nil {
+                    noCutWatchdog?.noteReplayPacketRead(at: Date())
+                    replayPending.append(ReplayBufferedPacket(packet: read.packet, origin: read.origin,
+                                                               sample: sample, isDuplicate: decision.drop))
+                    replayPendingBytes += max(0, Int(read.packet.pointee.size))
+                    switch decision.event {
+                    case .some(.finished(let videoPackets, let audioPackets, let videoSeconds)):
+                        commitReplayCandidate()
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] live source overlap resolved: "
+                            + "removed \(videoPackets) video + \(audioPackets) audio packets "
+                            + "across \(String(format: "%.2f", videoSeconds))s; "
+                            + "first new packet continues the existing timeline",
+                            category: .session)
+                    case .some(.mismatch(let videoPackets, let audioPackets)):
+                        rollbackReplayCandidate(reason: "track diverged after \(videoPackets) video "
+                            + "+ \(audioPackets) audio matches")
+                    default:
+                        if replayPendingBytes > Self.maximumReplayPendingBytes
+                            || replayPending.count > Self.maximumReplayPendingPackets {
+                            rollbackReplayCandidate(reason: "bounded overlap check reached its limit")
+                        }
+                    }
+                    continue
+                }
+            }
+            if !replayPending.isEmpty {
+                noCutWatchdog?.noteReplayPacketRead(at: Date())
+                // Keep subtitle/caption/metadata packets in source order while the video/audio
+                // decision is pending. Their content is never discarded without an exact match.
+                replayPending.append(ReplayBufferedPacket(packet: read.packet, origin: read.origin,
+                                                           sample: sample, isDuplicate: false))
+                replayPendingBytes += max(0, Int(read.packet.pointee.size))
+                if replayPendingBytes > Self.maximumReplayPendingBytes
+                    || replayPending.count > Self.maximumReplayPendingPackets {
+                    rollbackReplayCandidate(reason: "bounded overlap check reached its limit")
+                }
+                continue
+            }
+            // The recording sees the same unique source packets as playback.
             tapForRecording(read.packet)
             recordPlayedMedia(read.packet, origin: read.origin)
+            return (read.packet, read.origin, sample)
         }
-        return read
+    }
+
+    private func commitReplayCandidate() {
+        for entry in replayPending {
+            if entry.isDuplicate {
+                var packet: UnsafeMutablePointer<AVPacket>? = entry.packet
+                trackedPacketFree(&packet)
+            } else {
+                replayReady.append(entry)
+            }
+        }
+        replayPending.removeAll(keepingCapacity: true)
+        replayPendingBytes = 0
+        noCutWatchdog?.setReplayChecking(false, at: Date())
+    }
+
+    private func rollbackReplayCandidate(reason: String) {
+        replayReady.append(contentsOf: replayPending)
+        replayPending.removeAll(keepingCapacity: true)
+        replayPendingBytes = 0
+        liveReplayGuard.reset()
+        noCutWatchdog?.setReplayChecking(false, at: Date())
+        EngineLog.emit(
+            "[HLSSegmentProducer] live source overlap unconfirmed: \(reason); "
+            + "forwarding all packets to normal discontinuity handling",
+            category: .session)
+    }
+
+    private func freeReplayPackets() {
+        for entry in replayPending + replayReady.dropFirst(replayReadyIndex) {
+            var packet: UnsafeMutablePointer<AVPacket>? = entry.packet
+            trackedPacketFree(&packet)
+        }
+        replayPending.removeAll()
+        replayReady.removeAll()
+        replayReadyIndex = 0
+        replayPendingBytes = 0
+        replayDeferredError = nil
+        noCutWatchdog?.setReplayChecking(false, at: Date())
+    }
+
+    private func liveReplaySample(packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin)
+        -> LiveReplaySample? {
+        // Only the single-demuxer stream-copy path has one source timeline for both tracks.
+        // Side audio and bridged audio have independent clocks; the existing rebase owns them.
+        guard isLive, sideAudioDemuxer == nil, audioConfig?.bridge == nil,
+              packet.pointee.dts != Int64.min, packet.pointee.pts != Int64.min,
+              packet.pointee.size > 0, let bytes = packet.pointee.data else { return nil }
+        let stream: LivePacketReplayGuard.Stream
+        let timeBaseSeconds: Double
+        if origin == .main, packet.pointee.stream_index == videoStreamIndex {
+            stream = .video
+            timeBaseSeconds = sourceVideoTbSeconds
+        } else if let audio = audioConfig,
+                  packet.pointee.stream_index == audio.sourceStreamIndex,
+                  origin == .main {
+            stream = .audio
+            timeBaseSeconds = audioSourceTbSeconds
+        } else {
+            return nil
+        }
+        guard timeBaseSeconds > 0 else { return nil }
+        let signature = LivePacketReplayGuard.Signature(
+            stream: stream, dts: packet.pointee.dts, pts: packet.pointee.pts,
+            payload: UnsafeRawBufferPointer(start: bytes, count: Int(packet.pointee.size)))
+        return LiveReplaySample(signature: signature,
+                                seconds: Double(packet.pointee.dts) * timeBaseSeconds,
+                                timeBaseSeconds: timeBaseSeconds)
     }
 
     /// AE#514: the video stream and the audio stream this session plays, on the source axis the engine
@@ -3083,6 +3300,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
                 let packet: UnsafeMutablePointer<AVPacket>
                 let origin: PacketOrigin
+                let replaySample: LiveReplaySample?
                 if !audioWaitForVideo, hasPregateAudioToReplay {
                     // #74: once the video gate opens, drain the buffered head-of-stream audio in DTS
                     // order before reading further source packets. These were already counted in
@@ -3099,6 +3317,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                     packet = entry.0
                     origin = entry.1
+                    replaySample = nil
                     pregateAudioBufferBytes -= Int(packet.pointee.size)
                 } else {
                     guard let read = try readNextSourcePacket() else {
@@ -3114,6 +3333,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                     packet = read.packet
                     origin = read.origin
+                    replaySample = read.replaySample
                     packetsRead += 1
                     noCutWatchdog?.notePacketRead()
                 }
@@ -3332,6 +3552,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             exitReason = .sourceReplay
                             break readLoop
                         }
+                        liveReplayGuard.reset()
                         let (newShift, continuationDts) = Self.rebasedVideoShift(
                             srcDts: packet.pointee.dts,
                             lastSrcDts: lastVideoSourceDts,
@@ -3414,6 +3635,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             exitReason = .sourceReplay
                             break readLoop
                         }
+                        liveReplayGuard.reset()
                         if pendingAudioShiftOverride != nil {
                             EngineLog.emit(
                                 "[HLSSegmentProducer] audio rebase: discarding stale shift override (new boundary)",
@@ -4021,6 +4243,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     continue
                 }
 
+                // Only packets that passed the live gates and output timestamp checks enter the
+                // history. Their original source signature was captured before timestamp repair.
+                if let sample = replaySample {
+                    liveReplayGuard.record(sample.signature, sourceSeconds: sample.seconds)
+                }
+
                 if isVideoPkt {
                     if !loggedFirstVideoPktInfo {
                         loggedFirstVideoPktInfo = true
@@ -4301,6 +4529,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
         }
 
+        freeReplayPackets()
         freeMergeLookaheads()
 
         // #74: free any head-of-stream audio still buffered (e.g. the video gate never opened on a
