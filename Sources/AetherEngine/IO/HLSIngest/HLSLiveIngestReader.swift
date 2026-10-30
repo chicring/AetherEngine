@@ -32,7 +32,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var started = false
     private var closed = false
     // All _-prefixed vars are protected by startLock.
-    private var _terminalError: HLSIngestError?
+    private var _terminalFailure: Error?
     /// Written before any segment byte reaches the FIFO; first write wins.
     private var _upstreamTargetDuration: Double?
     /// Tracks observed segment-arrival cadence for LL-HLS shaping (AetherEngine#167). Updated whenever new
@@ -56,6 +56,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// "mpegts" or "aac", classified from the first segment's leading bytes, written before that segment's first FIFO byte.
     private var _segmentFormatHint: String?
     private var _packedAudioTimestampOffset90k: Int64?
+    /// `LoadOptions.liveEdgeCushionSeconds`, validated, set by the engine before the first read: the
+    /// join takes enough of the upstream listing to cover it (`HLSPlaylistTracker.joining(cushion:)`).
+    private var _joinCushionSeconds: Double?
+    /// The Retry-After of the last refused playlist request, taken by the refresh loop as it waits.
+    private var _playlistRetryAfter: TimeInterval?
 
     /// `formatResolved` flips after classification OR on any ingest exit, so `resolveSegmentFormatHint` never outwait a dead ingest.
     private let formatCondition = NSCondition()
@@ -85,7 +90,12 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var sniffedFirstSegment = false
 
     public var terminalError: HLSIngestError? {
-        startLock.withLock { _terminalError }
+        // Keep the public terminal-state contract; the engine consumes the original cause below.
+        terminalFailure.map { ($0 as? HLSIngestError) ?? .playlistUnreachable(status: -1) }
+    }
+
+    var terminalFailure: Error? {
+        startLock.withLock { _terminalFailure }
     }
 
     public var upstreamTargetDuration: Double? {
@@ -183,7 +193,21 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private static let formatResolveTimeout: TimeInterval = 30
 
     /// Install companion under startLock. If close() raced the resolver, the new companion is closed immediately so no loop or URLSession outlives the parent.
+    /// Set before the first read; a reader already ingesting keeps the depth it joined at.
+    func setJoinCushion(_ seconds: Double?) {
+        startLock.lock()
+        _joinCushionSeconds = seconds
+        startLock.unlock()
+    }
+
+    private var joinCushionSeconds: Double? {
+        startLock.lock()
+        defer { startLock.unlock() }
+        return _joinCushionSeconds
+    }
+
     private func installCompanion(_ companion: HLSLiveIngestReader) {
+        companion.setJoinCushion(joinCushionSeconds)
         startLock.lock()
         let raceClosed = closed
         if !raceClosed { _companionAudioReader = companion }
@@ -199,8 +223,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// reader, so header-enforcing IPTV origins (Referer / User-Agent / Authorization, #119) accept the
     /// ingest the same way they accept the AVPlayer bypass (AetherEngine#168). Credential headers go
     /// only to `playlistURL`'s origin with no TLS downgrade (audit NET-7).
-    public convenience init(playlistURL: URL, httpHeaders: [String: String]) {
-        self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+    public convenience init(playlistURL: URL, httpHeaders: [String: String],
+                            diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context) {
+        self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo,
+                  diagnosticContext: diagnosticContext)
     }
 
     /// #199: fresh reader over the same playlist URL and headers, for the in-engine live reopen of an
@@ -209,11 +235,18 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// audio reader's lifetime is owned by its parent and never reopens independently.
     func makeFreshMainReader() -> HLSLiveIngestReader? {
         guard role == .mainVideo else { return nil }
-        return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+        let fresh = HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo,
+                                        diagnosticContext: diagnosticContext)
+        fresh.setJoinCushion(joinCushionSeconds)
+        return fresh
     }
 
+    private let diagnosticContext: SourceNetworkDiagnostics.Context?
+
     init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
-         credentialOrigin: URL? = nil) {
+         credentialOrigin: URL? = nil,
+         diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context) {
+        self.diagnosticContext = diagnosticContext
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
         self.credentialOrigin = credentialOrigin ?? playlistURL
@@ -282,8 +315,12 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             wakeFormatResolveWaiters() // wake any pending format resolve regardless of exit path
         }
         do {
-            let (mediaURL, seedPlaylist) = try await resolveMediaPlaylistURL()
-            var tracker = HLSPlaylistTracker()
+            let (resolvedURL, seedPlaylist) = try await resolveMediaPlaylistURL()
+            var mediaURL = resolvedURL
+            // A media playlist the host's URL led to directly (through redirects, as an IPTV panel's
+            // tokenized session URL), which that URL can lead to afresh when the session expires.
+            let mediaURLIsReresolvable = seedPlaylist != nil && mediaURL != playlistURL
+            var tracker = HLSPlaylistTracker.joining(cushion: joinCushionSeconds)
             var loggedEncryptedDirectPlay = false
             var refreshInterval: Double = 2
             var pendingPlaylist: HLSMediaPlaylist? = seedPlaylist
@@ -294,10 +331,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     media = seeded // reuse playlist parsed during resolve to avoid a redundant fetch
                     pendingPlaylist = nil
                 } else {
-                    let (playlist, _) = try await fetchPlaylistWithRetry(mediaURL)
-                    guard case .media(let fetched) = playlist else {
-                        throw HLSIngestError.playlistInvalid(reason: "expected media playlist on refresh")
-                    }
+                    let (fetched, refreshedURL) = try await refreshMediaPlaylist(
+                        mediaURL, canReresolve: mediaURLIsReresolvable)
+                    mediaURL = refreshedURL
                     media = fetched
                 }
                 startLock.withLock { // publish before any segment byte reaches the FIFO; first write wins
@@ -373,14 +409,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         } catch is CancellationError {
             // teardown
         } catch let error as HLSIngestError {
-            startLock.withLock { _terminalError = error }
+            startLock.withLock { _terminalFailure = error }
             EngineLog.emit("[HLSIngest] terminal: \(error)", category: .engine)
             fifo.cancel()
         } catch {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled {
                 return // teardown rides through as cancellation, not a terminal error
             }
-            startLock.withLock { _terminalError = .playlistUnreachable(status: -1) }
+            startLock.withLock { _terminalFailure = error }
             EngineLog.emit("[HLSIngest] terminal (transport): \(error.localizedDescription)", category: .engine)
             fifo.cancel()
         }
@@ -455,7 +491,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         mediaURL: URL
     ) {
         group.addTask {
-            let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration)
+            let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration,
+                                                      byteRange: item.segment.byteRange)
             guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
             return (index, try await self.decryptSegment(fetched, crypt: crypt, against: mediaURL))
         }
@@ -551,7 +588,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 )
                 installCompanion(HLSLiveIngestReader(
                     playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio,
-                    credentialOrigin: credentialOrigin))
+                    credentialOrigin: credentialOrigin, diagnosticContext: diagnosticContext))
             }
             // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
             // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
@@ -580,46 +617,147 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
-    /// 12s: FIFO + producer buffer give ~10-20s slack; past that, going terminal beats stretching a stall the buffer can no longer hide.
-    private static let refreshRetryBudget: TimeInterval = 12
+    /// How long a live refresh is retried while the origin refuses it (`refusalStatuses`: 429, 503,
+    /// 509). It outlasts what a session holds ahead of the playhead, so a refusal that
+    /// ends while the picture is still playing from it is never seen: the host's own stall handling
+    /// steps in once that runs dry. A connection-limited IPTV panel answers 509 for as long as another
+    /// device on the account holds its last slot, which is seconds to tens of seconds when that device
+    /// changes channels, and then serves again at once. The 7.36.0 ladder (1, 2, 4 s within 12 s) went
+    /// terminal well inside such a window, and on the software path that ended the session.
+    static let refreshRetryBudget: TimeInterval = 60
 
-    /// Playlist refresh with bounded exponential backoff (1s, 2s, 4s). Device repro: a single -1001 CDN timeout used to force a visible ~10s retune; now bridged invisibly inside `refreshRetryBudget`. Parse errors and 4xx throw immediately. Initial join stays single-shot (fast spinner fallback beats slow retry).
-    private func fetchPlaylistWithRetry(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let deadline = Date().addingTimeInterval(Self.refreshRetryBudget)
-        var attempt = 0
+    /// How long a refresh or segment is retried when the origin cannot be reached or answers with any
+    /// other 5xx. That is not a refusal that lifts by itself: a dead channel or a lost network would
+    /// otherwise sit behind a spinner for a minute before the host's reopen or fallback gets a turn.
+    /// FIFO and producer buffer give 10 to 20 s of slack, so 12 s still bridges a single CDN timeout.
+    static let unreachableRetryBudget: TimeInterval = 12
+
+    /// The retry budget for a failure with this HTTP status, nil for a transport error. A retry loop
+    /// keeps the longest budget it has seen, so one transport blip inside a refusal does not end it.
+    static func retryBudget(forStatus status: Int?) -> TimeInterval {
+        guard let status, refusalStatuses.contains(status) else { return unreachableRetryBudget }
+        return refreshRetryBudget
+    }
+
+    /// The steady wait between those retries. One small request a second, never growing: a refusal of
+    /// this kind lifts the moment the other device lets its slot go, and a growing backoff only adds
+    /// to the wait after that. An origin's own Retry-After stretches it, up to `maximumRetryWait`.
+    static let refusedRefreshRetryInterval: TimeInterval = 1
+    static let maximumRetryWait: TimeInterval = 5
+
+    /// Failed refreshes that are each logged; past these, one line every `retryLogStride`.
+    private static let loggedRetries = 3
+    private static let retryLogStride = 10
+
+    /// Refusals of a session URL after which it is asked for again through the URL the host loaded.
+    /// An IPTV panel that let another device's connection take the account's last slot keeps refusing
+    /// the session it evicted, for as long as that lasts, while a fresh session from the loaded URL is
+    /// admitted at once. Two lets a refusal that lifts by itself within a second or two keep the
+    /// session it has.
+    static let sessionURLRefusalsBeforeReresolve = 2
+
+    /// The live refresh, retried steadily while the origin refuses it or cannot be reached. When the
+    /// URL the host loaded led to this media playlist through redirects (`canReresolve`: an IPTV
+    /// panel's tokenized session URL), a playlist that answers as gone (a 4xx other than 429 and 408:
+    /// the session expired or was revoked) is asked for again through the loaded URL at once, and one
+    /// refused `sessionURLRefusalsBeforeReresolve` times in a row after that, for a fresh session URL;
+    /// the loaded URL is then asked at the same steady pace. The playlist tracker follows
+    /// MEDIA-SEQUENCE, so the segments it hands out continue where they left off. Parse errors throw at
+    /// once. Returns the playlist and the URL it was read from, which later refreshes use.
+    private func refreshMediaPlaylist(_ mediaURL: URL, canReresolve: Bool) async throws -> (HLSMediaPlaylist, URL) {
+        let startedAt = Date()
+        var budget = Self.unreachableRetryBudget
+        var url = mediaURL
+        var failures = 0
         while true {
             try Task.checkCancellation()
+            startLock.withLock { _playlistRetryAfter = nil }
             do {
-                return try await fetchPlaylist(url)
-            } catch let error as HLSIngestError {
-                guard case .playlistUnreachable(let status) = error,
-                      status >= 500 || status == 429 else {
-                    throw error
+                let (playlist, finalURL) = try await fetchPlaylist(url)
+                guard case .media(let media) = playlist else {
+                    throw HLSIngestError.playlistInvalid(reason: "expected media playlist on refresh")
                 }
-                try await backoffOrRethrow(error, attempt: &attempt, deadline: deadline)
+                if failures > 0 || url != mediaURL {
+                    EngineLog.emit(
+                        "[HLSIngest] playlist refresh recovered after \(failures) failed attempt(s) in "
+                        + "\(String(format: "%.1f", Date().timeIntervalSince(startedAt)))s"
+                        + (url != mediaURL ? " through the loaded URL" : ""),
+                        category: .engine
+                    )
+                }
+                return (media, finalURL)
+            } catch let error as HLSIngestError {
+                guard case .playlistUnreachable(let status) = error else { throw error }
+                if Self.isGoneStatus(status) {
+                    guard canReresolve, url == mediaURL else { throw error }
+                    EngineLog.emit(
+                        "[HLSIngest] media playlist answered \(status); asking the loaded URL for a fresh one",
+                        category: .engine
+                    )
+                    url = playlistURL
+                    continue
+                }
+                failures += 1
+                budget = max(budget, Self.retryBudget(forStatus: status))
+                try await waitBeforeRetrying(error, failures: failures, deadline: startedAt.addingTimeInterval(budget))
+                url = Self.nextRefreshURL(after: failures, current: url, sessionURL: mediaURL,
+                                          loadedURL: playlistURL, canReresolve: canReresolve)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 if (error as? URLError)?.code == .cancelled { throw error }
-                try await backoffOrRethrow(error, attempt: &attempt, deadline: deadline)
+                failures += 1
+                try await waitBeforeRetrying(error, failures: failures, deadline: startedAt.addingTimeInterval(budget))
+                url = Self.nextRefreshURL(after: failures, current: url, sessionURL: mediaURL,
+                                          loadedURL: playlistURL, canReresolve: canReresolve)
             }
         }
     }
 
-    private func backoffOrRethrow(_ error: Error, attempt: inout Int, deadline: Date) async throws {
-        attempt += 1
-        let delay = min(4.0, pow(2.0, Double(attempt - 1)))
-        guard Date().addingTimeInterval(delay) < deadline else { throw error }
+    /// Where the next refresh goes after `failures` in a row: the loaded URL, for a fresh session,
+    /// once the session URL has been refused `sessionURLRefusalsBeforeReresolve` times; otherwise
+    /// where the last one went.
+    static func nextRefreshURL(after failures: Int, current: URL, sessionURL: URL, loadedURL: URL,
+                               canReresolve: Bool) -> URL {
+        guard canReresolve, current == sessionURL, failures >= sessionURLRefusalsBeforeReresolve else {
+            return current
+        }
         EngineLog.emit(
-            "[HLSIngest] playlist refresh failed (attempt \(attempt): \(error.localizedDescription)); retrying in \(Int(delay))s",
+            "[HLSIngest] session URL refused \(failures) times; asking the loaded URL for a fresh one",
             category: .engine
         )
+        return loadedURL
+    }
+
+    /// A status that says the playlist will not be served at this URL again, rather than not now:
+    /// any 4xx but 429 (Too Many Requests) and 408 (Request Timeout).
+    static func isGoneStatus(_ status: Int) -> Bool {
+        (400..<500).contains(status) && status != 429 && status != 408
+    }
+
+    /// The wait before the next retry, or the error once the budget would be overrun.
+    static func retryWait(retryAfter: TimeInterval?) -> TimeInterval {
+        min(max(retryAfter ?? refusedRefreshRetryInterval, refusedRefreshRetryInterval), maximumRetryWait)
+    }
+
+    private func waitBeforeRetrying(_ error: Error, failures: Int, deadline: Date) async throws {
+        let retryAfter = startLock.withLock { _playlistRetryAfter }
+        let delay = Self.retryWait(retryAfter: retryAfter)
+        guard Date().addingTimeInterval(delay) < deadline else { throw error }
+        if failures <= Self.loggedRetries || failures % Self.retryLogStride == 0 {
+            EngineLog.emit(
+                "[HLSIngest] playlist refresh failed (attempt \(failures): \(EngineLog.summary(of: error))); "
+                + "retrying in \(String(format: "%.1f", delay))s",
+                category: .engine
+            )
+        }
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
     /// AE#678: every ingest request is charged to `OriginRequestBudget` like the reader's and the relay's,
-    /// so the host's declared ceiling and a ceiling learned from a refusal bind this path too. The slot
-    /// wait blocks, so it runs off the cooperative pool; no ticket is ever held across another acquire.
+    /// so the host's declared ceiling, and a ceiling or pacer learned from another path's refusal, bind
+    /// this path too. Its own refusals are not charged (see below). The slot wait blocks, so it runs off
+    /// the cooperative pool; no ticket is ever held across another acquire.
     private func budgeted(
         _ url: URL, label: String, _ fetch: () async throws -> (Data, URLResponse)
     ) async throws -> (Data, URLResponse) {
@@ -637,10 +775,15 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             if let finalURL = http.url, finalURL != url {
                 OriginRequestBudget.shared.noteRedirect(from: url, to: finalURL)
             }
-            if Self.refusalStatuses.contains(http.statusCode) {
-                OriginRequestBudget.shared.noteRefusal(
-                    for: http.url ?? url, status: http.statusCode,
-                    retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init))
+            // A refusal here is not charged to the origin's books. A live ingest asks at most once a
+            // second while refused (`refusedRefreshRetryInterval`), and a connection-limited IPTV panel
+            // refuses on behalf of another device holding the account's last slot, not of our request
+            // rate. Charged, its 509 armed a quiet period of up to 15 s and halved the request budget
+            // for the rest of the process, so the refresh that would have been served the moment the
+            // slot freed, and every reopen or reload after it, waited up to 10 s for the pacer instead.
+            if Self.refusalStatuses.contains(http.statusCode), label == "ingest-playlist" {
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                startLock.withLock { _playlistRetryAfter = retryAfter }
             }
         }
         return (data, response)
@@ -652,14 +795,18 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var isClosed: Bool { startLock.withLock { closed } }
 
     /// Applies the configured origin headers to every ingest fetch, credentials only where the host's
-    /// origin is (audit NET-7). Internal for the header-contract tests.
-    func makeRequest(_ url: URL) -> URLRequest {
+    /// origin is (audit NET-7), and a segment's sub-range when it has one. Internal for the
+    /// header-contract tests.
+    func makeRequest(_ url: URL, byteRange: HLSByteRange? = nil) -> URLRequest {
         var request = URLRequest(url: url)
         for (field, value) in RedirectHeaderPolicy.scoped(
             httpHeaders, grantedFor: credentialOrigin, sentTo: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
-        return request
+        if let byteRange {
+            request.setValue(byteRange.requestHeaderValue, forHTTPHeaderField: "Range")
+        }
+        return SourceNetworkDiagnostics.request(request, context: diagnosticContext)
     }
 
     /// Fetch + parse a playlist. Returns parsed playlist and final URL after redirects (relative segment URIs resolve against it).
@@ -678,34 +825,57 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return (try HLSPlaylistParser.parse(text), response.url ?? url)
     }
 
-    private func fetchSegment(_ url: URL, duration: Double) async throws -> Data {
-        var lastStatus = -1
+    private func fetchSegment(_ url: URL, duration: Double, byteRange: HLSByteRange?) async throws -> Data {
+        var lastFailure: Error = HLSIngestError.playlistUnreachable(status: -1)
         let limit = BoundedFetch.segmentLimit(forDuration: duration)
-        for attempt in 0..<3 {
+        let startedAt = Date()
+        var budget = Self.unreachableRetryBudget
+        var attempt = 0
+        while true {
             if Task.isCancelled { throw CancellationError() }
+            var retryAfter: TimeInterval?
+            var status: Int?
             do {
                 let (data, response): (Data, URLResponse)
                 do {
                     (data, response) = try await budgeted(url, label: "ingest-segment") {
-                        try await BoundedFetch.data(for: self.makeRequest(url), session: self.session, limit: limit)
+                        try await BoundedFetch.data(for: self.makeRequest(url, byteRange: byteRange),
+                                                    session: self.session, limit: limit, role: .hlsSegment)
                     }
                 } catch is BoundedFetch.Exceeded {
                     // Audit NET-112: an endless body is the origin's answer, not a blip to retry.
                     throw HLSIngestError.playlistInvalid(reason: "segment exceeds \(limit) bytes")
                 }
-                lastStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
-                if (200..<300).contains(lastStatus) { return data }
+                let lastStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
+                lastFailure = HLSIngestError.playlistUnreachable(status: lastStatus)
+                status = lastStatus
+                if (200..<300).contains(lastStatus) {
+                    guard let byteRange else { return data }
+                    return try byteRange.segmentBytes(
+                        from: data, status: lastStatus,
+                        contentRange: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Range"))
+                }
                 if lastStatus == 404 { return Data() } // slid out of provider window; tracker advances regardless
                 if (400..<500).contains(lastStatus) && lastStatus != 429 {
                     throw HLSIngestError.playlistUnreachable(status: lastStatus)
                 }
+                retryAfter = (response as? HTTPURLResponse)?
+                    .value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
             } catch let error as HLSIngestError { throw error }
-            catch { /* transport blip: retry */ }
-            if attempt < 2 {
-                try await Task.sleep(nanoseconds: UInt64(0.5 * Double(attempt + 1) * 1_000_000_000))
+            catch {
+                if Task.isCancelled || (error as? URLError)?.code == .cancelled { throw error }
+                lastFailure = error
             }
+            attempt += 1
+            // Two quick retries for a blip, as before; then the steady pace of a refused refresh,
+            // within the same budget the refresh would get for this failure.
+            let delay = attempt <= 2 ? 0.5 * Double(attempt) : Self.retryWait(retryAfter: retryAfter)
+            budget = max(budget, Self.retryBudget(forStatus: status))
+            guard Date().addingTimeInterval(delay) < startedAt.addingTimeInterval(budget) else {
+                throw lastFailure
+            }
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
-        throw HLSIngestError.playlistUnreachable(status: lastStatus)
     }
 
     private func decryptSegment(_ ciphertext: Data, crypt: HLSSegmentCrypt, against base: URL) async throws -> Data {
@@ -730,14 +900,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         do {
             (data, response) = try await budgeted(url, label: "ingest-key") {
                 try await BoundedFetch.data(
-                    for: self.makeRequest(url), session: self.session, limit: BoundedFetch.keyLimit)
+                    for: self.makeRequest(url), session: self.session, limit: BoundedFetch.keyLimit, role: .hlsKey)
             }
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.segmentDecryptFailed(reason: "key exceeds \(BoundedFetch.keyLimit) bytes")
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
-            throw HLSIngestError.segmentDecryptFailed(reason: "key fetch HTTP \(status)")
+            throw HLSIngestError.playlistUnreachable(status: status)
         }
         guard data.count == kCCKeySizeAES128 else {
             throw HLSIngestError.segmentDecryptFailed(reason: "key length \(data.count) != 16")

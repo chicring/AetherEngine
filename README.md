@@ -44,12 +44,15 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [Silo](https://github.com/Silo-Server/silo-apple): native iOS, tvOS and macOS client for the Silo self-hosted media server.
 - [File Box](https://apps.apple.com/app/id6765818194): File Box is a simple and practical local file manager on iPhone and iPad.
 - [Moonfin](https://github.com/Moonfin-Client/Moonfin-Core): A multi-platform third party Jellyfin client.
-- [Vivid](https://github.com/blurbery/vivid): open-source media app for iPhone, iPad and Apple TV.
 - [Snappier IPTV](https://apps.apple.com/gb/app/snappier-iptv/id1579702567): IPTV App for iOS/iPadOS and tvOS.
 - [stashy](https://stashy.shelf.am/): iOS/tvOS native player for stash.
 - [Gflix](https://gflixhub.app/): A flawless media app for your media.
 - [Melon Video](https://apps.apple.com/ca/app/melon-video/id6811750997): Video Player for Vision Pro.
 - [WUW IPTV Player](https://apps.apple.com/tr/app/wuw-iptv-player-smart-m3u-tv/id6759220800): Watch U Want — or simply WUW — your IPTV player for iPhone, iPad, Mac, Apple TV and Apple Vision Pro.
+- [GiVo Stream](https://givostreamapp.com): media player for iPhone, iPad and Apple TV with bring-your-own playlists, live timeshift, DVR and VOD.
+- [LillyPlayer](https://lillyplayer.com): The all-in-one IPTV and media player for Apple TV, iPhone and iPad (live TV, EPG, replay, Jellyfin, Plex, SMB...).
+- [Plozz](https://plozz.app): Free forever open source native app for iPhone, iPad, and Apple TV. Supports Jellyfin, Plex, Emby, Silo, IPTV, SMB, WebDAV and more.
+- [Crivid IPTV Player](https://apps.apple.com/app/id6783083716): IPTV player for M3U and Xtream on Apple TV.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -60,18 +63,20 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 
 | Area | Summary |
 | --- | --- |
-| Containers | MKV, MP4, WebM, MPEG-TS, AVI, ASF / WMV, OGG, FLV |
+| Containers | MKV, MP4, WebM, MPEG-TS, AVI, ASF / WMV, OGG, FLV, RealMedia (.rm / .rmvb), 3GP / 3G2 |
+| MPEG-DASH | Remote on-demand manifests (static, one Period, `SegmentBase`, unencrypted): the video and every audio language are laid out as one fragmented MP4, so seeks, audio switching and both playback paths work unchanged. Live and `SegmentTemplate` manifests are refused with a reason |
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
 | Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 Main profile where HW AV1 exists |
-| Video (SW) | AV1 (dav1d) without HW, and AV1 High / Professional (4:4:4, 4:2:2, 12-bit) everywhere, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE, the Flash tail (Sorenson Spark, On2 VP6) and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
-| HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG, HDR Vivid (played on its HLG / PQ base, CUVA metadata reported by `probe`) |
-| Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / LPCM (incl. Blu-ray, G.711) / WMA (Standard, Pro, Lossless, Voice) / Nellymoser / ADPCM-SWF / Speex bridge to EAC3 5.1 (default) or lossless FLAC |
-| Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
+| Video (SW) | AV1 (dav1d) without HW, and AV1 High / Professional (4:4:4, 4:2:2, 12-bit) everywhere, VP9 (VideoToolbox hardware when supported, otherwise libavcodec) / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE, the Flash tail (Sorenson Spark, On2 VP6), RealVideo 1-4, H.263, Theora and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
+| HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 on the native route as single-layer 8.1 (HDR10 base layer on a display without Dolby Vision), or composed dual-layer on Metal with per-frame DV metadata for FEL when `preferDualLayerDolbyVision` is set, the `DualLayerDolbyVision` trait is on and VideoToolbox decodes HEVC in hardware, P8.1, P8.4, AV1 P10.x), HLG (declared, or named by an alternative transfer SEI as broadcast HLG is), HDR Vivid (played on its HLG / PQ base, CUVA metadata reported by `probe`) |
+| Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / LPCM (incl. Blu-ray, G.711) / WMA (Standard, Pro, Lossless, Voice) / Nellymoser / ADPCM-SWF / Speex / RealAudio (Cook, ATRAC3, Sipro, Lossless, 14.4 / 28.8) / AMR-NB / AMR-WB / DVD LPCM bridge to EAC3 5.1 (default) or lossless FLAC |
+| Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix) except the opt-in Profile 7 FEL dual-layer route (`preferDualLayerDolbyVision`, `DualLayerDolbyVision` trait), which runs on the software host and plays an E-AC-3 JOC track as its 5.1 / 7.1 bed without the objects unless `LoadOptions.objectAudioRendering` is set (then the objects are kept: compressed JOC to the renderer, TrueHD and DTS:X object audio as a rendered bed, in a build with the object-audio traits). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path. TrueHD Atmos keeps its heights too, opt-in through `LoadOptions.objectAudioRendering` in a build with the `TrueHDObjectAudio` trait ([Optional components](#optional-components)): the engine decodes the Atmos objects, renders them into a speaker bed and delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as Spatial Audio ([details](docs/formats.md#truehd-atmos-with-heights)). DTS:X takes the same route with the `DTSXObjectAudio` trait, its four heights unfolded from the compatible 7.1 into 7.1.4 or 9.1.6 ([details](docs/formats.md#dtsx-with-heights)) |
+| Height channels | TrueHD and DTS:X object audio rendered into a speaker bed (5.1.2 up to 9.1.6) and delivered as lossless 24-bit PCM, or APAC when the route plays over AirPlay (`objectAudioRendering`, optional components) |
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` |
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
 | Background audio | Audio keeps playing when the app backgrounds on iOS: native AVPlayer stays alive, the software path drops video and keeps decoding audio (`backgroundPlaybackEnabled` / `pictureInPictureActive`); a paused session survives quick app switches for a grace window (`backgroundTeardownGraceSeconds`, default 15 s) before the wedge-safe teardown runs. tvOS tears down immediately (wedge-safe) unless a PiP window is active, which keeps the pipeline and loopback server alive; with PiP the software path keeps decoding video too (the window needs frames). Hosts gate corrective actions on the published `isSessionReady` |
 | Picture in Picture | Native path: hosts build `AVPictureInPictureController` around `currentAVPlayer`, or around the session's own `nativePlayerLayer` when they render through `bind(view:)` rather than AVKit; while `pictureInPictureActive` a native->native load hands the AVPlayerItem over in place so the window survives next-episode transitions. Software path: published `softwarePiPSource` carries the `AVSampleBufferDisplayLayer` plus transport answers on the enqueued frames' PTS axis for sample-buffer PiP. While PiP is active the software path also composites active subtitle cues (text and PGS/DVB bitmaps) into the decoded frames, so the window shows subtitles the host overlay cannot reach. On the native path, a selected bitmap track's compositions are OCR-recognized into its WebVTT rendition, so PGS subtitles render in the PiP window there as well. iOS renders sample-buffer PiP; tvOS AVKit does not evaluate sample-buffer content sources (Apple FB9751461, verified through tvOS 26) |
-| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage` at load, `setTeletextPage(_:)` while the channel plays), external files as first-class tracks (registered, listed, selected like embedded streams), a live channel's own HLS `SUBTITLES` renditions surfaced as tracks and fetched only once one is selected, opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`); bitmap tracks (PGS / DVB / DVD, embedded and external .sup) join as OCR-fed renditions: on-device Vision text recognition runs while the track is selected and fills a language-tagged text rendition, so bitmap subtitles survive PiP / AirPlay / external display on the native path too (lossy by design; fullscreen keeps the pixel-accurate overlay) |
+| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD, plus local VobSub `.idx` + `.sub` sidecars) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage` at load, `setTeletextPage(_:)` while the channel plays), external files as first-class tracks (registered, listed, selected like embedded streams), a live channel's own HLS `SUBTITLES` renditions surfaced as tracks and fetched only once one is selected, opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`); bitmap tracks (PGS / DVB / DVD, embedded and external .sup) join as OCR-fed renditions: on-device Vision text recognition runs while the track is selected and fills a language-tagged text rendition, so bitmap subtitles survive PiP / AirPlay / external display on the native path too (lossy by design; fullscreen keeps the pixel-accurate overlay) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Audio tap | Opt-in `installAudioTap()`: decoded playback audio as mono Float32 48 kHz PCM with source-PTS timestamps, off the render path (live transcription, ShazamKit); delivers on the loopback, remote-HLS (VOD + live), and software paths. The stream is bound to its session, so a session-preserving reload (audio / subtitle / disc-title switch, `reloadAtCurrentPosition`) finishes it and the host re-installs on stream end |
 | Metadata | `MediaMetadata` (title / artist / album + cover) parsed on load; a container's album artist folds into `artist` as a fallback |
@@ -92,8 +97,9 @@ On Apple platforms the real choice is between AVPlayer, with deep OS integration
 | **Approach** | Embeddable engine, Apple-only | Full player with bundled UI, FFmpeg + AVPlayer, Apple-only | Apple's built-in player | libVLC wrapped for Apple | libmpv, cross-platform |
 | **Container & codec breadth** | Wide, FFmpeg demux | Wide, FFmpeg demux | Narrow, Apple's set | Wide | Wide |
 | **Hardware decode** | VideoToolbox, dav1d SW fallback | VideoToolbox, FFmpeg SW fallback | VideoToolbox | VideoToolbox plus software | VideoToolbox plus software |
-| **Dolby Vision** | P5, P7 as 8.1, P8.1, P8.4, AV1 P10.x, real display switch | P5, P8 via AVPlayer; their matrix lists P5 HDR display without overheating as paid LGPL | P5 and P8.1 only | Tone-maps, no DV display | Tone-maps, no DV display |
+| **Dolby Vision** | P5, P7 as 8.1 (or opt-in FEL dual-layer), P8.1, P8.4, AV1 P10.x, real display switch | P5, P8 via AVPlayer; their matrix lists P5 HDR display without overheating as paid LGPL | P5 and P8.1 only | Tone-maps, no DV display | Tone-maps, no DV display |
 | **Dolby Atmos** | EAC3+JOC stream-copied (HDMI MAT, spatial) | EAC3+JOC via AVPlayer | EAC3+JOC passthrough | Decodes to PCM, no object passthrough | No Atmos passthrough on Apple |
+| **TrueHD / DTS:X heights** | Objects and height channels rendered into a speaker bed (up to 9.1.6), delivered as lossless 24-bit PCM, APAC on AirPlay (optional components) | 7.1 core (FFmpeg decode) | Not played | 7.1 core | 7.1 core |
 | **HDR on tvOS** | Native Match Content switch | Native Match Content on AVPlayer path, else Metal tone-map | Native Match Content | Software tone-mapping | Software tone-mapping |
 | **Rendering & UI** | OS-native, you ship SwiftUI | Own Metal renderer, bundled controls | OS-native, you ship UI | Own renderer, bundled controls | Own renderer, bundled OSC |
 | **Apple TV / App Store** | Yes, LGPL plus store exception | Free build GPL, paid LGPL tier for AV1 hardware decode and the full decoder set | Yes | Yes, LGPL | Not practical, GPL, no tvOS |
@@ -342,7 +348,7 @@ player.$discChapters                           // [ChapterInfo] for the selected
 player.selectChapter(id: chapterID)            // seek to a chapter (disc chapters only)
 
 // Container chapters (Matroska / MP4; empty for disc sources, which publish discChapters instead)
-player.$mediaChapters                          // [ChapterInfo]; startSeconds are seek(to:) timestamps
+player.$mediaChapters                          // [ChapterInfo]; startSeconds are seek(to:) values, 0-based like currentTime
 
 // Info panel / Now Playing (iOS / tvOS)
 player.setExternalMetadata([ AVMetadataItem(/* title, artwork, etc. */) ])
@@ -385,7 +391,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.33.2")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.52.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -566,7 +572,7 @@ asserting DV turns it off, because it is gated on the display having none.
 
 **Handoffs between items:** back-to-back `load()` calls preserve the applied criteria across the seam, so a same-mode follow-up (Dolby Vision episode to Dolby Vision episode) overwrites it in place with a single handshake instead of bouncing the panel through SDR. If your host calls `stop()` between items, pass `stop(resetDisplayCriteria: false)` to get the same behavior ([#128](https://github.com/superuser404notfound/AetherEngine/pull/128)); the plain `stop()` returns the panel to its default mode, which is what you want when leaving playback for the app UI. Audio-only sessions and suppressed hosts clear a leftover criteria automatically.
 
-**Who owns the audio session:** the engine declares the category at init but deliberately never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (issue [#24](https://github.com/superuser404notfound/AetherEngine/issues/24)). It therefore never releases it either, and on an E-AC-3 / Atmos bitstream-passthrough route the sink can keep looping the last MAT frame after the player is gone. If your app owns the session (no UI sounds, TTS, or `AVAudioEngine` of its own competing with playback), set `engine.deactivatesAudioSessionOnStop = true` and the engine releases the session on a genuine final teardown, meaning `stop()`, never a reload, handoff, or live retune. It is off by default: an app that plays its own audio would otherwise have its session torn out from under it when playback ends.
+**Who owns the audio session:** the engine declares the category at the first load but deliberately never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (issue [#24](https://github.com/superuser404notfound/AetherEngine/issues/24)). It therefore never releases it either, and on an E-AC-3 / Atmos bitstream-passthrough route the sink can keep looping the last MAT frame after the player is gone. If your app owns the session (no UI sounds, TTS, or `AVAudioEngine` of its own competing with playback), set `engine.deactivatesAudioSessionOnStop = true` and the engine releases the session on a genuine final teardown, meaning `stop()`, never a reload, handoff, or live retune. It is off by default: an app that plays its own audio would otherwise have its session torn out from under it when playback ends.
 
 > **Custom chrome with a SwiftUI `Menu`?** On tvOS 26 an open `Menu`'s focused row blinks on any render transaction in the tree. Build the menu button in UIKit (`UIButton.menu` + `showsMenuAsPrimaryAction`) and guard `updateUIView` so the open dropdown never rebuilds. Pattern in [docs/architecture.md › SwiftUI Menu](docs/architecture.md#swiftui-menu-in-custom-player-chrome).
 
@@ -578,6 +584,12 @@ A test rig that only captures stdout / stderr (`devicectl device process launch 
 
 ```swift
 EngineLog.handler = { print($0) }   // every info-level line, verbatim
+```
+
+A log viewer that files lines by subsystem takes the same lines with their category instead of parsing the `[Prefix]` in the text:
+
+```swift
+EngineLog.structuredHandler = { line, category, level in viewer.append(line, from: category.rawValue) }
 ```
 
 The first line of any session names the FFmpeg that answered, because which one does is decided by your executable's link rather than by the package graph:
@@ -624,7 +636,7 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 - **[docs/api.md](docs/api.md)**: every public surface a host consumes, and the contracts that require it to act (how a load ends, `.ended`, the live retune, the audio tap, what must be set before `load`, and which FFmpeg your link hands the engine). A test fails the build when a host-facing public symbol is named nowhere in the docs.
 - **[docs/architecture.md](docs/architecture.md)**: the three playback pipelines, the source-file map, dependencies, the SwiftUI `Menu` pattern.
 - **[docs/formats.md](docs/formats.md)**: codec / container coverage, HDR routing, audio bridging, subtitles, frame extraction, disc playback, live ingest, and known limitations.
-- **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty-one subcommands).
+- **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty-four subcommands).
 - **[CHANGELOG.md](CHANGELOG.md)**: per-release index.
 
 ## Stability and versioning
@@ -632,10 +644,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.33.2")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.52.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.33.2")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.52.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -648,9 +660,47 @@ Pin to `.upToNextMinor(from: "7.33.2")` for stricter teams that prefer to opt in
 | Swift | 6.4 |
 | Xcode | 27.0 |
 
-The Swift and Xcode rows are the toolchain CI builds and tests with (GitHub's `xcode-27` image); older toolchains are not tested. The source needs at least the 26.2 SDK in any case (`VTRegisterSupplementalVideoDecoderIfAvailable` is iOS / tvOS 26.2 API, and an unguarded C symbol has to exist at compile time). The deployment floor above stays iOS / tvOS 18 and macOS 15, with the newer calls behind `#available`.
+The Swift and Xcode rows are the supported toolchain CI builds and tests with (GitHub's
+`xcode-27` image). Older toolchains are not supported; the deployment floor above
+stays iOS / tvOS 18 and macOS 15, with newer calls behind `#available`. A weekly best-effort job
+(`xcode26-compat.yml`, also run before each release) builds the package for tvOS and iOS with
+Xcode 26.3 (Swift 6.2), so a break there is known before a release ships, but it does not block one.
+
+Supplemental AV1/VP9 registration also has a narrow compile-time guard around
+`VTRegisterSupplementalVideoDecoderIfAvailable`, first declared by the mobile SDKs in Xcode 26.2.
+The guard uses Swift 6.2.3 as a proxy for that SDK in stock Xcode bundles. It omits those calls in
+stock Xcode 26.0/26.1 while leaving hardware queries and software fallback intact; it does not
+establish that the rest of the package builds there or lower the supported toolchain above.
+A separately installed newer Swift toolchain paired with an older SDK is not covered by this
+proxy. The existing macOS registration path is unchanged.
+
+**Privacy manifest.** The engine ships a `PrivacyInfo.xcprivacy` in its resource bundle for the required-reason APIs it calls (#920): system boot time (35F9.1, `systemUptime` for elapsed time), disk space (E174.1, checked before packets spool to disk) and file timestamp (C617.1 for its own temp and cache files, 3B52.1 for local media the host opens). The FFmpeg frameworks carry their own from FFmpegBuild 3.10.2 on. Neither tracks or collects anything, so an app embedding the engine has nothing of the engine's to add to its own manifest.
 
 The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that still supports those pins the 6.x line with `.upToNextMajor(from: "6.89.1")`.
+
+### Optional components
+
+Four components are compiled only when a host asks for them, each behind a package trait that is **off by default**:
+
+| Trait | Compiles and links | Without it |
+| --- | --- | --- |
+| `TrueHDObjectAudio` | [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD) and the object renderer | TrueHD Atmos keeps the channel bridge whatever `objectAudioRendering` asks |
+| `DTSXObjectAudio` | the DTS:X decoder (FFmpeg's `dca` with FFmpegBuild's height patch, no extra library) and the object renderer | DTS:X keeps the channel bridge whatever `objectAudioRendering` asks |
+| `DualLayerDolbyVision` | the Profile 7 FEL dual-layer composer (`DualLayerVideoDecoder`, its Metal composer and the per-frame display metadata) | a Profile 7 source keeps the native route whatever `preferDualLayerDolbyVision` asks |
+| `DolbyVisionStillReshaping` | the reshaping that turns a Dolby Vision Profile 5 / AV1 Profile 10.0 frame into a still | such a source has no scrub stills, I-frame stills or held picture (`supportsCacheBackedStills` is false); playback is unaffected |
+
+Without its trait a component is not in the binary: its code is not compiled, and a library behind it is neither linked nor resolved (it drops out of the host's `Package.resolved`). The options that ask for it stay in the API, so a host compiles the same either way; they change nothing, and the session log says why (`TrueHD Atmos rendering requested but not built in (TrueHDObjectAudio trait off)`, `DV P7 dual-layer route: not taken (built without the DualLayerDolbyVision trait)`). A host that wants to hide a setting its build cannot honour asks `AetherEngine.OptionalComponent`, for example `AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn`.
+
+These components may be subject to third-party patent licensing. Integrators who enable them are responsible for their own licensing.
+
+To enable them, list the traits on the package dependency:
+
+```swift
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.52.0",
+         traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
+```
+
+In an Xcode project, a remote package's traits are set in the package dependency editor (Project › Package Dependencies), and Xcode stores them in the `.pbxproj`. XcodeGen cannot express them yet (2.45.4 drops a `traits:` key on a package without a word), so an XcodeGen project either patches the generated `.pbxproj` after each generate (a `traits = ( TrueHDObjectAudio, DTSXObjectAudio, );` list in the package's `XCRemoteSwiftPackageReference`, which Xcode 27 builds with), or depends on a small local package that depends on AetherEngine with the traits set and re-exports it (`@_exported import AetherEngine`). [Probes/AllTraits](Probes/AllTraits/Package.swift) is that package with every trait on, and `Probes/DolbyVisionPulse/Device/PulseEngine` one with `DualLayerDolbyVision` alone. The engine itself builds with them through `swift build --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision,DolbyVisionStillReshaping` (or `--enable-all-traits`); CI builds and tests both the default and the all-traits configuration, and builds the all-traits engine for tvOS and iOS through `Probes/AllTraits`.
 
 ## Support
 
@@ -673,6 +723,10 @@ The exception covers AetherEngine's own code; it does not extend to its dependen
 **FFmpeg** reaches your app through [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) as dynamically linked frameworks under plain LGPL-2.1-or-later (no GPL components), which keeps the relink requirement satisfiable for closed-source App Store apps. See FFmpegBuild's README for the per-component licenses and the concrete adopter steps (embed dynamically, ship the license texts, link the build's source). Its [LICENSES/](https://github.com/superuser404notfound/FFmpegBuild/tree/main/LICENSES) folder is the set to reproduce, one file per component.
 
 **libdovi** reaches your app through [LibDovi](https://github.com/superuser404notfound/LibDovi) as a static library. It is the compiled `dolby_vision` crate from [dovi_tool](https://github.com/quietvoid/dovi_tool), Copyright (c) quietvoid and contributors, dual-licensed MIT OR Apache-2.0 and consumed here under the MIT option. MIT asks for that copyright notice to travel with the binary, and it is quietvoid's notice that belongs on the acknowledgements screen. The MIT text in LibDovi's own `LICENSE` covers the packaging and build scripts only; both parts are in that one file.
+
+**LibTrueHD** ([superuser404notfound/LibTrueHD](https://github.com/superuser404notfound/LibTrueHD)) reaches your app as a static library and decodes TrueHD for `objectAudioRendering`. Its C API, framer and packaging are MIT (Copyright Quick104, who wrote it for Silo as SiloObjectAudio, and Vincent Herbst). It compiles in the `truehd` and `oamd` crates from [truehdd](https://github.com/truehdd/truehdd), Copyright Rainbaby and the truehdd contributors, under the Apache License 2.0, which asks for the license text and LibTrueHD's `NOTICE` to travel with the binary. Apache-2.0 combines with the engine's LGPL-3.0. It comes in only through the `TrueHDObjectAudio` trait, off by default ([Optional components](#optional-components)); with the trait on it is linked whether or not a host turns the option on.
+
+**DTS:X** is decoded by FFmpeg's own `dca` decoder in the FFmpeg frameworks above: FFmpegBuild carries a patch that decodes the height channels of DTS:X's standard presentation (#798), so the `DTSXObjectAudio` trait adds no library and no license of its own. Earlier releases linked LibDTSX instead, whose `dca` crate is a port of FFmpeg's decoder combined with Apache-2.0 code and therefore LGPL-3.0-or-later, which an App Store app cannot meet without an exception.
 
 **SMBClient** ([kishikawakatsumi/SMBClient](https://github.com/kishikawakatsumi/SMBClient), MIT) reaches your app only if you link the `AetherEngineSMB` product. Linking `AetherEngine` alone pulls in none of its symbols, even though SwiftPM still records the package in `Package.resolved`, which describes the resolved graph rather than what the linker kept.
 

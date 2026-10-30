@@ -9,9 +9,13 @@ enum VTCapabilityProbe {
 
     /// True only when AVPlayer's HLS-fMP4 pipeline can HW-decode AV1. Apple's dav1d (macOS 14+/iOS 17+) is reachable via direct file playback but NOT via AVPlayer HLS in practice (verified 2026-05-14 on M1 macOS 26.4): VTIsHardwareDecodeSupported returns false, AVURLAsset.isPlayable returns false. False routes to SoftwarePlaybackHost/dav1d.
     static let av1Available: Bool = {
+        // Swift 6.2.3 is a proxy for the mobile declaration in stock Xcode 26.2 SDKs.
+        // Custom compiler/SDK pairings are not covered; capability queries stay outside.
+        #if os(macOS) || compiler(>=6.2.3)
         if #available(tvOS 26.2, iOS 26.2, macOS 16.0, visionOS 26.2, *) {
             VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
         }
+        #endif
         let supported = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
         EngineLog.emit("[VTProbe] codec=av01 hwSupported=\(supported)", category: .engine)
         return supported
@@ -66,6 +70,13 @@ enum VTCapabilityProbe {
             return fits
         }
         return hardwareDecodeVerdict(codecpar: codecpar).keepsNativeRoute
+    }
+
+    /// Strict form of the gate for routes that need a PROVEN hardware session, such as the dual-layer path:
+    /// `.unclassifiable` is false here, unlike `canHardwareDecode`, because `SoftwarePlaybackHost` would
+    /// hand an unclassifiable stream to libavcodec.
+    static func opensHardwareDecoder(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder
     }
 
     /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and

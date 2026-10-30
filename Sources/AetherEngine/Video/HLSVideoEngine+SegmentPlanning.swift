@@ -69,6 +69,40 @@ extension HLSVideoEngine {
     ///   producer can never finish and AVPlayer waits on forever. The 60 s default leaves room for a
     ///   long final GOP and for a container duration padded by a trailing audio or subtitle track.
     ///
+    /// The cutter's and the restart gate's reach for each boundary of a keyframe-aligned plan:
+    /// `advance` (how far a repaired keyframe can precede its index entry), held below the distance
+    /// to the keyframe before that boundary so that one never reaches it. Per boundary, not one
+    /// figure for the plan: the 23 fps reporting asset keeps its keyframes 15 s apart but has one
+    /// pair four pictures apart, and a plan-wide bound left every other boundary without the reach
+    /// it needed. Empty when nothing moves.
+    static func keyframeReachTicks(advance: Int64, keyframes: [Int64], boundaries: [Int64]) -> [Int64] {
+        guard advance > 0 else { return [] }
+        let sorted = keyframes.sorted()
+        return boundaries.map { boundary in
+            var low = 0, high = sorted.count
+            while low < high {
+                let mid = (low + high) / 2
+                if sorted[mid] < boundary { low = mid + 1 } else { high = mid }
+            }
+            guard low > 0 else { return advance }
+            let (gap, overflow) = boundary.subtractingReportingOverflow(sorted[low - 1])
+            return overflow ? 0 : max(0, min(advance, gap - 1))
+        }
+    }
+
+    /// `collapseShortSegments`, then the reach for each boundary of the plan it leaves. The order is
+    /// the point: a pair of keyframes a few pictures apart is what makes a segment that gets folded,
+    /// and reaches read off the unfolded plan sat one boundary off from that fold on (three folds on
+    /// the 23 fps reporting asset). Off by one, a boundary takes the reach of the one before, which
+    /// can let the earlier keyframe of the pair open it, and hands its own to the next boundary,
+    /// whose keyframe can then miss it.
+    static func finalizedPlan(_ plan: [Segment], minDurationSeconds: Double, keyframeAdvance: Int64,
+                              keyframes: [Int64]) -> (plan: [Segment], reach: [Int64]) {
+        let collapsed = collapseShortSegments(plan, minDurationSeconds: minDurationSeconds)
+        return (collapsed, keyframeReachTicks(advance: keyframeAdvance, keyframes: keyframes,
+                                              boundaries: collapsed.map(\.startPts)))
+    }
+
     /// An index failing any witness is routed to the uniform-stride fallback.
     static func keyframeIndexIsTrustworthy(
         keyframes: [Int64],
@@ -384,6 +418,27 @@ extension HLSVideoEngine {
         return plan
     }
 
+    /// AE#783: the highest source bitrate of any planned segment, from the byte positions the container
+    /// index records at the segment boundaries. Those bytes hold every interleaved track, including the
+    /// ones the session drops, so the figure errs high. Nil unless the positions rise across every
+    /// measurable boundary: two IRAPs in one Matroska Cluster share a position, a disc folds several
+    /// files onto one axis, and either one makes a byte span mean nothing. The final segment has no
+    /// indexed end and is not measured.
+    ///
+    /// Pure for offline testing.
+    static func peakSegmentBitrate(plan: [Segment], keyframeBytePositions: [Int64: Int64]) -> Int64? {
+        guard plan.count > 1 else { return nil }
+        var peak: Double = 0
+        for segment in plan.dropLast() {
+            guard let start = keyframeBytePositions[segment.startPts], start >= 0,
+                  let end = keyframeBytePositions[segment.endPts], end > start,
+                  segment.durationSeconds > 0
+            else { return nil }
+            peak = max(peak, Double(end - start) * 8 / segment.durationSeconds)
+        }
+        return peak > 0 && peak < Double(Int64.max) ? Int64(peak) : nil
+    }
+
     /// Segments shorter than this are folded into a neighbour by `collapseShortSegments`. A keyframe
     /// cluster (several IRAPs within a few frames) otherwise makes `buildKeyframeSegmentPlan` emit
     /// sub-frame segments whose narrow [start,end) window can miss every demuxed keyframe, so the producer
@@ -487,9 +542,7 @@ extension HLSVideoEngine {
         guard Self.configRecordNeedsInBandRebuild(extradata, size: extradataSize) else { return nil }
         let naluLengthSize = 4   // the predicate above already required it
 
-        var vps: [UInt8]?
-        var sps: [UInt8]?
-        var pps: [UInt8]?
+        var sets = VideoConfigRecord.HEVCParameterSets()
         // Counted in VIDEO packets: a film interleaves audio and dozens of subtitle tracks, which
         // would otherwise exhaust the budget before the first video packet.
         let packetBudget = 16
@@ -501,55 +554,19 @@ extension HLSVideoEngine {
             if pkt.pointee.stream_index != videoStreamIndex { return false }
             packetsScanned += 1
             guard let pktData = pkt.pointee.data else { return packetsScanned >= packetBudget }
-            let pktSize = Int(pkt.pointee.size)
-
-            var offset = 0
-            while offset + naluLengthSize <= pktSize {
-                var nalLen = 0
-                for i in 0..<naluLengthSize {
-                    nalLen = (nalLen << 8) | Int(pktData[offset + i])
-                }
-                offset += naluLengthSize
-                if nalLen == 0 || offset + nalLen > pktSize { break }
-                let nalType = (Int(pktData[offset]) >> 1) & 0x3F  // HEVC NAL type: bits 1..6 of byte 0
-                let nalBytes = Array(UnsafeBufferPointer(start: pktData + offset, count: nalLen))
-                switch nalType {
-                case 32: if vps == nil { vps = nalBytes }
-                case 33: if sps == nil { sps = nalBytes }
-                case 34: if pps == nil { pps = nalBytes }
-                default: break
-                }
-                offset += nalLen
-            }
-
-            return (vps != nil && sps != nil && pps != nil) || packetsScanned >= packetBudget
+            sets.collect(from: pktData, size: Int(pkt.pointee.size), naluLengthSize: naluLengthSize)
+            return sets.isComplete || packetsScanned >= packetBudget
         }
 
-        guard let vps, let sps, let pps else {
+        guard let vps = sets.vps, let sps = sets.sps, let pps = sets.pps else {
             EngineLog.emit(
                 "[HLSVideoEngine] in-band parameter-set scan found none: "
-                + "packets=\(packetsScanned) vps=\(vps != nil) sps=\(sps != nil) pps=\(pps != nil)",
+                + "packets=\(packetsScanned) vps=\(sets.vps != nil) sps=\(sets.sps != nil) pps=\(sets.pps != nil)",
                 category: .session
             )
             return nil
         }
-
-        // Assemble hvcC: keep source 22-byte header, set numOfArrays=3, append VPS/SPS/PPS arrays (1-byte type, 2-byte numNalus=1, 2-byte nalUnitLength, NAL bytes).
-        var hvcC: [UInt8] = []
-        hvcC.reserveCapacity(22 + 1 + 5 * 3 + vps.count + sps.count + pps.count)
-        for i in 0..<22 { hvcC.append(extradata[i]) }
-        hvcC.append(3)
-        func appendArray(nalUnitType: UInt8, nal: [UInt8]) {
-            hvcC.append(0x80 | (nalUnitType & 0x3F))
-            hvcC.append(0); hvcC.append(1)
-            let nl = UInt16(nal.count)
-            hvcC.append(UInt8(nl >> 8)); hvcC.append(UInt8(nl & 0xFF))
-            hvcC.append(contentsOf: nal)
-        }
-        appendArray(nalUnitType: 32, nal: vps)
-        appendArray(nalUnitType: 33, nal: sps)
-        appendArray(nalUnitType: 34, nal: pps)
-        return hvcC
+        return VideoConfigRecord.hevcRecord(header: extradata, vps: vps, sps: sps, pps: pps)
     }
 
     /// Shows the packets at the head of the source to `inspect`, which returns true once it has seen
@@ -759,7 +776,15 @@ extension HLSVideoEngine {
     /// the media packets (untouched) and in the muxer's `mdcv`/`clli` boxes, not the hvcC SEI array. DV is
     /// unaffected too: the dvcC/dvvC boxes and RPU live outside the hvcC extradata. Returns nil when the record
     /// already holds only parameter-set arrays (no rewrite needed) or cannot be parsed as an hvcC.
-    static func canonicalizeHEVCConfigRecord(_ extradata: [UInt8]) -> [UInt8]? {
+    ///
+    /// `keepingSEIPayloadTypes` keeps the prefix SEI NAL units whose first payload is one of these types, in an
+    /// SEI array of their own, and still drops every other one. An MV-HEVC session keeps
+    /// `stereoReferenceDisplaysSEIPayloadType`: Apple's writer puts that SEI in the `hvcC`, and without it there
+    /// AVFoundation decodes the base view alone although `lhvC` and every layer-1 slice are there (measured on
+    /// macOS 27: AVPlayerVideoOutput with the stereoscopic preset gets one buffer for both eyes; with the SEI
+    /// back, one per eye; the Vision Pro showed the left eye only).
+    static func canonicalizeHEVCConfigRecord(_ extradata: [UInt8],
+                                             keepingSEIPayloadTypes: Set<Int> = []) -> [UInt8]? {
         guard extradata.count >= 23 else { return nil }
         guard extradata[0] == 1 else { return nil }  // configurationVersion; guards against Annex-B / non-hvcC
         let numOfArrays = Int(extradata[22])
@@ -785,15 +810,45 @@ extension HLSVideoEngine {
         }
 
         let parameterSetTypes: Set<Int> = [32, 33, 34]  // VPS, SPS, PPS
-        let kept = arrays.filter { parameterSetTypes.contains($0.type) }
-        guard kept.count < arrays.count else { return nil }  // nothing to drop: already canonical
+        var kept: [[UInt8]] = arrays.filter { parameterSetTypes.contains($0.type) }.map { Array(extradata[$0.range]) }
+        var keptSEI: [[UInt8]] = []   // whole NAL units (2-byte length dropped)
+        for array in arrays where array.type == 39 && !keepingSEIPayloadTypes.isEmpty {
+            var o = array.range.lowerBound + 3
+            while o + 2 <= array.range.upperBound {
+                let len = (Int(extradata[o]) << 8) | Int(extradata[o + 1])
+                let nal = Array(extradata[(o + 2)..<(o + 2 + len)])
+                if let type = Self.firstSEIPayloadType(nal), keepingSEIPayloadTypes.contains(type) { keptSEI.append(nal) }
+                o += 2 + len
+            }
+        }
+        if !keptSEI.isEmpty {
+            var array: [UInt8] = [0x80 | 39, UInt8(keptSEI.count >> 8), UInt8(keptSEI.count & 0xFF)]  // array_completeness
+            for nal in keptSEI { array += [UInt8(nal.count >> 8), UInt8(nal.count & 0xFF)] + nal }
+            kept.append(array)
+        }
+        let keptBytes = kept.reduce(0) { $0 + $1.count }
+        guard keptBytes < extradata.count - 23 else { return nil }  // nothing to drop: already canonical
 
         var out: [UInt8] = []
-        out.reserveCapacity(23 + kept.reduce(0) { $0 + $1.range.count })
+        out.reserveCapacity(23 + keptBytes)
         out.append(contentsOf: extradata[0..<22])  // header verbatim (profile/tier/level/lengthSize)
         out.append(UInt8(kept.count))               // rewritten numOfArrays
-        for array in kept { out.append(contentsOf: extradata[array.range]) }
+        for array in kept { out.append(contentsOf: array) }
         return out
+    }
+
+    /// SEI payload type 176, three_dimensional_reference_displays_info (H.265 annex G): what Apple's MV-HEVC
+    /// writer puts in the `hvcC` and AVFoundation needs there to decode the second view.
+    static let stereoReferenceDisplaysSEIPayloadType = 176
+
+    /// The first payload type of an SEI NAL unit (2-byte NAL header, then 0xFF-continued payload type), nil if
+    /// it is not one.
+    static func firstSEIPayloadType(_ nal: [UInt8]) -> Int? {
+        guard nal.count >= 3, (Int(nal[0]) >> 1) & 0x3F == 39 || (Int(nal[0]) >> 1) & 0x3F == 40 else { return nil }
+        var type = 0, i = 2
+        while i < nal.count, nal[i] == 0xFF { type += 255; i += 1 }
+        guard i < nal.count else { return nil }
+        return type + Int(nal[i])
     }
 
     /// ADTS AAC from MPEG-TS arrives without an AudioSpecificConfig in `extradata`; the fMP4 `mp4a`/`esds` sample entry can't be written. Synthesizes a 2-byte ASC, installs it, and clears the TS codec_tag the mov muxer rejects. Returns true when applied; caller strips per-frame ADTS headers.

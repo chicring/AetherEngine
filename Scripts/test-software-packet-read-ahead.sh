@@ -11,8 +11,10 @@ trap 'rm -f "$TASK_TMP/check"; rmdir "$TASK_TMP"' EXIT
 xcrun swiftc \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareStoredPacket.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketCoverage.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareAudioPacketCoverage.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareVideoPacketCoverage.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketDiskFIFO.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketStore.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketReadAhead.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Diagnostics/EngineLog.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Diagnostics/LogRedaction.swift" \

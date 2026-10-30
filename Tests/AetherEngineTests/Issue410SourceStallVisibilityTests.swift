@@ -14,8 +14,9 @@ struct Issue410SourceStallVisibilityTests {
 
     /// The refusal these tests stage arms the request-rate pacer's wall-clock quiet ladder, which
     /// added 54 s to `bytes handed back out of memory do not clear the stall` and blocked a reader
-    /// thread throughout. The subject here is stall visibility, so the ladder is pinned away.
-    init() { OriginRequestBudget.shared.quietPeriodCapForTesting = 0 }
+    /// thread throughout. The subject here is stall visibility, so the ladder is pinned away, for the
+    /// lifetime of this suite instance (one test) and not for the rest of the process.
+    private let quietCapPin = OriginRequestBudget.shared.pinQuietPeriodCapForTesting(0)
 
     private final class PhaseLog: @unchecked Sendable {
         private let lock = NSLock()
@@ -36,8 +37,6 @@ struct Issue410SourceStallVisibilityTests {
     @Test("a refusing origin stays visible across the runway and the give-up",
           .timeLimit(.minutes(2)))
     func refusedRefillHoldsTheStallThroughGiveUp() async throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
 
         // 8 MB of runway so the low-water refill is refused while the window still has plenty to serve:
         // the reads after the refusal are exactly the memory serves that used to report delivery.
@@ -50,7 +49,7 @@ struct Issue410SourceStallVisibilityTests {
         defer { server.stop() }
 
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
-                                boundedInitialFetch: firstRange)
+                                boundedInitialFetch: firstRange, backoffScale: 0.02)
         defer { reader.markClosed(); reader.close() }
         let phases = PhaseLog()
         reader.onNetworkPhaseChanged = { phases.append($0) }
@@ -79,8 +78,6 @@ struct Issue410SourceStallVisibilityTests {
     @Test("a transient refusal clears once the origin delivers again",
           .timeLimit(.minutes(2)))
     func transientRefusalClearsOnDelivery() async throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
 
         let firstRange: Int64 = 1024 * 1024
         let refusals = OSAllocatedUnfairLockCounter()
@@ -95,7 +92,7 @@ struct Issue410SourceStallVisibilityTests {
         defer { server.stop() }
 
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
-                                boundedInitialFetch: firstRange)
+                                boundedInitialFetch: firstRange, backoffScale: 0.02)
         defer { reader.markClosed(); reader.close() }
         let phases = PhaseLog()
         reader.onNetworkPhaseChanged = { phases.append($0) }
@@ -125,8 +122,6 @@ struct Issue410SourceStallVisibilityTests {
     @Test("bytes handed back out of memory do not clear the stall",
           .timeLimit(.minutes(2)))
     func memoryServeDoesNotClearTheStall() async throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
 
         let runway: Int64 = 8 * 1024 * 1024
         let serverMaybe = ThrottledOriginServer(
@@ -137,7 +132,7 @@ struct Issue410SourceStallVisibilityTests {
         defer { server.stop() }
 
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
-                                boundedInitialFetch: runway)
+                                boundedInitialFetch: runway, backoffScale: 0.02)
         defer { reader.markClosed(); reader.close() }
         let phases = PhaseLog()
         reader.onNetworkPhaseChanged = { phases.append($0) }

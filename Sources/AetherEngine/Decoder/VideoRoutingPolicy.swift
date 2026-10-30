@@ -12,6 +12,23 @@ enum VideoRoutingPolicy {
         AV_FIELD_TT, AV_FIELD_BB, AV_FIELD_TB, AV_FIELD_BT
     ]
 
+    /// Whether the Profile 7 dual-layer route is both requested and possible, which is everything that
+    /// decides it except the stream's `el_type`. `requiresSoftwarePath` adds the FEL condition; the load
+    /// asks this one first, so the `el_type` probe (a packet scan and a seek) only runs when its answer
+    /// can change the route. A nil `canHardwareDecode` assumes hardware decode.
+    static func dualLayerRouteIsWanted(
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dolbyVisionHandling: DolbyVisionHandling,
+        preferDualLayerDolbyVision: Bool,
+        canHardwareDecode: (() -> Bool)?
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_HEVC, dvProfile == 7,
+              preferDualLayerDolbyVision, DualLayerRouteDecision.isBuiltIn,
+              dolbyVisionHandling == .automatic else { return false }
+        return canHardwareDecode?() ?? true
+    }
+
     /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
     /// Evaluated only for AV1; registering its decoder must not delay unrelated formats.
@@ -33,8 +50,29 @@ enum VideoRoutingPolicy {
         fieldOrder: AVFieldOrder,
         av1Available: @autoclosure () -> Bool,
         spsIndicatesInterlaced: Bool = false,
-        stereo3DType: AVStereo3DType? = nil
+        stereo3DType: AVStereo3DType? = nil,
+        dvProfile: Int? = nil,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        preferDualLayerDolbyVision: Bool = false,
+        canHardwareDecode: (() -> Bool)? = nil,
+        elType: String? = nil
     ) -> Bool {
+        // Profile 7 FEL dual-layer Metal reconstruction routes to the software host pipeline
+        // when preferDualLayerDolbyVision is enabled, dolbyVisionHandling is .automatic, and hardware decode is confirmed (or assumed true if closure
+        // not provided).
+        // Only elType == "FEL" routes to software; MEL, nil, or unknown stay native
+        // (the 8.1 conversion where the display takes Dolby Vision, the HDR10 base layer where it does
+        // not; the conversion is lossless only for MEL).
+        // If dolbyVisionHandling is .baseLayerOnly, it also stays native (HDR10 base layer).
+        if codecID == AV_CODEC_ID_HEVC, dvProfile == 7 {
+            return elType == "FEL" && dualLayerRouteIsWanted(
+                codecID: codecID,
+                dvProfile: dvProfile,
+                dolbyVisionHandling: dolbyVisionHandling,
+                preferDualLayerDolbyVision: preferDualLayerDolbyVision,
+                canHardwareDecode: canHardwareDecode
+            )
+        }
         switch codecID {
         case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
             return false
@@ -87,6 +125,42 @@ enum VideoRoutingPolicy {
         guard codecID == AV_CODEC_ID_H264 else { return false }
         if interlacedFieldOrders.contains(fieldOrder) { return true }
         return fieldOrder == AV_FIELD_UNKNOWN && spsIndicatesInterlaced
+    }
+
+    /// Hardware deinterlace setup is unrelated to progressive software codecs such as VP8/VP9/AV1.
+    /// Start that relatively expensive Metal/VideoToolbox warm-up only when probe metadata says the
+    /// source can actually enter the deinterlacer.
+    static func requiresDeinterlaceWarmup(
+        codecID: AVCodecID,
+        fieldOrder: AVFieldOrder,
+        spsIndicatesInterlaced: Bool = false
+    ) -> Bool {
+        // The decoder can deinterlace any codec whose frames carry the interlaced flag.
+        // Concrete probe evidence also covers DV, MPEG-1, H.263 and interlaced ProRes.
+        // A progressive declaration skips speculative work. If later mixed-cadence frames are
+        // interlaced, DeinterlaceFilter still builds its graph on demand at that first frame.
+        if interlacedFieldOrders.contains(fieldOrder) { return true }
+        switch codecID {
+        case AV_CODEC_ID_H264:
+            return fieldOrder == AV_FIELD_UNKNOWN && spsIndicatesInterlaced
+        case AV_CODEC_ID_MPEG4, AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1:
+            // Shallow/live probes often leave legacy codecs UNKNOWN even though decoded frames later
+            // carry AV_FRAME_FLAG_INTERLACED. Warm conservatively for those codecs so the first such
+            // frame does not have to build the Metal/VideoToolbox graph inline.
+            return fieldOrder != AV_FIELD_PROGRESSIVE
+        default:
+            return false
+        }
+    }
+
+    /// The same SPS tie-breaker for the initial probe and a reopened disc title. A concrete field
+    /// order wins; no borrowed codec-parameter storage escapes this synchronous classification.
+    static func spsIndicatesInterlaced(codecParameters: UnsafePointer<AVCodecParameters>) -> Bool {
+        let parameters = codecParameters.pointee
+        guard parameters.codec_id == AV_CODEC_ID_H264, parameters.field_order == AV_FIELD_UNKNOWN,
+              let extradata = parameters.extradata, parameters.extradata_size > 0 else { return false }
+        let bytes = Array(UnsafeBufferPointer(start: extradata, count: Int(parameters.extradata_size)))
+        return spsIndicatesInterlaced(extradata: bytes)
     }
 
     /// #150: pure extradata classifier feeding `spsIndicatesInterlaced`. Accepts Annex-B (MPEG-TS) and

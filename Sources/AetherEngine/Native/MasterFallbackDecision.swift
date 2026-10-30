@@ -42,9 +42,30 @@ enum MasterFallbackDecision {
     ///
     /// AE#667: nor while a display mode switch is in progress. AVPlayer answers for the mode the panel is
     /// in at that moment, which mid-switch is the one it is leaving, so the refusal is about the moment.
-    static func shouldLatchPanelRefusal(code: Int, displayEligibleForHDRNow: Bool,
-                                        displaySwitchInProgress: Bool) -> Bool {
-        isDisplayRejectionCode(code) && displayEligibleForHDRNow && !displaySwitchInProgress
+    ///
+    /// AE#535 (2026-10-11): nor when the refused master advertised `VIDEO-RANGE=SDR`. A refusal of an SDR
+    /// master says nothing about HDR presentation, yet it latched the HDR route for every later title
+    /// (cmcpherson274, two SDR titles' -11848 refusals at 7.15.1 and 7.17.1).
+    ///
+    /// AE#849: nor on a panel that engages HDR on demand (iOS, macOS). The latch only ever moves the
+    /// panel answer, and the routing there reads the display's eligibility instead, so it changed nothing
+    /// but a log line claiming every later HDR title went media-direct. Nor is the refusal a fact about
+    /// such a panel: an eligible built-in panel takes the master however it is presenting (measured on a
+    /// MacBook Air M1 SDR panel: a P8.1 master with and without SUPPLEMENTAL-CODECS, a High-tier 3832x1600
+    /// PQ master and an audio switch to AC-3 on both, none refused), so a refusal there is about the
+    /// master, and latching it would take the master from later titles it would have served.
+    ///
+    /// AE#887: nor while the host asserts the panel presents HDR. The assertion short-circuits the route
+    /// (`sessionRoutesAsHDRPanel`), so the latch would change no routing and would only forget the panel
+    /// proof and log that later titles go media-direct, which they do not. Measured on an Apple TV 4K
+    /// (tvOS 27, output 4K HDR, headroom 1.20): a live PQ master refused with -11868 / -17223 in HDR
+    /// exactly as in SDR, so that refusal was about the stream, not the panel.
+    static func shouldLatchPanelRefusal(code: Int, servedMasterIsHDR: Bool, displayEligibleForHDRNow: Bool,
+                                        displaySwitchInProgress: Bool,
+                                        panelEngagesHDROnDemand: Bool = false,
+                                        hostAssertsPanelHDR: Bool = false) -> Bool {
+        isDisplayRejectionCode(code) && servedMasterIsHDR && displayEligibleForHDRNow && !displaySwitchInProgress
+            && !panelEngagesHDROnDemand && !hostAssertsPanelHDR
     }
 
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair
@@ -58,11 +79,54 @@ enum MasterFallbackDecision {
         isDisplayRejectionCode(code) || code == -1002
     }
 
+    /// A malformed media playlist can be wrapped in the same -11848 as a display refusal.
+    /// It says nothing about HDR support and must not poison the process's display decision.
+    ///
+    /// AE#682: an HDR master with an SDR motion JPEG I-frame rendition has one variant left when AVPlayer
+    /// refuses the HDR one, and AVPlayer would play the stills as the video. The server therefore
+    /// withholds the I-frame playlist until a media segment is asked for, and the refused item fails
+    /// with the 404's NSURLErrorDomain -1100. With `iFramePlaylistWithheld` that is the -11848 refusal
+    /// it stands in for.
+    static func isMasterRejection(_ error: NSError, mediaErrorCodes: [Int] = [],
+                                  iFramePlaylistWithheld: Bool = false) -> Bool {
+        if iFramePlaylistWithheld, isWithheldIFramePlaylistFailure(error) { return true }
+        guard !mediaErrorCodes.contains(-12642) else { return false }
+        var current: NSError? = error
+        for _ in 0..<8 {
+            guard let value = current else { break }
+            if value.domain == "CoreMediaErrorDomain", value.code == -12642 { return false }
+            current = value.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return isMasterRejectionCode(error.code)
+    }
+
+    static func isWithheldIFramePlaylistFailure(_ error: NSError) -> Bool {
+        error.domain == NSURLErrorDomain && error.code == NSURLErrorFileDoesNotExist
+    }
+
+    /// The code the fallback acts on: the item's own, or for a withheld I-frame playlist the display
+    /// refusal the 404 stands in for.
+    static func rejectionCode(for error: NSError, iFramePlaylistWithheld: Bool) -> Int {
+        iFramePlaylistWithheld && isWithheldIFramePlaylistFailure(error) ? -11848 : error.code
+    }
+
     /// Fall back to the media playlist only when a master-rejection failed the item, the engine was
     /// serving the master, and this session has not already fallen back (single-shot, no loop).
     static func shouldFallBackToMediaPlaylist(
         errorCode: Int, servingMasterPlaylist: Bool, alreadyFellBack: Bool
     ) -> Bool {
         isMasterRejectionCode(errorCode) && servingMasterPlaylist && !alreadyFellBack
+    }
+
+    /// AE#849: whether an audio switch rebuilds onto the media playlist its session already fell back to.
+    ///
+    /// The switch changes the audio and nothing the display was asked about, so a display that refused
+    /// this session's HDR master refuses the rebuilt one too and the rebuild pays the same rejection and
+    /// fallback again. Only a display refusal of an HDR master carries: a `-1002` parse failure is about
+    /// the playlist, which the switch rewrites, and an SDR refusal is about the window (#535).
+    static func audioSwitchKeepsMediaRoute(
+        outgoingServingMaster: Bool, outgoingMasterRefusedByDisplay: Bool
+    ) -> Bool {
+        !outgoingServingMaster && outgoingMasterRefusedByDisplay
     }
 }

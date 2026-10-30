@@ -82,10 +82,28 @@ struct DemuxerOpenProfile: Sendable {
     /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.
     var readerLabel: String = "pump"
     var sourceOpenPolicy: SourceOpenPolicy = .init()
+    /// Captured by the load before detached opens; retained by each fresh session reader.
+    var diagnosticContext: SourceNetworkDiagnostics.Context? = nil
+    /// AE#792: the session's live header set. A reader opened with one reads its headers from it per
+    /// request instead of keeping the `extraHeaders` it was opened with, so a session-scoped open (the
+    /// playback demuxer, the producer's reopens) follows `updateRequestHeaders(_:)`. Nil everywhere else.
+    var requestHeaders: RequestHeaderStore? = nil
 
     func withSourceOpenPolicy(_ policy: SourceOpenPolicy) -> DemuxerOpenProfile {
         var copy = self
         copy.sourceOpenPolicy = policy
+        return copy
+    }
+
+    func withDiagnosticContext(_ context: SourceNetworkDiagnostics.Context?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.diagnosticContext = context
+        return copy
+    }
+
+    func withRequestHeaders(_ store: RequestHeaderStore?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.requestHeaders = store
         return copy
     }
 
@@ -249,6 +267,10 @@ public final class Demuxer: @unchecked Sendable {
     /// own (never `accessLock`, which `av_read_frame` holds for a whole network read) makes that
     /// load a retained snapshot instead of a race.
     private let providerLock = NSLock()
+    /// AE#818: the URL error the source reader last recorded when the open gave up. Diagnostic data
+    /// for a live start's give-up to name as its cause; nil when the open succeeded, failed for
+    /// another reason, or the source is not an HTTP reader.
+    private(set) var openTransportFailureCode: Int?
     private var _avioProvider: AVIOProvider?
     private var avioProvider: AVIOProvider? {
         get {
@@ -267,6 +289,10 @@ public final class Demuxer: @unchecked Sendable {
     /// `ConcatIOReader.close()` is a no-op and the bridge does not own its reader, so this is the only
     /// owner left to end the reader's `URLSession`. Guarded by `providerLock`.
     private var _ownedSourceReader: IOReader?
+    /// AE#859: the DASH open in flight, so `markClosed()` reaches its manifest fetch and the
+    /// representation readers it has opened before any of them belongs to a provider. Guarded by
+    /// `providerLock`.
+    private var pendingDASHOpener: DASHSourceOpener?
 
     private func adoptOwnedSourceReader(_ reader: IOReader) {
         providerLock.lock()
@@ -289,8 +315,10 @@ public final class Demuxer: @unchecked Sendable {
     private func cancelOwnedSourceReader() {
         providerLock.lock()
         let reader = _ownedSourceReader
+        let dash = pendingDASHOpener
         providerLock.unlock()
         reader?.cancel()
+        dash?.cancel()
     }
 
     /// Audit HLS-2: `markClosed()` before the provider exists used to be a no-op, so a teardown
@@ -353,6 +381,11 @@ public final class Demuxer: @unchecked Sendable {
     /// #407: video streams whose PTS `+genpts` invented out of decode order, because the container
     /// carries none of its own. Cleared on the way out of `readPacketLocked` so the decoder's reorder
     /// owns the presentation axis. Decided once at open, see `armGeneratedPTSSuppression`.
+    private var aviMPEG4CacheTimingStreams: Set<Int32> = []
+    func usesAVIMPEG4CacheTiming(at index: Int32) -> Bool {
+        streamTableLock.lock(); defer { streamTableLock.unlock() }
+        return aviMPEG4CacheTimingStreams.contains(index)
+    }
     private var generatedPTSStreams: Set<Int32> = []
 
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
@@ -374,6 +407,10 @@ public final class Demuxer: @unchecked Sendable {
 
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
+
+    /// True when the source is a UHD Blu-ray clip whose Dolby Vision RPUs are folded in from the enhancement-layer
+    /// PID (`BluRayDolbyVisionLayers`): the video packets carry the RPU but not the enhancement layer itself.
+    private(set) var foldsBluRayDolbyVisionLayers = false
 
     /// True when libavformat opened the source itself, which it does only for a local path
     /// (`openLocal`). Every network, disc and custom source is read through an `AVIOProvider`.
@@ -477,6 +514,14 @@ public final class Demuxer: @unchecked Sendable {
     /// #651: one assembler per stream `declareDiscSubpictureStreams` created, keyed by stream index.
     /// Those streams have no libavformat parser, so their fragments are joined here. Under `accessLock`.
     private var subpictureAssemblers: [Int32: DVDSubpictureAssembler] = [:]
+    /// A UHD Blu-ray clip's two Dolby Vision layers, folded into one Profile 7 stream as they are read
+    /// (`BluRayDolbyVisionLayers`); nil for every other source.
+    private var doviLayers: BluRayDolbyVisionLayers?
+    /// Base-layer packets waiting for the enhancement-layer unit with their PTS, and RPUs that came before their
+    /// picture. The enhancement unit usually follows its base unit, sometimes a picture or two later.
+    private var doviPairing = DolbyVisionLayerPairing<UnsafeMutablePointer<AVPacket>>()
+    /// Base-layer pictures that went out without an RPU (no matching enhancement unit), for the log.
+    private var doviUnpairedBase = 0
 
     /// Per-clip presentation-offset spans for a selected multi-clip Blu-ray title (empty otherwise). When
     /// non-empty, `readPacket` and `indexedKeyframes` fold each clip's timestamps onto one contiguous
@@ -489,6 +534,9 @@ public final class Demuxer: @unchecked Sendable {
     /// A clip's observed base is only trusted on a clean forward crossing (`idx == lastReadClipIdx + 1`),
     /// so a seek landing mid-clip cannot mis-anchor that clip's fold offset. AE#105.
     private var lastReadClipIdx: Int = -1
+    /// The selected Blu-ray title's EP-map seek table, when every clip has one: a seek then goes to the
+    /// keyframe's byte instead of searching by timestamp (`seekByDiscTableLocked`). Under `accessLock`.
+    private var discSeekTable: DiscSeekTable?
     /// Observed raw STC base (seconds) of clip 0's first read packet. The fold anchors every clip to this so
     /// the folded timeline stays in clip 0's raw domain (the producer gate then zero-bases it). NaN until the
     /// first packet is read. Guarded by `accessLock`. AE#105.
@@ -497,6 +545,11 @@ public final class Demuxer: @unchecked Sendable {
     /// the first time it is read and cached (stable across seeks). NaN = not yet resolved. Guarded by
     /// `accessLock`. AE#105.
     private var clipResolvedShiftSec: [Double] = []
+    /// The selected DVD title is folded by cell (`DiscReader.dvdCellTimeline`): each cell's timestamp base
+    /// comes from its navigation packs (`adoptDVDNav`). Under `accessLock`.
+    private var dvdCellFold = false
+    /// The selected DVD title's time map: a seek goes to the VOBU's byte (`seekByDVDTimeMapLocked`).
+    private var dvdTimeMap: DVDTimeMap?
     /// AE#105 diag: last clip index we logged a boundary crossing for, and the last folded PTS
     /// (seconds) seen, so a crossing can print the true raw jump against the applied offset.
     private var diagLastLoggedClipIndex: Int = -1
@@ -508,6 +561,9 @@ public final class Demuxer: @unchecked Sendable {
         discStreamLanguages = info.selectedTitle?.streamLanguages ?? [:]
         discSubpictureStreamIDs = info.selectedTitle?.dvdSubpictureStreamIDs
         clipTimeline = info.clipTimeline
+        discSeekTable = info.seekTable
+        dvdTimeMap = info.dvdTimeMap
+        dvdCellFold = info.formatHint == "mpeg" && !info.clipTimeline.isEmpty
         lastClipIndex = 0
         lastReadClipIdx = -1
         clipBase0Sec = .nan
@@ -642,7 +698,7 @@ public final class Demuxer: @unchecked Sendable {
         self.openProfile = profile
         beginOpenTiming()
         self.auditSource = isLive ? nil : (url, extraHeaders)
-        let isHTTP = url.scheme == "http" || url.scheme == "https"
+        let isHTTP = ["http", "https"].contains(url.scheme?.lowercased() ?? "")
 
         if isHTTP {
             try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive, selectTitleID: selectTitleID)
@@ -689,6 +745,7 @@ public final class Demuxer: @unchecked Sendable {
         refreshStreamTableLocked()
         accessLock.unlock()
         reportOpenStage(.streamsProbed)
+        promoteAlternativeTransferHLG()
     }
 
     /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
@@ -714,10 +771,12 @@ public final class Demuxer: @unchecked Sendable {
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
     }
 
-    /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension. Gates the HTTP disc-adapter
+    /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension, or an extensionless URL this
+    /// process already recognized as one from its `Content-Type` or volume signature (AE#860). Gates the HTTP disc-adapter
     /// path so a normal media URL keeps the optimized streaming AVIOReader open with no probe cost.
     static func isDiscImageURL(_ url: URL) -> Bool {
         ["iso", "img", "udf"].contains(url.pathExtension.lowercased())
+            || DiscImageMediaType.isKnownDiscImage(url)
     }
 
     private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false, selectTitleID: Int? = nil) throws {
@@ -725,40 +784,80 @@ public final class Demuxer: @unchecked Sendable {
         // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
         // the source is not a recognizable disc, fall through to the streaming reader.
-        if !isLive, Self.isDiscImageURL(url) {
-            let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
-            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
-                adoptOwnedSourceReader(discReader)
-                if isCloseRequested {
-                    releaseOwnedSourceReader()
-                    throw DemuxerError.openFailed(code: -1)
-                }
-                let discInfo: DiscInfo?
+        if !isLive, Self.isDASHManifestURL(url) {
+            try openDASH(manifestURL: url, extraHeaders: extraHeaders)
+            return
+        }
+        let triedDisc = !isLive && Self.isDiscImageURL(url)
+        if triedDisc {
+            if try openHTTPDiscImage(url: url, extraHeaders: extraHeaders, selectTitleID: selectTitleID) { return }
+            DiscImageMediaType.forgetDiscImage(url)
+        }
+        do {
+            try openHTTPStream(url: url, extraHeaders: extraHeaders, isLive: isLive,
+                               routesDiscMediaType: !isLive && !triedDisc)
+        } catch AVIOReaderError.discImageMediaType {
+            // AE#860: an extensionless URL whose opening response declared a disc image, or served
+            // `application/octet-stream` over a volume signature at sector 16. Either is only a hint;
+            // the disc readers confirm it, and a body that is no disc streams as before.
+            EngineLog.emit("[Demuxer] AE#860: the source declared a disc image type or carries a volume signature; trying the disc adapter", category: .demux)
+            // A hint is no promise of a filesystem: a structure that does not parse falls back the
+            // same way as none at all, where an `.iso` URL reports it.
+            let openedDisc: Bool
+            do {
+                openedDisc = try openHTTPDiscImage(url: url, extraHeaders: extraHeaders, selectTitleID: selectTitleID)
+            } catch let error as DiscError {
+                EngineLog.emit("[Demuxer] AE#860: \(error) behind the hint", category: .demux)
+                openedDisc = false
+            }
+            if openedDisc {
+                DiscImageMediaType.noteDiscImage(url)
+                return
+            }
+            EngineLog.emit("[Demuxer] AE#860: no disc structure behind the hint; opening it as ordinary media", category: .demux)
+            try openHTTPStream(url: url, extraHeaders: extraHeaders, isLive: isLive, routesDiscMediaType: false)
+        }
+    }
+
+    /// Opens `url` through the disc adapter. False when the source is unreachable or is not a
+    /// recognizable disc, in which case any warm is back in the store for the streaming reader.
+    private func openHTTPDiscImage(url: URL, extraHeaders: [String: String], selectTitleID: Int?) throws -> Bool {
+        let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
+        if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
+            adoptOwnedSourceReader(discReader)
+            if isCloseRequested {
+                releaseOwnedSourceReader()
+                throw DemuxerError.openFailed(code: -1)
+            }
+            let discInfo: DiscInfo?
+            do {
+                discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString)
+            } catch {
+                releaseOwnedSourceReader()
+                if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+                throw error
+            }
+            if let discInfo {
+                adoptDiscInfo(discInfo)
+                auditSource = nil
+                let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+                let inputFormat = av_find_input_format(discInfo.formatHint)
                 do {
-                    discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString)
+                    try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
                 } catch {
                     releaseOwnedSourceReader()
-                    if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
                     throw error
                 }
-                if let discInfo {
-                    adoptDiscInfo(discInfo)
-                    auditSource = nil
-                    let bridge = CustomIOReaderBridge(reader: discInfo.reader)
-                    let inputFormat = av_find_input_format(discInfo.formatHint)
-                    do {
-                        try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
-                    } catch {
-                        releaseOwnedSourceReader()
-                        throw error
-                    }
-                    return
-                }
-                releaseOwnedSourceReader()
+                return true
             }
-            // Not a disc: hand the warm back so the streaming reader below adopts it (#647).
-            if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+            releaseOwnedSourceReader()
         }
+        // Not a disc: hand the warm back so the streaming reader adopts it (#647).
+        if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+        return false
+    }
+
+    private func openHTTPStream(url: URL, extraHeaders: [String: String], isLive: Bool, routesDiscMediaType: Bool) throws {
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
@@ -771,11 +870,55 @@ public final class Demuxer: @unchecked Sendable {
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly,
             heldConnection: openProfile.avioHeldConnection,
-            sourceOpenPolicy: openProfile.sourceOpenPolicy
+            sourceOpenPolicy: openProfile.sourceOpenPolicy,
+            requestHeaderStore: openProfile.requestHeaders,
+            diagnosticContext: openProfile.diagnosticContext,
+            routesDiscMediaType: routesDiscMediaType
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
-        try openWithProvider(reader, isLive: isLive)
+        do {
+            try openWithProvider(reader, isLive: isLive)
+        } catch AVIOReaderError.dashManifest {
+            try openDASH(manifestURL: url, extraHeaders: extraHeaders)
+        }
+    }
+
+    /// AE#859: an MPEG-DASH manifest by URL extension, opened as DASH without a first look at the body.
+    static func isDASHManifestURL(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == "mpd"
+    }
+
+    /// AE#859: opens an on-demand DASH manifest as the fragmented MP4 `DASHSourceOpener` lays it out.
+    /// The reader is engine-owned the way the remote disc reader is: the bridge does not own it, so it
+    /// is adopted here and closed with the demuxer.
+    private func openDASH(manifestURL url: URL, extraHeaders: [String: String]) throws {
+        let opener = DASHSourceOpener(manifestURL: url, headers: extraHeaders,
+                                      requestTimeout: max(openProfile.avioRequestTimeout, 10))
+        providerLock.lock()
+        pendingDASHOpener = opener
+        providerLock.unlock()
+        defer {
+            providerLock.lock()
+            pendingDASHOpener = nil
+            providerLock.unlock()
+        }
+        if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
+        let reader = try opener.open()
+        adoptOwnedSourceReader(reader)
+        if isCloseRequested {
+            releaseOwnedSourceReader()
+            throw DemuxerError.openFailed(code: -1)
+        }
+        // The Dolby Vision record audit re-reads the source URL as a media file, which an MPD is not.
+        auditSource = nil
+        let bridge = CustomIOReaderBridge(reader: reader)
+        do {
+            try openWithProvider(bridge, inputFormat: av_find_input_format("mp4"), isLive: false)
+        } catch {
+            releaseOwnedSourceReader()
+            throw error
+        }
     }
 
     /// A provider that connected (or tried to) for an open that is not going to finish.
@@ -805,6 +948,7 @@ public final class Demuxer: @unchecked Sendable {
         do {
             try provider.open()
         } catch {
+            openTransportFailureCode = (provider as? AVIOReader)?.lastTransportFailureCode
             abandonProvider(provider)
             throw error
         }
@@ -884,6 +1028,7 @@ public final class Demuxer: @unchecked Sendable {
         av_dict_free(&opts)
         guard ret == 0 else {
             formatContext = nil
+            openTransportFailureCode = (avioProvider as? AVIOReader)?.lastTransportFailureCode
             avioProvider?.close()
             avioProvider = nil
             throw DemuxerError.openFailed(code: ret)
@@ -901,6 +1046,7 @@ public final class Demuxer: @unchecked Sendable {
         // the cold-start state that only exists to serve them. Deliberately after probeStreams:
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
         avioProvider?.markOpenPhaseFinished()
+        promoteAlternativeTransferHLG()
     }
 
     /// AE#585: bracket the host's bounded index pass (the cue prewarm and the cursor reset that
@@ -910,6 +1056,10 @@ public final class Demuxer: @unchecked Sendable {
 
     /// AE#585: ends the bracket above. Safe to call without a matching `beginIndexPass`.
     func endIndexPass() { avioProvider?.endIndexPass() }
+
+    /// AE#782: a producer restart just seeked here, so the reader anchors its connection at the next
+    /// read it cannot serve from memory instead of detouring.
+    func notePlaybackRepositioned() { avioProvider?.notePlaybackRepositioned() }
 
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
     /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
@@ -1036,13 +1186,21 @@ public final class Demuxer: @unchecked Sendable {
         reclassifyAttachedPictures(ctx)
         boundProbeForDeclaredDiscTitle(ctx)
         let parked = parkUnresolvableAudio(ctx)
+        let parkedPGS = parkPGSSubtitles(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
         unparkUnresolvableAudio(ctx, parked)
+        unparkPGSSubtitles(ctx, parkedPGS)
         guard findRet >= 0 else {
             emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
         logStreams(ctx)
+        armBluRayDolbyVisionLayers(ctx)
+        // A cell-folded DVD title is anchored on cell 0's base, which is where the stream starts (the
+        // engine's source axis starts there too), so a resume that lands in a later cell can fold at once.
+        if dvdCellFold, clipBase0Sec.isNaN, ctx.pointee.start_time != Int64.min {
+            clipBase0Sec = Double(ctx.pointee.start_time) / Double(AV_TIME_BASE)
+        }
         armGeneratedPTSSuppression(ctx)
         if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
             let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
@@ -1130,12 +1288,112 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// Whether `find_stream_info` would chase this stream for a parameter playback never reads. (#858)
+    ///
+    /// `has_codec_parameters` fails a PGS stream until it knows a width, and only a decoded
+    /// presentation composition segment carries one. PGS is sparse (the first cue of a film can sit
+    /// minutes in), so a single such track holds the probe to its whole byte ceiling: 50 MiB and
+    /// ~14 s on the reported remote Matroska source with four of them. Nothing downstream needs that
+    /// width from the probe: `EmbeddedSubtitleDecoder` takes the canvas from the PCS it decodes and
+    /// falls back to the video size, the same footing the subtitle side reader has stood on since
+    /// it stopped probing at all (#87). The codec must already be known; `AV_CODEC_ID_NONE` is a
+    /// stream still being identified.
+    static func subtitleNeedsNoProbe(codecID: AVCodecID, codecType: AVMediaType) -> Bool {
+        codecType == AVMEDIA_TYPE_SUBTITLE && codecID == AV_CODEC_ID_HDMV_PGS_SUBTITLE
+    }
+
+    /// Park PGS tracks as ATTACHMENT for the duration of the probe, the lever `parkUnresolvableAudio`
+    /// uses, so the pass stops once audio and video are known. The restore follows the probe because
+    /// `find_stream_info` writes its context back over `codecpar`; the caller sees the same track it
+    /// would have after a full-budget probe that never met a cue, width 0. (#858)
+    private func parkPGSSubtitles(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int] {
+        var parked: [Int] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let codecpar = ctx.pointee.streams[i]?.pointee.codecpar,
+                  Self.subtitleNeedsNoProbe(codecID: codecpar.pointee.codec_id,
+                                            codecType: codecpar.pointee.codec_type)
+            else { continue }
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
+            parked.append(i)
+        }
+        return parked
+    }
+
+    private func unparkPGSSubtitles(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
+        for i in parked where i < Int(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
+        }
+    }
+
+    /// A UHD Blu-ray clip with its Dolby Vision enhancement layer on PID 0x1015: the base layer is declared
+    /// Profile 7 and `readPacketLocked` hands it out with each picture's RPU appended (`BluRayDolbyVisionLayers`).
+    private func armBluRayDolbyVisionLayers(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        dropHeldDolbyVisionBaseLocked()
+        doviLayers = BluRayDolbyVisionLayers.detect(ctx)
+        foldsBluRayDolbyVisionLayers = doviLayers != nil
+        guard let layers = doviLayers, let base = ctx.pointee.streams[Int(layers.base)] else { return }
+        let declared = BluRayDolbyVisionLayers.declareProfile7(base)
+        EngineLog.emit(
+            "[Demuxer] Blu-ray Dolby Vision: base layer stream=\(layers.base) (PID 0x1011), enhancement layer "
+            + "stream=\(layers.enhancement) (PID 0x1015); RPUs folded into the base layer, "
+            + (declared ? "declared Profile 7" : "record already present"),
+            category: .demux
+        )
+    }
+
+    /// Frees the base-layer packets still waiting for their enhancement units (a seek, a reopen, close).
+    private func dropHeldDolbyVisionBaseLocked() {
+        for held in doviPairing.drain() {
+            var packet: UnsafeMutablePointer<AVPacket>? = held
+            trackedPacketFree(&packet)
+        }
+    }
+
+    /// The oldest waiting base-layer packet, once its RPU is in, or once too many wait behind it (it goes without
+    /// one), or at the end of the source; nil while it may still be completed.
+    private func releaseDolbyVisionBaseLocked(atEnd: Bool = false) -> UnsafeMutablePointer<AVPacket>? {
+        guard let out = doviPairing.release(atEnd: atEnd) else { return nil }
+        if !out.paired { noteUnpairedBase() }
+        return out.unit
+    }
+
+    /// One packet through the Blu-ray Dolby Vision fold. A base-layer packet waits in `doviPairing` until the
+    /// enhancement unit with its PTS brings the RPU (appended to it); an enhancement unit that comes first leaves its
+    /// RPU there for it. Enhancement packets never leave the demuxer. Returns the packet to hand out (other
+    /// streams pass straight through, a step or two ahead of the picture being completed), nil to read on.
+    private func foldDolbyVisionLayersLocked(_ read: UnsafeMutablePointer<AVPacket>,
+                                             _ layers: BluRayDolbyVisionLayers) -> UnsafeMutablePointer<AVPacket>? {
+        switch read.pointee.stream_index {
+        case layers.enhancement:
+            var packet: UnsafeMutablePointer<AVPacket>? = read
+            defer { trackedPacketFree(&packet) }
+            guard let rpu = BluRayDolbyVisionLayers.rpu(inAnnexB: UnsafeRawBufferPointer(
+                start: read.pointee.data, count: Int(max(0, read.pointee.size)))) else { return nil }
+            doviPairing.addRPU(rpu, pts: read.pointee.pts) { BluRayDolbyVisionLayers.append($1, to: $0) }
+            return nil
+        case layers.base:
+            doviPairing.addBase(read, pts: read.pointee.pts) { BluRayDolbyVisionLayers.append($1, to: $0) }
+            return nil
+        default:
+            return read
+        }
+    }
+
+    private func noteUnpairedBase() {
+        doviUnpairedBase += 1
+        if doviUnpairedBase == 1 || doviUnpairedBase % 500 == 0 {
+            EngineLog.emit("[Demuxer] Blu-ray Dolby Vision: \(doviUnpairedBase) base-layer picture(s) without an RPU "
+                           + "(no enhancement unit with their PTS)", category: .demux)
+        }
+    }
+
     /// #407: find the video streams whose PTS `+genpts` is inventing out of decode order, so
     /// `readPacketLocked` can clear it and leave the axis to the decoder's own reorder. Needs the
     /// stream parameters `avformat_find_stream_info` fills in, hence the call site right below it.
     /// See `VFWDecodeOrderPTSRepair` for why the gate is an equivalence rather than a heuristic.
     private func armGeneratedPTSSuppression(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         generatedPTSStreams.removeAll()
+        streamTableLock.lock(); aviMPEG4CacheTimingStreams.removeAll(); streamTableLock.unlock()
         guard let nameC = ctx.pointee.iformat?.pointee.name else { return }
         let formatName = String(cString: nameC)
         guard VFWDecodeOrderPTSRepair.containerWithholdsPTS(formatName) else { return }
@@ -1151,6 +1409,9 @@ public final class Demuxer: @unchecked Sendable {
             guard VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(formatName: formatName, shape: shape)
             else { continue }
             generatedPTSStreams.insert(index)
+            if formatName.split(separator: ",").contains("avi"), shape.codecID == AV_CODEC_ID_MPEG4 {
+                streamTableLock.lock(); aviMPEG4CacheTimingStreams.insert(index); streamTableLock.unlock()
+            }
             EngineLog.emit(
                 "[Demuxer] AE#407 stream=\(index) in \(formatName) is FourCC-carried "
                 + "(tag=\(fourCC(par.pointee.codec_tag)) "
@@ -1168,6 +1429,53 @@ public final class Demuxer: @unchecked Sendable {
         return text.allSatisfy { $0.isASCII && !$0.isNewline && $0 != "\0" }
             ? text
             : String(format: "0x%08X", tag)
+    }
+
+    /// AE#839: video packets read for the alternative-transfer SEI before the declared transfer is
+    /// believed. Broadcast HLG repeats it on every IRAP and the first packet is one, so a handful is
+    /// generous, and at the head of a container they are packets `find_stream_info` already queued.
+    static let alternativeTransferVideoPacketBudget = 8
+    /// The same scan's cap on packets of any stream, so interleaved audio cannot stretch it.
+    static let alternativeTransferPacketBudget = 64
+
+    /// AE#839: a stream that declares a backward-compatible transfer and names HLG in an
+    /// `alternative_transfer_characteristics` SEI is HLG, and its `codecpar` says so from here on.
+    /// Done in the demuxer rather than at a probe site so every reader of `color_trc` agrees: format
+    /// detection, the display criteria, `CodecRoutePolicy`'s video range, the muxer's `colr`, the static
+    /// `probe(url:)` and a live reopen. Peeks, so playback still gets every packet it looked at.
+    private func promoteAlternativeTransferHLG() {
+        guard !openProfile.skipStreamInfo else { return }
+        let index = videoStreamIndex
+        typealias Gate = (declared: AVColorTransferCharacteristic, codec: A53SEIParser.CodecKind,
+                          framing: A53SEIParser.NALFraming)
+        guard let gate = withStream(at: index, { stream -> Gate? in
+            guard stream.pointee.discard != AVDISCARD_ALL, let par = stream.pointee.codecpar,
+                  AlternativeTransferSEI.declaredTransferMayHideHLG(
+                      codecID: par.pointee.codec_id, primaries: par.pointee.color_primaries,
+                      transfer: par.pointee.color_trc) else { return nil }
+            let codec: A53SEIParser.CodecKind = par.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264
+            return (par.pointee.color_trc, codec, A53SEIParser.nalFraming(
+                codec: codec, extradata: par.pointee.extradata, size: Int(par.pointee.extradata_size)))
+        }) ?? nil else { return }
+        let (declared, codec, framing) = gate
+        var videoPackets = 0
+        var preferred: UInt8?
+        try? peekPackets(maxPackets: Self.alternativeTransferPacketBudget) { packet in
+            guard packet.pointee.stream_index == index, let data = packet.pointee.data else { return false }
+            videoPackets += 1
+            preferred = AlternativeTransferSEI.preferredTransfer(
+                in: data, size: Int(packet.pointee.size), codec: codec, framing: framing)
+            return preferred != nil || videoPackets >= Self.alternativeTransferVideoPacketBudget
+        }
+        guard preferred == AlternativeTransferSEI.hlgTransfer,
+              withStream(at: index, { $0.pointee.codecpar?.pointee.color_trc = AVCOL_TRC_ARIB_STD_B67 }) != nil
+        else { return }
+        let declaredName = av_color_transfer_name(declared).map { String(cString: $0) } ?? "\(declared.rawValue)"
+        EngineLog.emit(
+            "[Demuxer] AE#839 stream=\(index): alternative transfer SEI names HLG over a declared "
+            + "trc=\(declaredName); the stream is HLG (videoPackets=\(videoPackets))",
+            category: .demux
+        )
     }
 
     /// Run a bounded `avformat_find_stream_info` on an already-open context (#87). Used by the subtitle
@@ -1231,9 +1539,23 @@ public final class Demuxer: @unchecked Sendable {
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by
     /// HLSVideoEngine.masterBandwidth to populate HLS BANDWIDTH attributes.
+    ///
+    /// A disc title takes its rate from its own size over its playlist duration instead, whenever
+    /// libavformat produced one. libavformat divides the source size by the duration it read off the
+    /// timestamps, and that duration is as unreliable over a multi-clip title whose clips restart their
+    /// clock as it is for `duration` (AE#105): a 6537 s title whose two clips both start at 11.6 s probed
+    /// as 388 s, and its 54.6 GB declared 1.1 Gbit/s on average and 2.25 Gbit/s at peak, a variant no
+    /// AVPlayer ever chose (it waited with no item to play). A title libavformat gives no rate for keeps
+    /// the 0 and the caller's over-declared fallback.
     var bitRate: Int64 {
         guard let ctx = formatContext else { return 0 }
-        return ctx.pointee.bit_rate
+        let declared = ctx.pointee.bit_rate
+        guard declared > 0, let titleSeconds = selectedDiscTitleDurationSeconds, let pb = ctx.pointee.pb else {
+            return declared
+        }
+        let size = avio_size(pb)
+        guard size > 0 else { return declared }
+        return Int64((Double(size) * 8 / titleSeconds).rounded())
     }
 
     /// AVFormatContext.start_time in AV_TIME_BASE units. Non-zero on re-muxed
@@ -1489,15 +1811,26 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
-    /// Container (Matroska/MP4) chapters mapped to the public model. Empty when the container declares
-    /// none. Disc sources keep their playlist/IFO chapters via `discChapterInfos`; both can coexist and
-    /// the engine picks. See `chapterInfos(from:containerDuration:)` for the id, naming and duration rules.
-    func mediaChapterInfos() -> [ChapterInfo] {
+    /// Container (Matroska/MP4) chapters as the container states them, on the source axis, plus what the
+    /// published axis needs later: the container duration and the container start (the origin the
+    /// playback clock begins at). Snapshotted at probe time because the probe is closed before the route
+    /// is known, and a reopen of the same source must rebuild the list without re-probing.
+    struct ContainerChapterSource: Equatable {
+        let chapters: [RawContainerChapter]
+        let containerDuration: Double?
+        let formatStartSeconds: Double
+        /// `resolvedSourceStartOrigin`: the container start, backed up by the video stream's own start when
+        /// the container does not state one. The software host anchors its clock on this origin.
+        let sourceStartOrigin: Double
+    }
+
+    /// The container's chapters, or nil when the container declares none.
+    func containerChapterSource() -> ContainerChapterSource? {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext,
               ctx.pointee.nb_chapters > 0,
-              let chapterList = ctx.pointee.chapters else { return [] }
+              let chapterList = ctx.pointee.chapters else { return nil }
 
         var raw: [RawContainerChapter] = []
         raw.reserveCapacity(Int(ctx.pointee.nb_chapters))
@@ -1515,9 +1848,45 @@ public final class Demuxer: @unchecked Sendable {
                 title: metadataValue(chapter.metadata, key: "title")
             ))
         }
+        guard !raw.isEmpty else { return nil }
         let declared = ctx.pointee.duration
         let containerDuration = declared > 0 ? Double(declared) / Double(AV_TIME_BASE) : nil
-        return Self.chapterInfos(from: raw, containerDuration: containerDuration)
+        let formatStart = ctx.pointee.start_time
+        let formatStartSeconds = formatStart != Int64.min && formatStart > 0
+            ? Double(formatStart) / Double(AV_TIME_BASE) : 0
+        return ContainerChapterSource(chapters: raw, containerDuration: containerDuration,
+                                      formatStartSeconds: formatStartSeconds,
+                                      sourceStartOrigin: sourceStartOriginLocked(ctx))
+    }
+
+    /// Container chapters on the published axis: every start and end moved back by `origin` (the
+    /// container start the playback clock begins at), so a published start is the value `seek(to:)` and
+    /// `currentTime` use for that moment. A chapter that lies wholly before the origin is left out; one
+    /// that starts before it is clamped to the content start.
+    ///
+    /// "Wholly before" is judged on the effective end, not the declared one: a chapter runs to the next
+    /// chapter's start, and only the last falls back to its declared end (when it is after its start) and
+    /// then to the container duration. MKVs routinely write `end == start`, so a declared end of 0 on a
+    /// chapter that really runs for minutes must not drop it.
+    static func chapterInfos(_ source: ContainerChapterSource, origin: Double) -> [ChapterInfo] {
+        let sorted = source.chapters.sorted { $0.start < $1.start }
+        let onContent = sorted.enumerated().compactMap { i, ch -> RawContainerChapter? in
+            if origin > 0 {
+                let effectiveEnd: Double
+                if i + 1 < sorted.count {
+                    effectiveEnd = sorted[i + 1].start
+                } else if ch.end > ch.start {
+                    effectiveEnd = ch.end
+                } else {
+                    effectiveEnd = Swift.max(ch.start, source.containerDuration.map { $0 + origin } ?? ch.start)
+                }
+                guard effectiveEnd > origin else { return nil }
+            }
+            return RawContainerChapter(start: Swift.max(0, ch.start - origin),
+                                       end: Swift.max(0, ch.end - origin),
+                                       title: ch.title)
+        }
+        return chapterInfos(from: onContent, containerDuration: source.containerDuration)
     }
 
     private func attachedPictureData() -> Data? {
@@ -1566,6 +1935,7 @@ public final class Demuxer: @unchecked Sendable {
         let isForced = (disposition & AV_DISPOSITION_FORCED) != 0
         let isHearingImpaired = (disposition & AV_DISPOSITION_HEARING_IMPAIRED) != 0
         let isCommentary = (disposition & AV_DISPOSITION_COMMENT) != 0
+        let isVisualImpaired = (disposition & AV_DISPOSITION_VISUAL_IMPAIRED) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
         let bitrate = declaredBitrate(stream: stream)
 
@@ -1599,6 +1969,7 @@ public final class Demuxer: @unchecked Sendable {
             isForced: isForced,
             isHearingImpaired: isHearingImpaired,
             isCommentary: isCommentary,
+            isVisualImpaired: isVisualImpaired,
             isAtmos: isAtmos,
             assHeader: assHeader,
             sampleRate: isAudio ? Int(codecpar.pointee.sample_rate) : 0,
@@ -1619,7 +1990,7 @@ public final class Demuxer: @unchecked Sendable {
         guard layout.pointee.nb_channels > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: 64)
         guard av_channel_layout_describe(layout, &buffer, buffer.count) > 0 else { return nil }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// The language to publish for a stream. A disc keeps its track languages in its navigation data
@@ -1779,6 +2150,13 @@ public final class Demuxer: @unchecked Sendable {
             // AVDISCARD_DEFAULT = 0 (= passthrough), AVDISCARD_NONKEY = 32, AVDISCARD_ALL = 48.
             if keep.contains(i) {
                 stream.pointee.discard = AVDISCARD_DEFAULT
+            } else if let layers = doviLayers, i == layers.enhancement, keep.contains(layers.base) {
+                // The base layer's RPUs are in the enhancement layer; `readPacketLocked` absorbs its packets.
+                stream.pointee.discard = AVDISCARD_DEFAULT
+            } else if dvdCellFold, stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV {
+                // A cell-folded DVD title reads its navigation packs for the cell bases; `readPacketLocked`
+                // absorbs them, so they never reach a caller.
+                stream.pointee.discard = AVDISCARD_DEFAULT
             } else if i == pacing {
                 stream.pointee.discard = AVDISCARD_NONKEY
             } else {
@@ -1793,6 +2171,12 @@ public final class Demuxer: @unchecked Sendable {
     /// during avformat_find_stream_info. Empty = no usable index, fall back to
     /// uniform-stride plan. AVINDEX_KEYFRAME checked defensively.
     func indexedKeyframes(streamIndex: Int32) -> [Int64] {
+        indexedKeyframeEntries(streamIndex: streamIndex).map(\.pts)
+    }
+
+    /// `indexedKeyframes` with each entry's byte position in the source (AE#783), -1 where the index
+    /// has none. Matroska stores the position of the Cluster that holds the keyframe.
+    func indexedKeyframeEntries(streamIndex: Int32) -> [(pts: Int64, pos: Int64)] {
         accessLock.lock()
         defer { accessLock.unlock() }
         let compositionOffset = compositionRepair?.decodeTimestampOffset
@@ -1805,7 +2189,7 @@ public final class Demuxer: @unchecked Sendable {
         let count = avformat_index_get_entries_count(stream)
         guard count > 0 else { return [] }
         let tb = stream.pointee.time_base
-        var result: [Int64] = []
+        var result: [(pts: Int64, pos: Int64)] = []
         for i in 0..<count {
             // AVINDEX_KEYFRAME = 0x0001. Fold each entry onto the contiguous timeline (multi-clip disc)
             // so the segment plan built from these IRAP positions matches the normalized packets
@@ -1816,9 +2200,18 @@ public final class Demuxer: @unchecked Sendable {
                   let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb),
                   let placed = Self.offsetIndexTimestamp(folded, by: compositionOffset)
             else { continue }
-            result.append(placed)
+            result.append((pts: placed, pos: entry.pointee.pos))
         }
         return result
+    }
+
+    /// Ticks (stream time base) by which a delivered keyframe may precede its `indexedKeyframeEntries`
+    /// timestamp: a #409 repair that synthesizes the decode ladder moves a late-written IDR back onto
+    /// its sequence. 0 when packets sit exactly on the index.
+    var indexedKeyframeAdvanceTicks: Int64 {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        return compositionRepair?.keyframeAdvanceTicks ?? 0
     }
 
     func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {
@@ -1973,7 +2366,20 @@ public final class Demuxer: @unchecked Sendable {
     /// Caller holds `accessLock`.
     private func readPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
         while true {
-            guard let read = try readDemuxedPacketLocked() else { return nil }
+            if let ready = releaseDolbyVisionBaseLocked() { return ready }
+            guard var read = try readDemuxedPacketLocked() else {
+                // The last base-layer pictures go out even if their enhancement units never came.
+                return releaseDolbyVisionBaseLocked(atEnd: true)
+            }
+            if let layers = doviLayers {
+                guard let out = foldDolbyVisionLayersLocked(read, layers) else { continue }
+                read = out
+            }
+            if dvdCellFold, adoptDVDNav(read) {
+                var owned: UnsafeMutablePointer<AVPacket>? = read
+                trackedPacketFree(&owned)
+                continue
+            }
             var packet: UnsafeMutablePointer<AVPacket>? = read
             let index = read.pointee.stream_index
             guard subpictureAssemblers[index] != nil else { return read }
@@ -2013,6 +2419,9 @@ public final class Demuxer: @unchecked Sendable {
 
     /// #651: drop half-joined subpicture units along with libavformat's own parser state.
     private func resetSubpictureAssembly() {
+        // Every caller is a place libavformat just dropped its read state (a seek, a flush): a base-layer picture
+        // held for its enhancement unit belongs to the old position too.
+        dropHeldDolbyVisionBaseLocked()
         for key in subpictureAssemblers.keys { subpictureAssemblers[key]?.reset() }
     }
 
@@ -2169,6 +2578,8 @@ public final class Demuxer: @unchecked Sendable {
         // seekable by design, so live callers keep their own rules.
         guard isSourceSeekable else { return false }
         dropPeekedPacketsLocked()
+        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) { return true }
+        if seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) { return true }
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
@@ -2207,6 +2618,11 @@ public final class Demuxer: @unchecked Sendable {
         }
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
+        if dvdTimeMap != nil, let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
+           timeBase.num > 0, timeBase.den > 0,
+           seekByDVDTimeMapLocked(ctx, sourceSeconds: Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)) {
+            return true
+        }
         let ret = avformat_seek_file(
             ctx,
             streamIndex,
@@ -2220,11 +2636,59 @@ public final class Demuxer: @unchecked Sendable {
                 "[Demuxer] Seek to stream \(streamIndex) timestamp \(timestamp) failed: \(ret)",
                 category: .demux
             )
+        } else if let stream = ctx.pointee.streams[Int(streamIndex)],
+                  Self.forwardLandingCrossesUnreadFragment(ctx, stream: stream, timestamp: timestamp) {
+            // AE#859: a fragmented MP4 indexes only the fragments it has read. The forward search
+            // above loaded the fragment holding the target, but not the next one, so the first
+            // sync sample "at or after" the target was whatever fragment an earlier read had left
+            // in the index (measured: start at 150 s, seek to 52 s, landed at 116 s). Landing on
+            // the sync sample before the target costs at most that one fragment, which the
+            // producer's gate drops.
+            let back = avformat_seek_file(ctx, streamIndex, Int64.min, timestamp, timestamp, 0)
+            EngineLog.emit(
+                "[Demuxer] AE#859: forward seek on stream \(streamIndex) to \(timestamp) crossed an "
+                + "unread fragment; landed on the preceding sync sample instead (ret=\(back))",
+                category: .demux
+            )
         }
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1
         return ret >= 0
+    }
+
+    /// AE#859: whether the sync sample a forward seek to `timestamp` chose lies behind a hole in the
+    /// stream's sample index, which in a fragmented MP4 is a fragment nobody has read yet. Only the
+    /// mov demuxer builds its index fragment by fragment; every other container either indexes the
+    /// whole file at open or seeks without an index.
+    private static func forwardLandingCrossesUnreadFragment(
+        _ ctx: UnsafeMutablePointer<AVFormatContext>, stream: UnsafeMutablePointer<AVStream>,
+        timestamp: Int64
+    ) -> Bool {
+        guard let name = ctx.pointee.iformat?.pointee.name,
+              String(cString: name).split(separator: ",").contains("mov") else { return false }
+        let landing = av_index_search_timestamp(stream, timestamp, 0)
+        guard landing >= 0 else { return false }
+        let first = max(0, av_index_search_timestamp(stream, timestamp, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY))
+        guard landing > first else { return false }
+        var timestamps: [Int64] = []
+        timestamps.reserveCapacity(Int(landing - first) + 1)
+        for i in first...landing {
+            guard let entry = avformat_index_get_entry(stream, i) else { return false }
+            timestamps.append(entry.pointee.timestamp)
+        }
+        let tb = stream.pointee.time_base
+        guard tb.num > 0, tb.den > 0 else { return false }
+        let holeTicks = Int64(Double(tb.den) / Double(tb.num) * indexHoleSeconds)
+        return indexHasHole(timestamps, holeTicks: max(1, holeTicks))
+    }
+
+    /// Consecutive samples further apart than this are not neighbours: no real stream leaves half a
+    /// second between two pictures, while the shortest fragment a packager writes is about that long.
+    static let indexHoleSeconds = 0.5
+
+    static func indexHasHole(_ timestamps: [Int64], holeTicks: Int64) -> Bool {
+        zip(timestamps, timestamps.dropFirst()).contains { $1 &- $0 > holeTicks }
     }
 
     private func resetAfterTimeSeek(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
@@ -2351,6 +2815,11 @@ public final class Demuxer: @unchecked Sendable {
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
+        // The software path and the subtitle side reader reposition here, so a disc title seeks by its
+        // EP maps or its DVD time map here too, whichever stream anchors the request.
+        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
+            return !(avioProvider?.readDeadlineFired ?? false) && probeControl?.isStopped != true
+        }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
@@ -2358,7 +2827,11 @@ public final class Demuxer: @unchecked Sendable {
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
         let capped = avioProvider?.readDeadlineFired ?? false
-        return ret >= 0 && !capped && probeControl?.isStopped != true
+        let stopped = probeControl?.isStopped == true
+        // Fixed result flags only: FFmpeg refusal, read deadline, cancellation. No source identity.
+        let flags = (ret < 0 ? 1 : 0) | (capped ? 2 : 0) | (stopped ? 4 : 0)
+        EngineLog.emit("[DemuxReposition] flags=\(flags)", category: .swPlayback)
+        return ret >= 0 && !capped && !stopped
     }
 
     /// How an off-actor reposition ended (#254). Named to mirror `SeekEvent.Outcome` so the engine's
@@ -2528,6 +3001,11 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return 0 }
+        return sourceStartOriginLocked(ctx)
+    }
+
+    /// Caller holds `accessLock`.
+    private func sourceStartOriginLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> Double {
         var videoStart = Int64.min
         var tbNum: Int32 = 0
         var tbDen: Int32 = 0
@@ -2540,6 +3018,85 @@ public final class Demuxer: @unchecked Sendable {
         return Self.sourceStartOrigin(
             formatStartUs: ctx.pointee.start_time, videoStreamStart: videoStart,
             videoTimeBaseNum: tbNum, videoTimeBaseDen: tbDen)
+    }
+
+    /// Repositions a Blu-ray title to the keyframe at or before `seconds` (the folded source axis) by its
+    /// clips' EP maps, in one byte seek. A timestamp search over a title whose clips each run their own
+    /// clock from the same start cannot tell the clips apart: a 3000 s seek on a two-clip title whose
+    /// clips both start at 11.6 s landed in the second clip, four packets before its end. Returns false,
+    /// with nothing moved, when the title has no table; the caller searches by timestamp then. Caller
+    /// holds `accessLock`.
+    private func seekByDiscTableLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        guard let table = discSeekTable,
+              let hit = table.keyframe(forSourceSeconds: seconds, base0Sec: clipBase0Sec),
+              avformat_seek_file(ctx, -1, hit.offset, hit.offset, hit.offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
+        EngineLog.emit("[Demuxer] EP map seek: source=\(String(format: "%.3f", seconds))s -> clip \(hit.clip) keyframe "
+                       + "\(String(format: "%.3f", hit.keyframeSec))s on its clock, byte \(hit.offset)", category: .demux)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651
+        lastReadClipIdx = -1  // AE#105: a landing mid-clip is not a clean crossing
+        return true
+    }
+
+    /// Repositions a DVD title to the VOBU at or before `seconds` (the folded source axis: cell 0's base
+    /// plus title time) by its time map, in one byte seek. Over a title whose cells restart their
+    /// timestamps, a timestamp search lands nowhere near: a 2000 s seek read straight to the end of the
+    /// title and the session ended. Returns false, with nothing moved, without a time map or before cell 0's
+    /// base is known; the caller searches by timestamp then. Caller holds `accessLock`.
+    private func seekByDVDTimeMapLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        guard let map = dvdTimeMap, clipBase0Sec.isFinite else { return false }
+        let titleSeconds = max(0, seconds - clipBase0Sec)
+        let offset = map.byteOffset(forTitleSeconds: titleSeconds)
+        guard avformat_seek_file(ctx, -1, offset, offset, offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
+        EngineLog.emit("[Demuxer] DVD time map seek: title=\(String(format: "%.3f", titleSeconds))s -> byte \(offset)",
+                       category: .demux)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651
+        lastReadClipIdx = -1  // landing mid-cell; its offset comes from the next navigation pack
+        return true
+    }
+
+    /// Absorbs a DVD navigation pack, recording the timestamp base of the cell it is in; true when the
+    /// packet was one (the caller drops it). A navigation pack leads every VOBU, so a cell entered in
+    /// order and a seek landing mid-cell both meet it before that cell's audio and video, and the cell's
+    /// offset is in place before its first packet is folded. Caller holds `accessLock`.
+    private func adoptDVDNav(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        guard let ctx = formatContext,
+              let stream = ctx.pointee.streams[Int(packet.pointee.stream_index)],
+              stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV else { return false }
+        guard let data = packet.pointee.data, packet.pointee.size > 0,
+              let cellBase = Self.dvdCellBaseSeconds(pci: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+        else { return true }
+        let idx = ClipSpan.index(forPos: packet.pointee.pos, in: clipTimeline, fallback: lastClipIndex)
+        if idx == 0 {
+            if clipBase0Sec.isNaN { clipBase0Sec = cellBase }
+            return true
+        }
+        guard clipBase0Sec.isFinite, idx < clipResolvedShiftSec.count else { return true }
+        let shift = ClipFold.offsetSeconds(observedBaseSec: cellBase, base0Sec: clipBase0Sec,
+                                           cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
+        if !clipResolvedShiftSec[idx].isFinite || abs(clipResolvedShiftSec[idx] - shift) > 0.05 {
+            clipResolvedShiftSec[idx] = shift
+            EngineLog.emit("[Demuxer] DVD cell \(idx): base=\(String(format: "%.3f", cellBase))s "
+                           + "cumBefore=\(String(format: "%.1f", clipTimeline[idx].cumulativeBeforeSec))s -> shift "
+                           + "\(String(format: "%.3f", shift))s", category: .demux)
+        }
+        return true
+    }
+
+    /// The raw timestamp (seconds) at which the cell a navigation pack's PCI belongs to starts: the
+    /// VOBU's start PTS (90 kHz) less the cell's elapsed time (C_ELTM, BCD with a frame count). nil for a
+    /// DSI or a PCI too short to read; libavformat hands the two over as separate packets, the PCI's
+    /// first byte 0x00, the DSI's 0x01.
+    static func dvdCellBaseSeconds(pci data: UnsafeBufferPointer<UInt8>) -> Double? {
+        guard data.count >= 0x1D, data[0] == 0x00 else { return nil }
+        let startPTS = (UInt32(data[0x0D]) << 24) | (UInt32(data[0x0E]) << 16) | (UInt32(data[0x0F]) << 8) | UInt32(data[0x10])
+        func bcd(_ b: UInt8) -> Double { Double(Int(b >> 4) * 10 + Int(b & 0x0F)) }
+        let frameByte = data[0x1C]
+        let fps: Double = (frameByte >> 6) == 1 ? 25 : ((frameByte >> 6) == 3 ? 30000.0 / 1001.0 : 0)
+        let elapsed = bcd(data[0x19]) * 3600 + bcd(data[0x1A]) * 60 + bcd(data[0x1B])
+            + (fps > 0 ? bcd(frameByte & 0x3F) / fps : 0)
+        return Double(startPTS) / 90000 - elapsed
     }
 
     /// One AVSEEK_FLAG_BYTE positioning seek + flush. Shared by the estimate probe loop.
@@ -2692,6 +3249,9 @@ public final class Demuxer: @unchecked Sendable {
         while streamUsers > 0 { streamTableLock.wait() }
         streamTableLock.unlock()
         dropPeekedPacketsLocked()
+        dropHeldDolbyVisionBaseLocked()
+        doviLayers = nil
+        foldsBluRayDolbyVisionLayers = false
         if formatContext != nil {
             avformat_close_input(&formatContext)
         }
@@ -2711,10 +3271,40 @@ public final class Demuxer: @unchecked Sendable {
     }
 }
 
-enum DemuxerError: Error, CustomStringConvertible, LocalizedError {
+enum DemuxerError: Error, CustomNSError, CustomStringConvertible, LocalizedError {
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+
+    static var errorDomain: String { "AetherEngine.DemuxerError" }
+    static let ffmpegErrorCodeKey = "AetherFFmpegErrorCode"
+    var errorUserInfo: [String: Any] {
+        let code: Int32
+        switch self {
+        case .openFailed(let value), .streamInfoFailed(let value), .readFailed(let value): code = value
+        }
+        return [NSLocalizedDescriptionKey: description, Self.ffmpegErrorCodeKey: Int(code)]
+    }
+    // Preserve Swift's implicit NSError codes from before CustomNSError conformance.
+    var errorCode: Int {
+        switch self {
+        case .openFailed: 0
+        case .streamInfoFailed: 1
+        case .readFailed: 2
+        }
+    }
+
+    static func preservedFFmpegCode(in error: Error?) -> Int? {
+        var next = error as NSError?
+        for _ in 0..<6 {
+            guard let current = next else { break }
+            if current.domain == errorDomain,
+               let code = current.userInfo[ffmpegErrorCodeKey] as? Int,
+               code < 0, Int32(exactly: code) != nil { return code }
+            next = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return nil
+    }
 
     /// AE#283: this is the most common error at the load boundary, and the AVERROR code is the whole
     /// diagnosis (INVALIDDATA vs a POSIX errno vs EOF). Rendering it keeps a refused transcode

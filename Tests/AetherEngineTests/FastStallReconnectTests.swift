@@ -92,8 +92,6 @@ struct FastStallReconnectTests {
     @Test("a mid-stream silent origin exhausts the fast-stall budget instead of looping forever",
           .timeLimit(.minutes(2)))
     func midStreamSilentOriginGivesUp() async throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize,
             respond: { _, offset, _ in
@@ -103,7 +101,8 @@ struct FastStallReconnectTests {
         defer { server.stop() }
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
                                 boundedInitialFetch: Self.firstRange,
-                                connStallTimeout: 4)
+                                connStallTimeout: 4,
+                                backoffScale: 0.02)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 

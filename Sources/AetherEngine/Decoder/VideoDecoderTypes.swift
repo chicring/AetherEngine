@@ -9,8 +9,8 @@ import AetherLibavcodec
 /// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.
 typealias DecodedFrameHandler = @Sendable (CVPixelBuffer, CMTime, Data?) -> Void
 
-/// Common video decoder protocol. SoftwareVideoDecoder (libavcodec, AV1/VP9) and
-/// HardwareVideoDecoder (VTDecompressionSession, HEVC) both conform; the host swaps per codec without rewiring the demux loop.
+/// Common video decoder protocol. SoftwareVideoDecoder (libavcodec) and
+/// HardwareVideoDecoder (VTDecompressionSession, HEVC/VP9) both conform; the host swaps per codec without rewiring the demux loop.
 // Sendable: both conformers (SoftwareVideoDecoder, HardwareVideoDecoder) are @unchecked Sendable
 // (internally lock-guarded), so `any VideoDecodingPipeline` is safe to capture in @Sendable closures.
 protocol VideoDecodingPipeline: AnyObject, Sendable {
@@ -24,6 +24,10 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
+    /// Every frame the decoder has produced since it opened, the ones `skipUntilPTS` discards
+    /// included. The preroll reads it as the decoder's progress toward a seek target (#800): a slow
+    /// decoder still working up to the target is told apart from one that delivers nothing.
+    var framesDecoded: UInt64 { get }
 
     /// AE#492: the decoder's current feed epoch. A caller that decides a batch of packets is
     /// current captures this, hands it back with each one, and the decoder refuses any packet whose
@@ -37,23 +41,50 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// `nil` from a caller with no seek of its own to be invalidated by.
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64?)
     func flush()
+    /// End of source or a live seam: delivers what the decoder still owes before the `flush()` the host
+    /// makes next. `flush()` of a decoder that delivers what it drains is enough, so the default does
+    /// nothing; a decoder whose `flush()` discards (the dual-layer one) overrides it. Seeks never call it.
+    func drainForEndOfStream()
     func close()
+}
+
+extension VideoDecodingPipeline {
+    func drainForEndOfStream() {}
+    /// A decoder that does not count reports no progress, so its preroll times out as before.
+    var framesDecoded: UInt64 { 0 }
 }
 
 enum VideoDecoderError: Error, LocalizedError {
     case noCodecParameters
     case unsupportedCodec(id: UInt32)
     case noExtradata
+    case unsupportedConfiguration(codec: String, detail: String)
+    case hardwareDecoderUnavailable(codec: String)
     case formatDescriptionFailed(status: OSStatus)
     case sessionCreationFailed(status: OSStatus)
+    /// `DualLayerVideoDecoder` is single use (dolby-vision-fel.md §5.8): `open` after `close` refuses
+    /// with this instead of inheriting the previous stream's state. Thrown rather than a
+    /// trapping precondition so host misuse surfaces as an error and tests can assert it.
+    case decoderClosed
+    /// No Metal device or shader compilation failed; FEL composition cannot run.
+    /// Thrown from `open()` for a decoder built without a composer. The software host does not get
+    /// there in production: it builds the composer first and decodes the base layer alone when that
+    /// fails.
+    case composerUnavailable
 
     var errorDescription: String? {
         switch self {
         case .noCodecParameters: "No codec parameters"
         case .unsupportedCodec(let id): "Unsupported video codec (id: \(id))"
         case .noExtradata: "Missing codec extradata"
+        case .unsupportedConfiguration(let codec, let detail):
+            "Unsupported \(codec) configuration: \(detail)"
+        case .hardwareDecoderUnavailable(let codec):
+            "Hardware \(codec) decoder unavailable"
         case .formatDescriptionFailed(let s): "Format description failed (\(s))"
         case .sessionCreationFailed(let s): "Decoder session failed (\(s))"
+        case .decoderClosed: "Decoder is closed (single use)"
+        case .composerUnavailable: "Dolby Vision FEL composer unavailable (no Metal device or shader compilation failed)"
         }
     }
 }
