@@ -310,7 +310,7 @@ extension AetherEngine {
                 // pipeline is actually stopped, then publish. `state`/`errorInfo`/`loadedURL`
                 // are untouched by stopInternal, so the error still reads and a later
                 // load()/reloadAtCurrentPosition() rebuilds as before. The credential-refusal
-                // verdict is read before the teardown, which would clear the session's headers.
+                // verdict is read first, so the published error is classified as of the failure.
                 let reclassified = Self.reclassifiedForCredentialRefusal(
                     info, refusal: self.sessionRequestHeaders.recentCredentialRefusal(
                         within: HLSVideoEngine.rateLimitVerdictWindowSeconds))
