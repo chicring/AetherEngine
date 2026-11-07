@@ -8,31 +8,18 @@
 import XCTest
 @testable import AetherEngine
 
-/// Captures `EngineLog` lines for one test. The handler is process-global, so it is restored on
-/// every path; suites run in parallel, so assertions are on presence, never on absence of lines
-/// other tests may legitimately emit.
+/// Captures `EngineLog` lines for one test through the shared `EngineLogCapture` (the handler is
+/// process-global and never assigned by a test); suites run in parallel, so assertions are on
+/// presence, never on absence of lines other tests may legitimately emit.
 private final class ExtractLogTap: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private let previous: ((String) -> Void)?
+    private let capture = EngineLogCapture()
 
-    init() {
-        previous = EngineLog.handler
-        EngineLog.handler = { [self] line in
-            lock.lock()
-            lines.append(line)
-            lock.unlock()
-        }
-    }
-
-    func restore() { EngineLog.handler = previous }
+    func restore() { capture.end() }
 
     /// Only this feature's own channel: lines other suites happen to emit concurrently can match
     /// a bare needle, but cannot carry the extract tag.
     func extractLines() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return lines.filter { $0.contains("[AVIOReader:extract]") }
+        capture.lines.filter { $0.contains("[AVIOReader:extract]") }
     }
 
     func extractMatching(_ needle: String) -> [String] {

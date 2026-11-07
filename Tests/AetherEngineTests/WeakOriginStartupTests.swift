@@ -27,25 +27,12 @@ struct WeakOriginStartupTests {
     /// Timestamped EngineLog capture, process-global by nature — the suite is `.serialized`, and
     /// each test filters to its own reader label / origin port before reading anything.
     private final class LogTap: @unchecked Sendable {
-        private let lock = NSLock()
-        private var entries: [(t: Date, line: String)] = []
-        private let previous: ((String) -> Void)?
+        private let capture = EngineLogCapture()
 
-        init() {
-            previous = EngineLog.handler
-            EngineLog.handler = { [self] line in
-                lock.lock()
-                entries.append((Date(), line))
-                lock.unlock()
-            }
-        }
-
-        func restore() { EngineLog.handler = previous }
+        func restore() { capture.end() }
 
         func lines(containing needle: String) -> [(t: Date, line: String)] {
-            lock.lock()
-            defer { lock.unlock() }
-            return entries.filter { $0.line.contains(needle) }
+            capture.entries.filter { $0.line.contains(needle) }
         }
     }
 
@@ -573,27 +560,13 @@ struct WeakOriginEngineStopTests {
     @Test("T4 stopDuringOpen: no origin traffic after stop()", .timeLimit(.minutes(2)))
     func stopDuringOpen() async throws {
         final class Tap: @unchecked Sendable {
-            private let lock = NSLock()
-            private var entries: [(t: Date, line: String)] = []
-            private let previous: ((String) -> Void)?
-            init() {
-                previous = EngineLog.handler
-                EngineLog.handler = { [self] line in
-                    lock.lock()
-                    entries.append((Date(), line))
-                    lock.unlock()
-                }
-            }
-            func restore() { EngineLog.handler = previous }
+            private let capture = EngineLogCapture()
+            func restore() { capture.end() }
             func avioLines(after t: Date) -> [String] {
-                lock.lock()
-                defer { lock.unlock() }
-                return entries.filter { $0.t >= t && $0.line.contains("[AVIOReader]") }.map(\.line)
+                capture.entries.filter { $0.t >= t && $0.line.contains("[AVIOReader]") }.map(\.line)
             }
             func preStopReaderLines(before t: Date) -> [String] {
-                lock.lock()
-                defer { lock.unlock() }
-                return entries.filter {
+                capture.entries.filter {
                     $0.t < t && ($0.line.contains("[AVIOReader]") || $0.line.contains("[AetherEngine]")
                                  || $0.line.contains("[HLSVideoEngine]") || $0.line.contains("subtitle"))
                 }.map(\.line)

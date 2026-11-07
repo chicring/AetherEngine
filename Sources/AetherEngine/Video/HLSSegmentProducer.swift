@@ -95,7 +95,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
-        let sourceStreamIndex: Int32
+        /// `var` for AE#996: a live SSAI source can move its audio to another PID at an ad seam,
+        /// and the producer follows it (`followsAudio(...)`). The format must not change with it.
+        var sourceStreamIndex: Int32
         /// TB of packets passed to av_write_frame: source TB for stream-copy, encoder TB 1/48000 for FLAC bridge.
         let inputTimeBase: AVRational
         /// TB of demuxer packets BEFORE bridge re-stamps them. Gate target is rescaled into this TB; using
@@ -182,12 +184,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Source video TB, carried to rescale timestamps (avformat_write_header rewrites the muxer's TB).
     private let sourceVideoTimeBase: AVRational
+    /// The source video stream's parameters, for `VideoPacketTap.begin`. The demuxer owns them and outlives the producer.
+    private let videoCodecparForTap: UnsafePointer<AVCodecParameters>
+    private var startedVideoPacketTap = false
     /// AE#886: `videoConfig.frameGrid` on VOD, nil on live. Pump-thread counters for the finish line.
     private let frameGrid: CFRFrameGrid?
     private var griddedVideoPackets = 0
     private var offGridVideoPackets = 0
     private let videoConfig: StreamConfig
-    private let audioConfig: AudioConfig?
+    private var audioConfig: AudioConfig?
 
     /// Start PTS (source video TB) for each segment at baseIndex+i; used to detect segment crossings.
     private let segmentBoundaries: [Int64]
@@ -229,6 +234,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// AE#684: the sound a finalized live segment carries (index, first and last audio packet on the
     /// output axis, seconds). Fired just before `onLiveSegmentFinalized` for the same index.
     var onLiveSegmentSound: (@Sendable (Int, Double, Double) -> Void)?
+    /// AE#936: the presentation time of every live video packet read, on the `onLiveSegmentFinalized`
+    /// start axis, so the first-serve gate can tell a drained burst from one still arriving.
+    var onLiveReadHead: (@Sendable (Double) -> Void)?
     /// Keyed by segment index; a nil value is a segment cut with no audio packet in it.
     private var liveSegmentSoundByIndex: [Int: (first: Double, last: Double)?] = [:]
     /// AE#684: set for the length of one merged read, so a second reader thread trips the assertion there.
@@ -272,6 +280,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// #369: one-shot latches for the containment logs. Pump-thread only.
     private var loggedVideoWriteFailure = false
     private var loggedSequentialParkSkip = false
+    private var loggedSequentialParkTrickle = false
+    /// AE#958: the cadence of the sequential park trickle, the last real cut duration. Pump-thread only.
+    private var lastSequentialSegmentDuration: Double?
 
     /// Order-preserving funnel for sequential finalize reports.
     private func emitSequentialReport(index: Int, duration: Double) {
@@ -297,6 +308,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// instantly, so it is no deadlock. Pure for the unit test.
     static func sequentialParkWouldSelfDeadlock(target: Int, highestAdvertised: Int) -> Bool {
         target >= 0 && target > highestAdvertised
+    }
+
+    /// AE#958: a sequential append playlist is an EVENT playlist, and AVPlayer stops fetching from
+    /// one that has not grown for about 45 s even with listed segments still ahead of it (measured
+    /// after a jump back into the cache: it fetched 59...70 of 87 listed, then stalled). The advance
+    /// park froze it for exactly that long, because the consumer reached its release target only by
+    /// replaying what it had jumped over, and a sequential origin has no restart to recover with.
+    /// So while the consumer is playing, a park releases one segment per segment duration: the
+    /// playlist grows at least in real time and the lead over the consumer stays where it was.
+    /// A paused or frozen consumer gets no trickle, which leaves the wedge detector its case.
+    static func sequentialParkTrickleDue(parkedSeconds: Int, cadenceSeconds: Double,
+                                         consumerRendering: Bool) -> Bool {
+        consumerRendering && Double(parkedSeconds) >= max(1, cadenceSeconds)
     }
 
     /// Forward discontinuity threshold. Distinct from NOPTS-dts repair (+1 tick scale); only fires on genuine multi-second leaps.
@@ -456,7 +480,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
               sourceVideoTimeBase.num == predecessor.sourceVideoTimeBase.num,
               sourceVideoTimeBase.den == predecessor.sourceVideoTimeBase.den,
               videoStreamIndex == predecessor.videoStreamIndex,
-              audioConfig?.sourceStreamIndex == predecessor.audioConfig?.sourceStreamIndex,
+              configuredAudioSourceStreamIndex == predecessor.configuredAudioSourceStreamIndex,
               audioConfig?.sourceTimeBase.num == predecessor.audioConfig?.sourceTimeBase.num,
               audioConfig?.sourceTimeBase.den == predecessor.audioConfig?.sourceTimeBase.den else { return }
         liveReplayGuard = (predecessor.interruptedReplayHistory ?? predecessor.liveReplayGuard).sourceContinuation()
@@ -581,6 +605,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// playhead. Set once before `start()`, like the gate above; nil for hosts that drive the engine
     /// without a session (`aetherctl` probes, tests).
     var playedMediaLedger: PlayedMediaLedger?
+
+    /// AE#996: the source is a segmented live stream (HLS ingest) whose clock may legitimately
+    /// restart at an announced discontinuity. Set by the session before `start()`.
+    var sourceAnnouncesDiscontinuities = false
+
+    /// AE#996 audio follow, pump thread only. Video source ticks since the bound audio stream last
+    /// delivered a packet, whether a video seam (rebase or program switch) has passed since then,
+    /// the compatible audio stream currently delivering in its place, and the streams bound before.
+    private var audioFollowVideoTicksSinceBound: Int64 = 0
+    private var audioFollowSeamSinceBound = false
+    private var audioFollowCandidate: (index: Int32, packets: Int)?
+    private var audioFollowPreviouslyBound: Set<Int32> = []
+    private var audioFollowRefusalLogged: Set<Int32> = []
+    /// The stream index this producer was configured with. A reopen compares this, not the
+    /// followed index, since the followed one numbers a stream of the demuxer that was closed.
+    private var configuredAudioSourceStreamIndex: Int32?
 
     /// Forward-only producer restart counter; surfaced in live telemetry. Written on pump thread, read under packetCounterLock.
     var restartCount: Int {
@@ -939,6 +979,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pumpQoSCurrent: qos_class_t = QOS_CLASS_USER_INITIATED
     private var pumpQoSLastSeg = Int.min
     private var pumpEpochHighestStored = Int.min
+    /// #941: `pumpEpochHighestStored` for readers off the pump thread. The host reads it at a restart
+    /// to tell a run that is continued seamlessly from one that is abandoned short of the new anchor.
+    private let epochHeadLock = NSLock()
+    private var _epochHighestCaptured = Int.min
+    var epochHighestCaptured: Int {
+        epochHeadLock.lock()
+        defer { epochHeadLock.unlock() }
+        return _epochHighestCaptured
+    }
     private var pumpUnwinding = false
     /// AE#850: a segment boundary is not often enough to decide on. At 0.1x a single segment took
     /// 19 s of wall time on `.utility`, longer than the whole relaxed lead, so the promotion landed
@@ -1291,6 +1340,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// installs one mid-session reaches the running producer without a data race on a stored closure. Set
     /// before `start()`; nil leaves the emission out entirely.
     var nativeVideoFrameTimeObserverProvider: (@Sendable () -> NativeVideoFrameTimeObserver?)?
+    /// The in-process tap of `LoadOptions.dualLayerRoute == .avPlayerOutput`: sees each Profile 7 packet
+    /// before the 8.1 conversion and again once it is written. Nil on every other session.
+    var videoPacketTapProvider: (@Sendable () -> VideoPacketTap?)?
 
     /// Monotonic producer generation, reported with every frame time so a consumer can drop entries from an
     /// epoch whose segments a restart has since rewritten (#260).
@@ -1457,17 +1509,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
     ///
     /// The axis reset is live-only. A sequential origin's archive chunks legitimately open their
     /// own axis at zero (#368), and reading that as a replay would end a healthy pump.
+    ///
+    /// AE#996: it is also limited to a CONTINUOUS transport stream. A segmented live source (HLS
+    /// ingest) may restart its clock at every EXT-X-DISCONTINUITY, and ad-stitched channels do,
+    /// at most ad seams: `srcDts=8590114592` is 2^33 + 180000, a clock that restarted at 2 s for
+    /// a new creative. On such a source the shape carries no evidence of a replay, and acting on
+    /// it reopened the source onto the same seam (six reopens in 9 s on one channel). A replay on
+    /// a reconnect is still caught by the exact payload match in `LivePacketReplayGuard`.
     static func sourceRestartShape(newDts: Int64,
                                    jumpTicks: Int64,
                                    firstSeenDts: Int64,
                                    tbSeconds: Double,
-                                   isLive: Bool) -> SourceRestartShape? {
+                                   isLive: Bool,
+                                   sourceAnnouncesDiscontinuities: Bool = false) -> SourceRestartShape? {
         guard firstSeenDts != Int64.min, tbSeconds > 0 else { return nil }
         let windowTicks = Int64(Self.sourceReplayStartWindowSeconds / tbSeconds)
         if jumpTicks < 0 {
             return newDts <= SourceTimestampBounds.sum(firstSeenDts, windowTicks) ? .rewind : nil
         }
-        guard isLive, newDts >= Self.mpegTSWrapTicks else { return nil }
+        guard isLive, !sourceAnnouncesDiscontinuities, newDts >= Self.mpegTSWrapTicks else { return nil }
         return newDts % Self.mpegTSWrapTicks <= windowTicks ? .axisReset : nil
     }
 
@@ -1487,7 +1547,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                                   jumpTicks: jumpTicks,
                                                   firstSeenDts: firstSeenDts,
                                                   tbSeconds: tbSeconds,
-                                                  isLive: isLive)
+                                                  isLive: isLive,
+                                                  sourceAnnouncesDiscontinuities: sourceAnnouncesDiscontinuities)
         else { return false }
         switch shape {
         case .rewind:
@@ -1597,9 +1658,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
+        self.configuredAudioSourceStreamIndex = audio?.sourceStreamIndex
         self.cache = cache
         self.baseIndex = baseIndex
         self.sourceVideoTimeBase = video.timeBase
+        self.videoCodecparForTap = video.codecpar
         self.frameGrid = isLive ? nil : video.frameGrid
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
         self.segmentBoundaries = segmentBoundaries
@@ -1748,6 +1811,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = pendingDiscontinuityFlag
             pendingDiscontinuityFlag = false
         }
+        onLiveReadHead?(ptsSeconds)
         return liveCurrentSegmentIndex
     }
 
@@ -1881,6 +1945,87 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Extract H.264 ad video config from in-band Annex-B SPS/PPS. nil on mid-GOP join (no parameter sets).
+    // MARK: - AE#996 audio follow
+
+    /// How long the bound audio may stay silent, in video time, while a compatible stream delivers
+    /// before the producer follows it without a seam. Long enough that a bursty interleave on a
+    /// source with two live audio streams never reads as a hand-over.
+    static let audioFollowSilenceSeconds = 1.0
+    /// Packets a never-bound stream must deliver after a video seam, with the bound one silent,
+    /// before the producer follows it (8 AAC frames are 0.17 s at 48 kHz).
+    static let audioFollowSeamPackets = 8
+
+    /// Whether the producer moves its audio to `candidate`. At a seam a stream that was bound
+    /// before (the programme coming back after an ad) is taken on its first packet; another one
+    /// after a short run, so a second audio stream that starts at the same seam does not win on a
+    /// single early packet. Without a seam only a long silence of the bound stream hands over.
+    static func audioFollowDecision(candidatePackets: Int,
+                                    candidateWasBoundBefore: Bool,
+                                    seamSinceBoundAudio: Bool,
+                                    boundSilentSeconds: Double) -> Bool {
+        guard candidatePackets > 0 else { return false }
+        if seamSinceBoundAudio,
+           candidateWasBoundBefore || candidatePackets >= audioFollowSeamPackets {
+            return true
+        }
+        return boundSilentSeconds >= audioFollowSilenceSeconds
+    }
+
+    /// Whether an ADTS frame carries the format the bound track's AudioSpecificConfig declares
+    /// (object type, sampling index, channel configuration). The fMP4 sample entry is written once
+    /// from that ASC, so a stream may only take over the track when its frames match it.
+    static func adtsFrameMatchesASC(_ frame: UnsafeRawBufferPointer, asc: UnsafeRawBufferPointer) -> Bool {
+        guard frame.count >= 7, asc.count >= 2,
+              frame[0] == 0xFF, frame[1] & 0xF6 == 0xF0 else { return false }
+        let profile = Int(frame[2] >> 6)
+        let samplingIndex = Int((frame[2] >> 2) & 0x0F)
+        let channels = Int(((frame[2] & 0x01) << 2) | (frame[3] >> 6))
+        let objectType = Int(asc[0] >> 3)
+        guard objectType != 31 else { return false }  // escaped object type, never synthesized
+        let ascSamplingIndex = Int(((asc[0] & 0x07) << 1) | (asc[1] >> 7))
+        let ascChannels = Int((asc[1] >> 3) & 0x0F)
+        return objectType == profile + 1 && samplingIndex == ascSamplingIndex
+            && samplingIndex != 15 && channels == ascChannels
+    }
+
+    /// Pump thread. Counts a compatible candidate and rebinds the audio track to it when
+    /// `audioFollowDecision` says so; an incompatible one is reported once and left foreign.
+    private func considerAudioFollow(_ packet: UnsafeMutablePointer<AVPacket>, candidate: Int32, audio: AudioConfig) {
+        guard audio.bridge == nil, audio.stripAacAdts,
+              let data = packet.pointee.data, packet.pointee.size > 0,
+              let asc = audio.codecpar.pointee.extradata, audio.codecpar.pointee.extradata_size >= 2,
+              Self.adtsFrameMatchesASC(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                       asc: UnsafeRawBufferPointer(start: asc, count: Int(audio.codecpar.pointee.extradata_size)))
+        else {
+            if audioFollowRefusalLogged.insert(candidate).inserted {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] audio on stream \(candidate) not followed: the bound track "
+                    + "(stream \(audio.sourceStreamIndex)) is \(audio.bridge == nil ? "stream-copy" : "bridged")"
+                    + "\(audio.stripAacAdts ? "" : " non-ADTS") or the new stream's format differs",
+                    category: .session)
+            }
+            return
+        }
+        let packets = (audioFollowCandidate?.index == candidate ? audioFollowCandidate?.packets ?? 0 : 0) + 1
+        audioFollowCandidate = (index: candidate, packets: packets)
+        let silentSeconds = Double(audioFollowVideoTicksSinceBound) * sourceVideoTbSeconds
+        let returning = audioFollowPreviouslyBound.contains(candidate)
+        let seam = audioFollowSeamSinceBound
+        guard Self.audioFollowDecision(candidatePackets: packets,
+                                       candidateWasBoundBefore: returning,
+                                       seamSinceBoundAudio: seam,
+                                       boundSilentSeconds: silentSeconds) else { return }
+        let silent = String(format: "%.2f", silentSeconds)
+        let previous = audio.sourceStreamIndex
+        EngineLog.emit(
+            "[HLSSegmentProducer] audio follows the source to stream \(candidate) (was \(previous)): "
+            + "bound stream silent for \(silent)s, seam=\(seam) packets=\(packets) returning=\(returning)",
+            category: .session)
+        audioFollowPreviouslyBound.insert(audio.sourceStreamIndex)
+        audioConfig?.sourceStreamIndex = candidate
+        audioFollowCandidate = nil
+    }
+
     private func extractAdVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> (width: Int32, height: Int32, extradata: [UInt8])? {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
         let buf = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
@@ -1926,7 +2071,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// index tuple once, then every 10 s, so a VOD wedge (cacheTarget frozen below target with no watchdog to break
     /// it) is distinguishable from healthy backpressure (cacheTarget climbing toward target). VOD only; live keeps
     /// its own watchdogs.
-    private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
+    private func awaitBackpressureRelease(target: Int, head: Int, context: String,
+                                          trickleSequential: Bool = false) -> Bool {
         // AE#850: a relaxed pump that parks is keeping up.
         if pumpQoSCurrent == QOS_CLASS_UTILITY { pumpRelaxationRate.reset() }
         // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
@@ -2019,6 +2165,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     category: .session
                 )
                 return false
+            }
+            if trickleSequential, let cadence = lastSequentialSegmentDuration,
+               Self.sequentialParkTrickleDue(parkedSeconds: parked,
+                                             cadenceSeconds: cadence,
+                                             consumerRendering: wantsToPlay && hasStarted
+                                                 && wedgeDetector.lastPollRendered) {
+                if !loggedSequentialParkTrickle {
+                    loggedSequentialParkTrickle = true
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] AE#958 sequential park trickling (\(context)) head=\(head) "
+                        + "target=\(target) cacheTarget=\(cacheTarget): consumer is playing behind the "
+                        + "release target, releasing one segment per \(String(format: "%.2f", cadence))s "
+                        + "so the EVENT playlist keeps growing",
+                        category: .session
+                    )
+                }
+                retunePumpQoS()
+                return true
             }
         }
         return false
@@ -2492,6 +2656,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // the NEW producer's position. Cutting on it would adopt this pump's partial segment under
         // its full index; the teardown rule decides what happens to the in-flight segment instead.
         if checkShouldStop() { return nil }
+        // AE#962: a video packet held for its successor's dts goes out with the segment it was routed
+        // to. After the last video packet of a title nothing but audio follows, so the successor never
+        // comes, and the EOF flush put the final picture into the last segment of an audio-only tail,
+        // a minute of item time after it; a session joining that tail placed its whole item by that
+        // one sample. Its duration falls back to one frame, as the EOF flush's always did. A video
+        // packet that opens a later segment itself is routed past this muxer and stays held.
+        if !isLive, let pending = pendingVideoPkt, pendingVideoSegIndex <= currentMuxerSegmentIndex {
+            pendingVideoPkt = nil
+            if (pending.pointee.flags & AV_PKT_FLAG_KEY) != 0,
+               firstSyncItemPtsBySegment[currentMuxerSegmentIndex] == nil {
+                firstSyncItemPtsBySegment[currentMuxerSegmentIndex] =
+                    planBoundaryAxis.timestamp(dts: pending.pointee.dts, pts: pending.pointee.pts)
+            }
+            finalizeAndWriteVideo(pending, nextDts: nil, muxer: muxer)
+            bumpPacketsWritten()
+        }
         switch muxer.cutFragmentForNextSegment(newIdx) {
         case .completed(let path, let bytesWritten):
             EngineLog.emit(
@@ -2505,6 +2685,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
+            epochHeadLock.lock()
+            _epochHighestCaptured = pumpEpochHighestStored
+            epochHeadLock.unlock()
             if isLive {
                 let tb = muxer.muxerAudioTimeBase
                 let tick = tb.den > 0 ? Double(tb.num) / Double(tb.den) : 0
@@ -2610,7 +2793,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         category: .session
                     )
                 }
-            } else if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") {
+            } else if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance",
+                                                trickleSequential: onSequentialSegmentFinalized != nil) {
                 return nil
             }
             // #369 follow-up: a skipped advance park hands the only remaining hold to the disk park,
@@ -2629,6 +2813,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Reports immediately when the segment is already captured; otherwise parks until the
     /// capture side arrives.
     private func noteSequentialDurationKnown(index: Int, duration: Double) {
+        if duration > 0 { lastSequentialSegmentDuration = duration }
         if seqCapturedAwaitingDuration.remove(index) != nil {
             emitSequentialReport(index: index, duration: duration)
         } else {
@@ -3484,6 +3669,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         pumpQoSLastSeg = Int.min
         pumpQoSNextCheckNanos = 0
         pumpEpochHighestStored = Int.min
+        epochHeadLock.lock()
+        _epochHighestCaptured = Int.min
+        epochHeadLock.unlock()
         pumpUnwinding = false
         pumpRelaxationRate.suspend()
         pthread_set_qos_class_self_np(pumpQoSCurrent, 0)
@@ -3640,7 +3828,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     activeMuxerVideoExtradata = adConfig.extradata  // #133 follow-up: rebaseline for same-PID PS-change detection
                     convertP7Active = false  // ad creatives are H.264
                     if lastLiveSegmentFinalizeAt != nil { stampLiveSegmentFinalize() }
+                    audioFollowSeamSinceBound = true
                     // pendingDiscontinuityFlag / pendingForceCutFlag set by the rebase below.
+                }
+
+                // AE#996: an SSAI source can carry the ad's audio on a PID of its own (MediaTailor:
+                // programme 0x1e2, ad 0x101, video on 0x1e1 throughout). A stream the demuxer adds
+                // mid-session is not discarded, so its packets arrive here; without this they fell
+                // through as foreign packets and every segment after the seam was cut without sound.
+                if isLive, origin == .main, sideAudioDemuxer == nil,
+                   let audio = audioConfig,
+                   pktStreamIdx != videoStreamIndex,
+                   pktStreamIdx != audio.sourceStreamIndex,
+                   demuxer.isAudioStream(pktStreamIdx) {
+                    considerAudioFollow(packet, candidate: pktStreamIdx, audio: audio)
                 }
 
                 // NOPTS dts repair: matroska reconstructs dts from ReferenceBlock relations; fails on some B-frames.
@@ -3654,6 +3855,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         && (audioConfig.map { pktStreamIdx == $0.sourceStreamIndex } ?? false)
                 } else {
                     isAudioPkt = (audioConfig.map { pktStreamIdx == $0.sourceStreamIndex }) ?? false
+                }
+                if isAudioPkt {
+                    audioFollowVideoTicksSinceBound = 0
+                    audioFollowSeamSinceBound = false
+                    audioFollowCandidate = nil
+                } else if isVideoPkt {
+                    let ticks = packet.pointee.duration > 0 ? packet.pointee.duration : videoFallbackDurationPts
+                    audioFollowVideoTicksSinceBound = SourceTimestampBounds.sum(audioFollowVideoTicksSinceBound, max(ticks, 0))
                 }
                 // #77: hand the in-band caption-track packet to the observer (read-only). It's a foreign
                 // packet (the eia_608/c608 caption stream) and is dropped below, never muxed.
@@ -3816,6 +4025,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                         }
                         videoShiftPts = newShift
+                        audioFollowSeamSinceBound = true
                         lastVideoSourceDts = packet.pointee.dts - 1  // dts-1 so monotonic gate is a no-op for this packet
                         // Re-anchor leading-B-frame gate to the new program (otherwise every reset-timeline packet drops).
                         if packet.pointee.pts != Int64.min {
@@ -4500,6 +4710,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         )
                     }
                     if convertP7Active {
+                        // The enhancement-route tap copies the packet while it still carries its
+                        // enhancement layer; the write below says when the stream shows it.
+                        if let tap = videoPacketTapProvider?() {
+                            if !startedVideoPacketTap {
+                                startedVideoPacketTap = true
+                                tap.begin(codecpar: videoCodecparForTap, timeBase: sourceVideoTimeBase, epoch: epoch)
+                            }
+                            tap.stash(sourceKey: packet.pointee.pts, packet: packet)
+                        }
                         // Probe the enhancement-layer type once (latching on the first RPU seen, before
                         // conversion strips it); a FEL source loses refinement in the P8.1 conversion.
                         if !loggedEnhancementLayerType,
@@ -5028,6 +5247,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             : Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts)
         let frameIsKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
         let frameSegmentIndex = currentMuxerSegmentIndex
+        let tapSourceKey = packet.pointee.pts
+        let tapForWrite = convertP7Active ? videoPacketTapProvider?() : nil
 
         // AE#886: decided on the source time base, before the rescale rounds it away.
         let gridded = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den
@@ -5056,6 +5277,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
         }
         let written = write.written
+
+        if let tapForWrite, write.rc >= 0,
+           let item = Self.cmTime(ticks: written.pts, timeBase: muxer.muxerVideoTimeBase) {
+            let decode = Self.cmTime(ticks: written.dts, timeBase: muxer.muxerVideoTimeBase) ?? item
+            tapForWrite.commit(sourceKey: tapSourceKey, item: item, decode: decode, epoch: epoch, isKeyframe: frameIsKeyframe)
+        }
 
         if let frameObserver,
            let source = Self.cmTime(ticks: frameSourcePts, timeBase: sourceVideoTimeBase),

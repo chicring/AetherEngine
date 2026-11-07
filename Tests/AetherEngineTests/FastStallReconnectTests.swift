@@ -15,6 +15,9 @@ struct FastStallReconnectTests {
 
     private static let totalSize: Int64 = 64 * 1024 * 1024
     private static let firstRange: Int64 = 2 * 1024 * 1024
+    /// AE#958: a refill past the retained head re-reads the last `rangeCheckBytes` before the frontier, so the
+    /// request that follows the first range starts that far short of it.
+    private static var refillStart: Int64 { firstRange - Int64(AVIOReader.rangeCheckBytes) }
 
     private final class AttemptCounter: @unchecked Sendable {
         private let lock = NSLock()
@@ -58,7 +61,7 @@ struct FastStallReconnectTests {
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize,
             respond: { _, offset, _ in
-                offset == Self.firstRange && attempts.next(for: offset) == 1
+                offset == Self.refillStart && attempts.next(for: offset) == 1
                     ? .serveThenGoSilent(afterBytes: 0) : .serve206
             })
         let server = try #require(serverMaybe)
@@ -71,7 +74,7 @@ struct FastStallReconnectTests {
         // Drain the initial range so the refill request lands on the silent directive.
         try await Self.waitUntil(10) { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: Int(Self.firstRange)) == Int(Self.firstRange))
-        try await Self.waitUntil(5) { server.requestedRanges.contains { $0.start == Self.firstRange } }
+        try await Self.waitUntil(5) { server.requestedRanges.contains { $0.start == Self.refillStart } }
 
         // Witness delay 5 s + a rebuilt connection serving at loopback speed: comfortably
         // under half the delivery-gap ladder's 20 s.
@@ -81,7 +84,7 @@ struct FastStallReconnectTests {
         let elapsed = Date().timeIntervalSince(t0)
         #expect(got == target, "read stopped at \(got / 1024) KB of \(target / 1024) KB")
         #expect(elapsed < 12, "silent generation took \(elapsed)s to be replaced")
-        #expect(server.requestedRanges.filter { $0.start == Self.firstRange }.count >= 2,
+        #expect(server.requestedRanges.filter { $0.start == Self.refillStart }.count >= 2,
                 "the silent generation was never rebuilt: \(server.requestedRanges)")
     }
 
@@ -95,7 +98,7 @@ struct FastStallReconnectTests {
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize,
             respond: { _, offset, _ in
-                offset < Self.firstRange ? .serve206 : .serveThenGoSilent(afterBytes: 0)
+                offset < Self.refillStart ? .serve206 : .serveThenGoSilent(afterBytes: 0)
             })
         let server = try #require(serverMaybe)
         defer { server.stop() }
@@ -114,7 +117,7 @@ struct FastStallReconnectTests {
                 "expected to stop at the served \(Self.firstRange / 1024) KB, got \(got / 1024) KB")
         #expect(readElapsed < 45, "give-up took \(readElapsed)s: the budget should bound it")
 
-        let rebuilds = server.requestedRanges.filter { $0.start == Self.firstRange }.count
+        let rebuilds = server.requestedRanges.filter { $0.start == Self.refillStart }.count
         #expect(rebuilds <= 14, "silent origin rebuilt \(rebuilds) times without a budget")
     }
 
@@ -129,7 +132,7 @@ struct FastStallReconnectTests {
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize,
             respond: { _, offset, _ in
-                offset == Self.firstRange && attempts.next(for: offset) == 1
+                offset == Self.refillStart && attempts.next(for: offset) == 1
                     ? .serveThenTrickle(afterBytes: 64 * 1024, tickBytes: 1400, tickUs: 1_600_000)
                     : .serve206
             })
@@ -142,7 +145,7 @@ struct FastStallReconnectTests {
 
         try await Self.waitUntil(10) { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: Int(Self.firstRange)) == Int(Self.firstRange))
-        try await Self.waitUntil(5) { server.requestedRanges.contains { $0.start == Self.firstRange } }
+        try await Self.waitUntil(5) { server.requestedRanges.contains { $0.start == Self.refillStart } }
 
         let target = 4 * 1024 * 1024
         let t0 = Date()
@@ -165,7 +168,7 @@ struct FastStallReconnectTests {
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize,
             respond: { _, offset, _ in
-                offset < Self.firstRange
+                offset < Self.refillStart
                     ? .serve206
                     : .serveThenTrickle(afterBytes: 0, tickBytes: 16 * 1024, tickUs: 1_000_000)
             })
@@ -181,7 +184,7 @@ struct FastStallReconnectTests {
         let got = Self.read(reader, bytes: target + Int(Self.firstRange), deadline: 30)
         #expect(got == target + Int(Self.firstRange),
                 "slow delivery was cut at \(got / 1024) KB")
-        #expect(server.requestedRanges.filter { $0.start == Self.firstRange }.count == 1,
+        #expect(server.requestedRanges.filter { $0.start == Self.refillStart }.count == 1,
                 "a slow live generation was rebuilt: \(server.requestedRanges)")
     }
 }

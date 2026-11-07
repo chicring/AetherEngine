@@ -18,7 +18,7 @@ import Foundation
 /// readable.
 final class EngineLogCapture: @unchecked Sendable {
     private let lock = NSLock()
-    private var storage: [String] = []
+    private var storage: [(t: Date, line: String)] = []
 
     init() {
         Registry.shared.add(self)
@@ -30,17 +30,23 @@ final class EngineLogCapture: @unchecked Sendable {
 
     var lines: [String] {
         lock.lock(); defer { lock.unlock() }
+        return storage.map(\.line)
+    }
+
+    /// The lines with the time each reached the capture, for tests that judge timing.
+    var entries: [(t: Date, line: String)] {
+        lock.lock(); defer { lock.unlock() }
         return storage
     }
 
     func matching(_ needle: String) -> [String] {
         lock.lock(); defer { lock.unlock() }
-        return storage.filter { $0.contains(needle) }
+        return storage.filter { $0.line.contains(needle) }.map(\.line)
     }
 
     fileprivate func append(_ line: String) {
         lock.lock(); defer { lock.unlock() }
-        storage.append(line)
+        storage.append((Date(), line))
     }
 
     /// The handler stays installed for the rest of the process once the first capture exists, which
