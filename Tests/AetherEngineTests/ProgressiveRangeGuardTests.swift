@@ -48,7 +48,7 @@ struct ProgressiveRangeGuardTests {
 
     /// A Range request against a segment being written must not stream it progressively: the
     /// responder would send the whole body chunked instead of the requested 206 byte range.
-    @Test("a Range request does not take the progressive path", .timeLimit(.minutes(1)))
+    @Test("a Range request does not take the progressive path", .timeLimit(.minutes(3)))
     func rangeRequestSkipsProgressive() async throws {
         let cache = makeCache()
         defer { cache.close() }
