@@ -139,6 +139,8 @@ Use `seekEvents` (`AnyPublisher<SeekEvent, Never>`) wherever the end of a seek m
 
 `$isSeeking` alone cannot tell you whether a seek landed, gave up or was replaced. And on a stalled source, a seek that gave up can still land minutes later.
 
+Each event also says who asked (`origin`) and where the playhead stood when it was asked (`departure`). A skip from Control Center or the iPhone Remote that the engine handled has origin `.remoteCommand`, so you can react to every skip back without intercepting commands. See [Seek events](api.md#seek-events).
+
 ### videoRoute
 
 `videoRoute` says which pipeline plays the session:
@@ -395,6 +397,7 @@ An assertion only ever adds a capability, so neither flag can hide one the syste
 - What it does: it serves a Profile 8.1 (or converted Profile 7) source as Profile 5. AVPlayer then composes the Dolby Vision picture itself, instead of handing the TV only the HDR10 base layer ([#455](https://github.com/superuser404notfound/AetherEngine/issues/455)).
 - The risk: a tvOS build that reads the base layer's colours from the profile field would show a green / violet cast.
 - Asserting `panelPresentsDolbyVision` turns it off.
+- A file that also carries HDR10+ loses that HDR10+ on this route. On an HDR10+ TV, also set `preferHDR10PlusOverForcedDolbyVision`, and such a file keeps its HDR10+ (Sodalite#245).
 
 Details in [api.md › forceDolbyVisionOnNonDVDisplay](api.md#forcedolbyvisiononnondvdisplay).
 
@@ -495,7 +498,7 @@ What `.fastZap` changes:
 
 - **Shorter segments.** Live segments are cut at every keyframe after 0.5 s instead of the standard ~4 s. The served `TARGETDURATION` drops to 1.5 x the source GOP length: 1 s GOPs serve 2, and so do segments up to 1.666 s. The headroom covers a broadcast's irregular GOPs (#670).
 - **Smaller holdback.** The live-edge holdback (`HOLD-BACK` = 3 x `TARGETDURATION`, the RFC 8216bis minimum, #189) shrinks with it.
-- **A bounded start.** The first manifest still prefers the full holdback. After two finished segments, a source that delivers strictly in real time gets one grace period of one observed segment, clamped to 0.5...2.0 s. After that, a shallow first window may be served so startup stays bounded. This can cause one early `-16832` error or a short rebuffer.
+- **A bounded start.** The first manifest goes out once the window holds the full holdback or two finished segments, whichever comes first. A shallow first window is normal, and on a source that delivers strictly in real time it can cause one early `-16832` warning or a short rebuffer. `liveStartupGraceSeconds` adds a wait for a deeper window if a host prefers that.
 - **Less patience.** A smaller `TARGETDURATION` also makes AVPlayer less patient with an unchanged playlist, and keeps a smaller buffer at the live edge. Origins that stall or deliver in bursts mid-stream rebuffer more easily.
 
 ### The retune request: `liveSourceReset`
@@ -773,7 +776,7 @@ if player.supportsCacheBackedStills {
 
 - Show the preview only when `supportsCacheBackedStills` is true.
 - A nil means "no image for this position yet", not an error. Show the time only.
-- A host on `AVPlayerViewController` sets `LoadOptions(serveIFramePlaylist: true)` instead and gets AVKit's own thumbnails.
+- A host on `AVPlayerViewController` sets `LoadOptions(serveIFramePlaylist: true)` instead and gets AVKit's own thumbnails. The engine reads the ones around the playhead ahead of time, so a scrub does not wait on each of them.
 - A host that shows no previews at all sets `generatesBackgroundScrubPreviews: false`. The engine then builds no set of preview images in idle time.
 
 Details in [api.md › Stills and thumbnails](api.md#stills-and-thumbnails).
@@ -849,8 +852,24 @@ SDR video below 1080p is scaled up to the display's native size, with VideoToolb
 - **It moves the title onto the software path,** so that path's rules apply: PiP through `softwarePiPSource`, no native subtitle renditions.
 - **Some titles keep their usual route:** HDR, Dolby Vision, a display no larger than the source, and any AirPlay route. The load logs one `[Upscale]` line saying why.
 - **It never stops playback.** A stage that falls behind degrades, then switches itself off. `$activeUpscale` then carries `degraded` or `disabledReason`.
+- **A failing VideoToolbox pass is dropped, not the stage.** Some devices (an A12 Apple TV on tvOS 27.2) report VideoToolbox super resolution and then refuse every frame. MetalFX alone then scales to the same size, and `$activeUpscale` shows `degraded` with `mlScale` nil.
 
 Details in [api.md › upscalesLowResolutionVideo](api.md#upscaleslowresolutionvideo) and [upscaleScaler](api.md#upscalescaler).
+
+### Tone mapping HDR10 to the display's peak
+
+```swift
+LoadOptions(videoProcessing: VideoProcessingOptions(targetPeakNits: 600)) // the display's peak, in nit
+player.$activeVideoProcessing   // VideoProcessingStatus?: what runs, from which source peak; nil while nothing runs
+```
+
+An HDR10 title mastered brighter than the display is tone mapped to the display's peak (BT.2390), and the display is told so (#957). Below the knee the picture is unchanged.
+
+- **It moves the title onto the software path,** so that path's rules apply: PiP through `softwarePiPSource`, the picture stays on this device over AirPlay, and an E-AC-3 Atmos track plays as its channel bed.
+- **Some titles keep their usual route:** Dolby Vision, HDR10+, HLG and SDR, a title whose peak is at or below the target or that declares no metadata, and any AirPlay route. The load logs one `[VideoProcessing]` line saying why.
+- **It never stops playback.** Processing that falls behind, or a stream that turns out to carry HDR10+, switches itself off. `$activeVideoProcessing` then carries `disabledReason`.
+
+Details in [api.md › videoProcessing](api.md#videoprocessing).
 
 ### Subtitle offset reach
 
@@ -885,6 +904,21 @@ player.setAudioShaping(AudioShaping(loudnessTargetLUFS: -23))   // raise quiet f
 - The same `AudioShaping` also carries the channel cap, the dialogue lift and night mode.
 
 Details in [api.md › Audio shaping](api.md#audio-shaping).
+
+### Even loudness across a music queue
+
+```swift
+var options = LoadOptions(audioOnly: true)
+options.normalizationGainDB = track.normalizationGain   // e.g. -7.9, or +4.2 for a quiet master
+try await player.load(url: url, options: options)
+```
+
+**This plays every track at the loudness your server measured.** Pass the track's ReplayGain or normalization gain on each load. Unlike `volume` it can lift a quiet track, with a -1 dBFS limiter so the lift does not clip, and it works on both audio-only hosts without moving a track between them.
+
+- `setNormalizationGain(_:)` changes it mid-track, for a setting the listener toggles.
+- `normalizationGainReport` says what was applied and how hard the limiter worked. Read it before the next load to log the finished track.
+
+Details in [api.md › Track loudness on audio-only sessions](api.md#track-loudness-on-audio-only-sessions).
 
 ### Stereo downmix for a 2.1 system
 

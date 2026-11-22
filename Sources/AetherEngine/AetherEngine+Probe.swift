@@ -15,7 +15,7 @@ extension AetherEngine {
     ///
     /// - Parameters:
     ///   - url: Media source (`file://`, `http://`, or `https://`).
-    ///   - options: Read for `httpHeaders` and `skipsContainerAttachments`; other flags ignored (no playback session).
+    ///   - options: Read for `httpHeaders`, `skipsContainerAttachments` and `untaggedVideoColor`; other flags ignored (no playback session).
     ///   - limits: Optional shared input, packet and monotonic time limits.
     ///   - cancellation: Optional one-shot token, callable from another thread or a task cancellation handler.
     /// - Throws: Open errors, `ProbeError` for a controlled stop, or `CancellationError`.
@@ -325,6 +325,7 @@ extension AetherEngine {
     /// budget sized for a header.
     private nonisolated static func probeOpenProfile(limits: ProbeLimits?, options: LoadOptions) -> DemuxerOpenProfile {
         let base = DemuxerOpenProfile.playback.skippingAttachments(options.skipsContainerAttachments)
+            .withUntaggedVideoColor(options.untaggedVideoColor)
         guard let limits else { return base }
         var profile = base
         // FFmpeg has a minimum probe size. The input seam still enforces smaller caller limits.
@@ -706,7 +707,8 @@ extension AetherEngine {
     /// takes neither a FLAC whose blocks are under CoreMedia's floor (AE#764), nor a FLAC whose frames
     /// are smaller than `STREAMINFO`'s `max_blocksize` (AE#946, AVPlayer mistimes it), nor a raw FLAC
     /// file (AE#946, AVPlayer seeks it to the wrong place), nor an AAC whose layout lives in a PCE
-    /// (AE#1047, the item ends at 0 s), nor a session the host asked onto `.software`.
+    /// (AE#1047, the item ends at 0 s), nor a container AVFoundation cannot open (MP2 in Matroska
+    /// failed with "Cannot Open" and a silent clock), nor a session the host asked onto `.software`.
     nonisolated static func audioOnlyUsesAVPlayer(
         codecID: AVCodecID,
         isCustomSource: Bool,
@@ -714,10 +716,26 @@ extension AetherEngine {
         flacFramesMistimed: Bool,
         flacSeeksMisplaced: Bool,
         aacLayoutInPCE: Bool = false,
+        containerUnreadable: Bool = false,
         preferred: DecodePath
     ) -> Bool {
         !isCustomSource && avPlayerCanDecodeAudio(codecID) && !flacBlocksTooSmall && !flacFramesMistimed
-            && !flacSeeksMisplaced && !aacLayoutInPCE && preferred != .software
+            && !flacSeeksMisplaced && !aacLayoutInPCE && !containerUnreadable && preferred != .software
+    }
+
+    /// libavformat demuxer names whose files AVFoundation opens itself: QuickTime/MP4/M4A, raw MPEG
+    /// audio, ADTS AAC, raw AC-3 / E-AC-3, raw FLAC, WAV, AIFF and CAF.
+    nonisolated static let avPlayerAudioContainers: Set<String> = [
+        "mov", "mp4", "m4a", "mp3", "aac", "ac3", "eac3", "flac", "wav", "aiff", "caf",
+    ]
+
+    /// Whether AVPlayer can open the container a whitelisted codec arrived in. The codec check alone
+    /// sent AAC, FLAC, MP3 and AC-3 inside Matroska, Ogg, MPEG-TS or ASF to AVPlayer, which refused
+    /// the file. `formatName` is libavformat's comma-separated demuxer name ("mov,mp4,m4a,3gp,3g2,mj2",
+    /// "matroska,webm"); nil (no probe) keeps the codec decision as it was.
+    nonisolated static func avPlayerReadsAudioContainer(_ formatName: String?) -> Bool {
+        guard let formatName else { return true }
+        return formatName.split(separator: ",").contains { avPlayerAudioContainers.contains(String($0)) }
     }
 
     /// AE#946: CoreMedia's parser for the raw FLAC container ignores `SEEKTABLE` and places a seek by

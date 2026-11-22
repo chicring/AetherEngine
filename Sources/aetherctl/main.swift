@@ -66,15 +66,15 @@ func printUsage() {
     aetherctl: standalone AetherEngine repro harness
 
     Usage:
-      aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
+      aetherctl probe [--untagged-color hdr10|hlg] [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--untagged-color hdr10|hlg] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl bench [--iterations N] [--json out.json] [--baseline base.json] [--tolerance PCT]
       aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]
-      aetherctl play [--fel [--fel-output]] [--upscale [--line-art]] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel [--fel-output]] [--upscale [--line-art]] [--tone-map NITS] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--live-join-at-start] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
-                 [--start-position S] [--switch-audio <index>[@ms]]
+                 [--start-position S] [--switch-audio <index>[@ms]] [--live-reopen-param NAME]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--subtitle-offset-reach SECONDS] [--subtitle-delay-reach SECONDS] [--subtitle-advance-reach SECONDS]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
@@ -84,13 +84,15 @@ func printUsage() {
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
              [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto] [--no-dtsx-objects]]
-                     [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext,subsatload] <url>
+                     [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext,subsatload,stopreopen@N[:off]] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
                       a build with the DualLayerDolbyVision trait); --upscale opts into
                       upscaling sub-1080p SDR video to the display (#846),
                       --line-art with the line-art scaler for animation, which
                       also takes 1080p and 10-bit SDR (AE#1039);
+                      --tone-map NITS opts into the picture processing,
+                      tone mapping HDR10 brighter than NITS to it (#957);
                       --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
@@ -110,7 +112,7 @@ func printUsage() {
                       --reload-applying corrects a LoadOption on the playing
                       session through #460's session-preserving reload, repeatable;
                       keys header.<Name>, audio-bridge, preferred-audio,
-                      decode-path, dolby-vision, prefer-dual-layer-dv, is-live
+                      decode-path, dolby-vision, untagged-color, prefer-dual-layer-dv, is-live
                       (is-live is there to show the refusal: a field that names the
                       session is refused, not silently ignored), default +20 s;
                       --sequential-origin declares a fake-range origin (one unranged
@@ -136,7 +138,7 @@ func printUsage() {
       aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
                           never EOF, unknown size; prints physFP and its slope against that rate)
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--standard-join] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--standard-join] [--live-cushion N] [--startup-grace S] [--single-segment-min S] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
@@ -169,6 +171,11 @@ func printUsage() {
                      AVPlayer composes the RPU itself. Only has an
                      effect together with --no-dv; a display that does
                      Dolby Vision keeps the P8.1 route.
+      --untagged-color hdr10|hlg
+                     LoadOptions.untaggedVideoColor (AE#1103), for
+                     probe and serve: show a 10-bit stream with no
+                     colour description at all as HDR10 or HLG. A
+                     stream that declares anything keeps it.
       --dv-base-layer
                      LoadOptions.dolbyVisionHandling = .baseLayerOnly:
                      present the HDR10 / HLG base layer of a Dolby
@@ -304,6 +311,8 @@ func printUsage() {
                 OK if the clock advanced or FAIL if it stayed silent.
                 Smoke-tests the FFmpeg decode -> AVSampleBufferAudioRenderer
                 pipeline end-to-end on macOS without a display layer.
+                --gain DB sets LoadOptions.normalizationGainDB and prints
+                the engine's normalization report before stopping.
 
       live      Start a synthetic endless MPEG-TS source (LiveFixture,
                 loopback HTTP, no Content-Length, monotonic PTS / PCR
@@ -338,12 +347,6 @@ private func objectAudioRendering(_ flag: String?, format: String? = nil) -> Obj
     }
     #if !(TrueHDObjectAudio || DTSXObjectAudio)
     print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
-    #endif
-    #if DEBUG
-    // A debug build renders the bed about 5x slower than real time (Unfold: 18.8 s against 2.0 s), so
-    // AVPlayer waits for audio and `play` ends in "clock did not advance". Not an engine defect.
-    print("[aetherctl] note: a debug build renders the object bed below real time, so play may stall; "
-        + "build with -c release to judge playback")
     #endif
     switch format {
     case nil, "apac": return .apac(layout)
@@ -572,13 +575,24 @@ if first == "scrubpreview" {
     let stills = takeFlag("--stills", from: &rest)
     let maxRequests = takeIntFlag("--max-concurrent-requests", from: &rest)
     let forward = takeIntFlag("--forward-buffer-segments", from: &rest)
+    // #853: the stills come off the plain deinterlacer either way; this sets what the playing session runs
+    // beside them, so a run can compare the two.
+    let stillsInverseTelecine = takeStringFlag("--inverse-telecine", from: &rest)
+        .map { spec -> InverseTelecineMode in
+            guard let mode = InverseTelecineMode(rawValue: spec) else {
+                print("ERROR: --inverse-telecine takes auto|off|force, got '\(spec)'")
+                exit(64)
+            }
+            return mode
+        } ?? .auto
     if let kbps = takeIntFlag("--throttle-kbps", from: &rest) {
         AetherEngine.setSourceThrottleKbpsForTesting(kbps)
         print("[aetherctl] source throttle: \(kbps) kbit/s")
     }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] "
-              + "[--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>")
+              + "[--stills [--max-concurrent-requests N] [--forward-buffer-segments N] "
+              + "[--inverse-telecine auto|off|force]] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
@@ -586,7 +600,8 @@ if first == "scrubpreview" {
     let positions = at.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
     if stills {
         exit(runScrubStills(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm,
-                            maxConcurrentRequests: maxRequests, forwardBufferSegments: forward))
+                            maxConcurrentRequests: maxRequests, forwardBufferSegments: forward,
+                            inverseTelecine: stillsInverseTelecine))
     }
     exit(runScrubPreview(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm, keepDir: keep))
 }
@@ -761,6 +776,10 @@ if first == "live" {
     let fastZap = !standardJoin
     // --live-cushion N: LoadOptions.liveEdgeCushionSeconds.
     let liveFixtureCushion = takeDoubleFlag("--live-cushion", from: &rest)
+    // --startup-grace S / --single-segment-min S: LoadOptions.liveStartupGraceSeconds and
+    // liveStartupSingleSegmentMinimumSeconds, the two fastZap first-serve levers.
+    let startupGrace = takeDoubleFlag("--startup-grace", from: &rest)
+    let singleSegmentMinimum = takeDoubleFlag("--single-segment-min", from: &rest)
     // --preroll N: backlog seconds the paced fixture bursts before 1x pacing (default 30).
     // 0 models a strict-realtime origin with no backlog (the AE#195 slow-join case).
     let preroll = takeDoubleFlag("--preroll", from: &rest)
@@ -819,7 +838,9 @@ if first == "live" {
                  reloadTest: reloadTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
                  discontinuityAt: discontinuityAt, realtime: realtime || realtimeRate != nil,
-                 fastZap: fastZap, liveCushion: liveFixtureCushion, pacingPreroll: preroll, pacingRate: realtimeRate,
+                 fastZap: fastZap, liveCushion: liveFixtureCushion,
+                 startupGrace: startupGrace, singleSegmentMinimum: singleSegmentMinimum,
+                 pacingPreroll: preroll, pacingRate: realtimeRate,
                  originLead: originLead,
                  freezeAfter: freezeAfter, unfreezeAfter: unfreezeAfter,
                  rewindBeforeFreeze: rewindBeforeFreeze,
@@ -865,10 +886,16 @@ if first == "play" {
     let liveStartImmediately = playLiveStartImmediately ? true : !playNoLiveStartImmediately
     // LoadOptions.liveEdgeCushionSeconds: how far behind the live edge the session plays.
     let liveCushion = takeDoubleFlag("--live-cushion", from: &rest)
+    // AE#1090: LoadOptions.liveJoinsAtPlaylistStart, "start from the beginning" on a recording in
+    // progress. Pair with `hlsfixture --recording-backlog N`.
+    let liveJoinAtStart = takeFlag("--live-join-at-start", from: &rest)
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
     let audioStats = takeFlag("--audio-stats", from: &rest)
+    // AE#1100: answers `liveReopenURL` by rewriting this query parameter to a fresh value per reopen,
+    // the way a host mints a new HDHomeRun SessionID.
+    let liveReopenParameter = takeStringFlag("--live-reopen-param", from: &rest)
     let seekEvery = takeDoubleFlag("--seek-every", from: &rest)
     // #240: absolute far-seek targets, cycled one per --seek-every tick (e.g. 600,30,302,640).
     let seekPattern = takeStringFlag("--seek-pattern", from: &rest)
@@ -901,6 +928,15 @@ if first == "play" {
     // AE#1039: `LoadOptions.upscaleScaler = .lineArt`; implies --upscale.
     let playLineArt = takeFlag("--line-art", from: &rest)
     let playUpscale = takeFlag("--upscale", from: &rest) || playLineArt
+    // #957: `LoadOptions.videoProcessing` with this target peak; off by default as in the engine.
+    var playVideoProcessing: VideoProcessingOptions?
+    if let spec = takeStringFlag("--tone-map", from: &rest) {
+        guard let nits = Double(spec), nits.isFinite, nits > 0 else {
+            print("ERROR: --tone-map takes a target peak in nit above 0, got '\(spec)'")
+            exit(64)
+        }
+        playVideoProcessing = VideoProcessingOptions(targetPeakNits: nits)
+    }
     let playSurfaceFlag = takeFlag("--surface", from: &rest)
     let playWindowFlag = takeFlag("--window", from: &rest)
     let playAttachSurface = playSurfaceFlag || playWindowFlag
@@ -965,6 +1001,19 @@ if first == "play" {
         playFieldRate = parsed
     } else {
         playFieldRate = .field
+    }
+    // #853: `LoadOptions.inverseTelecine`. `.auto` samples SD NTSC MPEG-2 at load and matches fields on
+    // film; `off` is the deinterlacer alone; `force` matches fields without the sample.
+    let playInverseTelecineSpec = takeStringFlag("--inverse-telecine", from: &rest)
+    let playInverseTelecine: InverseTelecineMode
+    if let playInverseTelecineSpec {
+        guard let parsed = InverseTelecineMode(rawValue: playInverseTelecineSpec) else {
+            print("ERROR: --inverse-telecine takes auto|off|force, got '\(playInverseTelecineSpec)'")
+            exit(64)
+        }
+        playInverseTelecine = parsed
+    } else {
+        playInverseTelecine = .auto
     }
     // AE#462: force the audio pipeline to fail so the video-only drop is observable end to end.
     // There is no fixture for it: the drop needs a codec this build has no decoder for (AC-4 is the
@@ -1121,6 +1170,9 @@ if first == "play" {
     // AE#956: LoadOptions.skipsContainerAttachments. Pair it with a throttled origin and an MKV that
     // carries fonts to see the open stop paying for them.
     let skipAttachments = takeFlag("--skip-attachments", from: &rest)
+    // AE#682: LoadOptions.serveIFramePlaylist on a full session, where the still ladder runs and
+    // fills the rendition ahead of AVKit (`[StillLadder] reading through the I-frame rendition`).
+    let playServesIFrames = takeFlag("--iframes", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -1150,6 +1202,13 @@ if first == "play" {
                 exit(64)
             }
             optionChanges.append(.decodePath(path))
+        } else if key == "untagged-color" {
+            let colors: [String: UntaggedVideoColor] = ["standard": .standard, "hdr10": .hdr10, "hlg": .hlg]
+            guard let color = colors[value] else {
+                print("ERROR: --reload-applying untagged-color takes standard|hdr10|hlg, got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.untaggedVideoColor(color))
         } else if key == "dolby-vision" {
             guard let handling = DolbyVisionHandling(rawValue: value) else {
                 print("ERROR: --reload-applying dolby-vision takes \(DolbyVisionHandling.allCases.map(\.rawValue).joined(separator: "|")), got '\(value)'")
@@ -1239,7 +1298,7 @@ if first == "play" {
         }
         done.wait()
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, liveJoinAtStart: liveJoinAtStart, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, liveReopenParameter: liveReopenParameter, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
@@ -1257,14 +1316,17 @@ if first == "play" {
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
+                 inverseTelecine: playInverseTelecine,
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
                  skipAttachments: skipAttachments,
+                 serveIFrames: playServesIFrames,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
                  dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
                  upscalesLowResolutionVideo: playUpscale,
                  upscaleScaler: playLineArt ? .lineArt : .automatic,
+                 videoProcessing: playVideoProcessing,
                  attachSurface: playAttachSurface,
                  record: playRecord))
 }
@@ -1292,6 +1354,16 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)
     let customAudioIndex = takeIntFlag("--audio-index", from: &rest).map(Int32.init)
+    // `--untagged-color hdr10|hlg`: LoadOptions.untaggedVideoColor (AE#1103), for probe and serve.
+    let untaggedColor: UntaggedVideoColor
+    switch takeStringFlag("--untagged-color", from: &rest) {
+    case nil, "standard": untaggedColor = .standard
+    case "hdr10": untaggedColor = .hdr10
+    case "hlg": untaggedColor = .hlg
+    case let other?:
+        print("ERROR: --untagged-color takes standard|hdr10|hlg, got '\(other)'")
+        exit(64)
+    }
     // `--stereo auto|mono|sbs|ou`: serve a 3D source the way visionOS gets it, from any system.
     let serveStereo: StereoPresentation? = takeStringFlag("--stereo", from: &rest).map {
         switch $0 {
@@ -1358,6 +1430,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let extractFlag = takeFlag("--extract", from: &rest)
     let secondsFlag = takeDoubleFlag("--seconds", in: 0...maxRunSeconds, from: &rest)
     let audioSeconds = secondsFlag ?? 10
+    let audioGain = takeDoubleFlag("--gain", from: &rest)   // Sodalite#242
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
     // AE#682: list an I-frame rendition in the master; serve only.
@@ -1388,7 +1461,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     }
     switch first {
     case "probe":
-        exit(runProbe(url: url, detecting: probeDetail))
+        exit(runProbe(url: url, detecting: probeDetail, untaggedColor: untaggedColor))
     case "serve":
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                  dolbyVisionHandling: dvHandling,
@@ -1396,7 +1469,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                  audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
                  objectAudioRendering: serveObjectAudioRendering,
                  // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex, stereo: serveStereo)
+                 audioStreamIndex: customAudioIndex, stereo: serveStereo, untaggedColor: untaggedColor)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))
@@ -1415,7 +1488,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
             maxWidth: extractWidth
         ))
     case "audio":
-        exit(runAudio(url: url, seconds: audioSeconds))
+        exit(runAudio(url: url, seconds: audioSeconds, gainDB: audioGain))
     case "customio":
         if customLive {
             exit(runCustomLiveSpool(path: urlArg, seconds: secondsFlag ?? 720, rateKbps: customRateKbps,
